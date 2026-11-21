@@ -6,6 +6,11 @@ subject to the same backstop.  Hole counts are derived at the end from the
 kept set: a kept parent's holes = its direct children that were not kept, which
 equals what a runtime dropped-child counter would record.
 
+An arm may defer a span ("defer" from on_end, the tail-based baseline buffers
+every span until the trace's root ends) and resolve it later through
+`take_releases()`, drained after every on_end at the current time; `finish()`
+resolves what is still deferred when the events run out.
+
 Volume is counted in span units.  A full span costs 1; a compact root record
 (reason "root_record", emitted by the record root policy) costs
 `sampler.record_cost` spans and the same fraction of the span's bytes.  The cap
@@ -174,11 +179,26 @@ def replay(corpus: Corpus, sampler: Sampler, v_star: float, cap: float, seed: in
             st.spans += 1
             if keep:
                 admit(idx, p, reason, per, t)
+            elif reason == "defer":
+                drop_reason[idx] = "defer"
             else:
                 st.dropped[reason] = st.dropped.get(reason, 0) + 1
                 drop_reason[idx] = reason
+            for ridx, rkeep, rp, rreason in sampler.take_releases():
+                if rkeep:
+                    admit(ridx, rp, rreason, per, t)
+                else:
+                    st.dropped[rreason] = st.dropped.get(rreason, 0) + 1
+                    drop_reason[ridx] = rreason
             if s.parent_idx < 0:
                 reqs.pop(s.trace_id, None)
+    t_last = events[-1][0] if events else t0
+    for ridx, rkeep, rp, rreason in sampler.finish():
+        if rkeep:
+            admit(ridx, rp, rreason, cur, t_last)
+        else:
+            st.dropped[rreason] = st.dropped.get(rreason, 0) + 1
+            drop_reason[ridx] = rreason
     finalize(cur)
 
     kept_arr = np.asarray(kept_idx, dtype=np.int64)

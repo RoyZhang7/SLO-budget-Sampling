@@ -52,17 +52,23 @@ prior.
 
 ## Arms
 
-| Arm | Definition |
-| --- | --- |
-| `chosen` | the Stage 1 mechanism: shared request budget, pinned roots, kept-span calibration, fixed N_need = 15, linear p growth, uniform plan, no escalation, no credit |
-| `chosen-local` | `chosen` with the budget counted per (request, host) |
-| `chosen-oracleT` | ablation: ground-truth T table instead of per-period calibration |
-| `chosen-v2` | the current configuration: local budget, uniform plan, escalation off, class key on, on-demand roots, frozen calibration (rate trigger), relative N_need f = 0.2, credit off, no cold-start prior (pass 4) |
-| `threshold` | every outlier kept at p = 1, no budget, no pool, no N_need; ordinary spans plan-sampled; same root policy and calibration source as the chosen arm it is compared with; the collector cap is the only limit |
-| `keep-parent` | `chosen` plus the parent of every kept outlier is kept (p = 1, pays from the budget) |
-| `reservoir` | weighted reservoir per host (Efraimidis-Spirakis, weight = size of miss), K_h = V* x host share, finalised at period end; uses the ground-truth T table |
-| `uniform-head` | one coin per trace at the root; rate adapted each period to V* |
-| `canopy` | per-service rate targets (equal shares of V*) adapted multiplicatively at the collector, span level, blind to outliers |
+The mechanism, its competitors (other samplers, reported in the competitor
+tables and the headline comparison) and its ablations (the same mechanism with
+one part removed or replaced, reported in their own tables and never as
+competitors).
+
+| Arm | Group | Definition |
+| --- | --- | --- |
+| `chosen` | mechanism | the Stage 1 mechanism: shared request budget, pinned roots, kept-span calibration, fixed N_need = 15, linear p growth, uniform plan, no escalation, no credit |
+| `chosen-v2` | mechanism | the current configuration: local budget, uniform plan, escalation off, class key on, on-demand roots, frozen calibration (rate trigger), relative N_need f = 0.2, credit off, no cold-start prior (pass 4) |
+| `uniform-head` | competitor | one coin per trace at the root; rate adapted each period to V* |
+| `reservoir` | competitor | weighted reservoir per host (Efraimidis-Spirakis, weight = size of miss), K_h = V* x host share, finalised at period end; uses the ground-truth T table |
+| `canopy` | competitor | Canopy-style per-service rate targets (equal shares of V*) adapted multiplicatively at the collector, span level, blind to outliers |
+| `tail` | competitor | tail-based whole-trace sampler, the canonical version: every span buffered at the collector until the root ends; the whole trace kept when the root misses its SLO or any span has an error status, else with the plan probability that brings the kept volume to V*; the per-period cap enforced on whole traces, oldest decision first; no per-request or per-host bound; a trace whose root has not ended within `timeout_slo_mult` (2) x SLO is evicted. Reports peak and mean buffered spans, peak buffered bytes, decision latency (root end minus first span start) and evictions |
+| `threshold` | ablation | every outlier kept at p = 1, no budget, no pool, no N_need; ordinary spans plan-sampled; same root policy and calibration source as the chosen arm it is compared with; the collector cap is the only limit |
+| `chosen-local` / `v2-shared` | ablation | the budget counted per (request, host) instead of per request (`chosen-local` on `chosen`), or per request instead of per (request, host) (`v2-shared` on `chosen-v2`) |
+| `chosen-oracleT` / `v2-oracleT` | ablation | the ground-truth T table instead of per-period calibration |
+| `keep-parent` / `v2-keep-parent` | ablation | the parent of every kept outlier is kept too (p = 1, pays from the budget) |
 
 All arms get the same V* (a fraction of the scenario's spans per period) and
 the same collector cap (1.25 V*); the cap is first come, first served per
@@ -119,7 +125,8 @@ Headline (all over periods >= 1, after the cold-start period; equal volume targe
 
 - `outlier_share`: kept non-root spans that are truth outliers (over the oracle T_i or not OK) / kept non-root spans; `_window` restricts to the fault window
 - `outlier_precision`: spans the arm kept *as* outliers that are truth outliers
-- bounded spend: `max_per_request` (span units kept for one request, p99 alongside), `max_per_host_period`, `over_cap_periods` (periods in which the arm wanted more than the cap)
+- bounded spend, real numbers for every arm: `max_per_request` (span units kept for one request, p99 alongside), `max_per_host_period`, `buffer_peak_spans` (the most spans the arm held at the collector before deciding: whole traces for `tail`, the candidates until period end for `reservoir`, none for budget and head arms), `over_cap_periods` (periods in which the arm wanted more than the cap)
+- collector cost of deferred decisions: `buffer_mean_spans`, `buffer_peak_bytes`, `decision_latency_mean` / `_p95` / `_max` (root end minus the trace's first span start), `evicted_traces` (tail buffer timeout), `cap_dropped_traces` (whole traces the tail cap refused)
 - attributability of kept truth outliers: `attrib_explained` = own time over its own-time share (`attrib_own`), or a kept child is itself an outlier (`attrib_child`), or every dropped child was ordinary in ground truth (`attrib_clean`); `attrib_loss` = the excess sat in a dropped child that was an outlier, split by that child's refusal reason (`loss_*`, `loss_split`); the pass-2 `ctx_sufficient` (root kept and zero holes) and `ctx_root_kept` / `outlier_no_root` stay in the CSV
 - refusal accounting: for truth outliers not kept, the share per reason (`ref_budget`, `ref_pool`, `ref_n_need` = the p < 1 coin, `ref_credit` = credit/reserve exhausted, `ref_k_cap`, `ref_credit_coin`, `ref_not_flagged` = the arm's T did not flag it, `ref_cap`, `ref_arm` = a baseline's own rule; `refusal_split`, `lost_outliers`)
 - `p95_err_svc_mean` / `_max` / `p95_svc_within5` / `p95_err_root`: 1/p-reweighted P95 error per service, pooled over routes and periods >= 1

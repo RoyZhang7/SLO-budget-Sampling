@@ -24,6 +24,12 @@ Cold-start period (period 0, which the headline metrics leave out):
 Fault shape on complete data (fault window): truth_rate_median / _max /
   _spread (max over median) of the truth outlier rate per service;
   truth_systemic / truth_culprit_est = the culprit rule applied to complete data
+Collector cost (bounded spend holds for every arm): buffer_peak_spans /
+  buffer_mean_spans / buffer_peak_bytes = spans (bytes) the arm holds at the
+  collector before deciding (tail: whole traces until the root ends; reservoir:
+  its candidates until period end; budget and head arms: 0), decision_latency_*
+  = root end minus the trace's first span start for tail-decided traces,
+  evicted_traces = traces the tail buffer timed out
 Secondary:
   recall_culprit    kept truth outliers of the culprit service in the fault window
   evidence_s        first kept truth outlier of the culprit service after the
@@ -131,7 +137,7 @@ def _mean(xs) -> float:
 # why a truth outlier was not kept, grouped for the refusal split
 REASON_GROUP = {"budget": "budget", "pool": "pool", "outlier_coin": "n_need", "credit_exhausted": "credit",
                 "reserve_exhausted": "credit", "credit_k": "k_cap", "credit_coin": "credit_coin",
-                "plan_coin": "not_flagged", "cap": "cap"}
+                "plan_coin": "not_flagged", "cap": "cap", "tail_cap": "cap"}
 REASON_GROUPS = ("budget", "pool", "n_need", "credit", "k_cap", "credit_coin", "not_flagged", "cap", "arm")
 
 
@@ -506,6 +512,20 @@ def compute(corpus: Corpus, arrays: CorpusArrays, res: RunResult, within: float 
     credit_items = np.isin(reasons, ["credit", "reserve"]) & kw
     out["credit_share"] = _safe_div(credit_items.sum(), kept_nr.sum())
     out["debt_total"] = int(sum(d.get("debt", 0) for d in res.diagnostics))
+    # collector cost: buffering and decision latency (periods >= 1) ----------------------
+    warm_d = [d for d in res.diagnostics if d.get("period", 0) >= 1]
+    peaks = [d.get("buffer_peak", 0) for d in warm_d]
+    out["buffer_peak_spans"] = float(max(peaks)) if peaks else 0.0
+    means = [d.get("buffer_mean", 0.0) for d in warm_d]
+    out["buffer_mean_spans"] = _mean(means) if means else 0.0
+    pb = [d.get("buffer_peak_bytes", 0) for d in warm_d]
+    out["buffer_peak_bytes"] = float(max(pb)) if pb else 0.0
+    lats = [l for d in warm_d for l in d.get("latencies", [])]
+    out["decision_latency_mean"] = _mean(lats) if lats else 0.0
+    out["decision_latency_p95"] = float(np.quantile(lats, 0.95)) if lats else 0.0
+    out["decision_latency_max"] = float(max(lats)) if lats else 0.0
+    out["evicted_traces"] = int(sum(d.get("evicted", 0) for d in res.diagnostics))
+    out["cap_dropped_traces"] = int(sum(d.get("cap_dropped_traces", 0) for d in res.diagnostics))
     fz: dict[str, int] = {}
     for d in res.diagnostics:
         for svc in d.get("frozen", []):

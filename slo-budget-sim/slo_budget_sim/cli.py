@@ -11,7 +11,8 @@ from .experiments import ALL_ARMS, EXPERIMENTS, make_arm, resummarize, run_exper
 from .jaeger import load_jaeger, to_jaeger
 from .metrics import CorpusArrays, compute
 from .replay import replay
-from .synthetic import ALL_SCENARIOS, build_scenario
+from .dump import dump_replay
+from .synthetic import ALL_SCENARIOS, SCENARIOS, build_scenario
 from .ttable import oracle_table
 
 
@@ -74,6 +75,14 @@ def cmd_replay(a) -> int:
     return 0
 
 
+def cmd_dump(a) -> int:
+    for sc in a.scenario:
+        for sd in a.seeds:
+            ev, de = dump_replay(sc, sd, a.volume_frac, Path(a.out), a.arm, _parse_overrides(a.set))
+            print(f"{sc} seed {sd}: {ev.name} {ev.stat().st_size // 1024} KB, {de.name} {de.stat().st_size // 1024} KB")
+    return 0
+
+
 def cmd_exp(a) -> int:
     results = Path(a.results)
     results.mkdir(parents=True, exist_ok=True)
@@ -117,6 +126,15 @@ def main(argv=None) -> int:
     rs.add_argument("exp", choices=list(EXPERIMENTS))
     rs.add_argument("--results", default="results")
     rs.set_defaults(func=lambda a: (resummarize(a.exp, Path(a.results)), 0)[1])
+
+    d = sub.add_parser("dump", help="write replay dumps (events + Python decisions) for the Go port's differential test")
+    d.add_argument("--scenario", choices=ALL_SCENARIOS, nargs="+", default=list(SCENARIOS))
+    d.add_argument("--seeds", type=int, nargs="+", default=[1, 2, 3])
+    d.add_argument("--volume-frac", type=float, default=0.12)
+    d.add_argument("--arm", default="chosen-v2", choices=ALL_ARMS)
+    d.add_argument("--set", nargs="*", metavar="KEY=VALUE", help="BudgetConfig overrides")
+    d.add_argument("--out", default="dumps")
+    d.set_defaults(func=cmd_dump)
 
     for name in list(EXPERIMENTS) + ["all"]:
         e = sub.add_parser(name, help=f"run {name}" if name != "all" else "run every experiment",

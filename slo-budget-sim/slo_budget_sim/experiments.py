@@ -11,8 +11,9 @@ the scenario and the same collector cap = cap_factor * V*.
               weights; escalation; class key)
   exp6        pass 2: root policy at 25, 12, 5%
   exp7        pass 2: T_i calibration source at 25, 12%
-  exp8        chosen-v2 vs threshold, reservoir, uniform head at 25, 12, 5%
-              (pass 4 configuration: relative N_need, frozen rate trigger, credit off)
+  exp8        chosen-v2 vs the competitors (uniform head, reservoir top-K, Canopy-style rate
+              target, tail-based whole-trace sampler) at 25, 12, 5%, with the ablations
+              (threshold, shared budget, oracle T, keep-parent) in their own table
   exp9        pass 3: outlier credit / reserve, c x k sweep at 12, 5%
   exp10       pass 3: N_need fixed 15 vs relative f at 25, 12, 5%
   exp11       pass 3: frozen trigger count vs rate (and kept) on steady/fault scenarios
@@ -35,17 +36,22 @@ from pathlib import Path
 
 import numpy as np
 
-from .baselines import CanopySampler, ReservoirSampler, UniformHeadSampler
+from .baselines import CanopySampler, ReservoirSampler, TailSampler, UniformHeadSampler
 from .metrics import REASON_GROUPS, CorpusArrays, compute
 from .replay import replay
 from .sampler import BEST_CALIB_SOURCE, BEST_COLD_PRIOR, BEST_CREDIT, BEST_N_NEED_FRAC, BEST_ROOT_POLICY, make_budget_arm
 from .synthetic import ALL_SCENARIOS, SCENARIOS, build_scenario, scenario_tag
 from .ttable import oracle_table
 
-BUDGET_ARMS = ("chosen", "chosen-local", "chosen-oracleT", "chosen-v2", "threshold", "keep-parent")
-OTHER_ARMS = ("reservoir", "uniform-head", "canopy")
+BUDGET_ARMS = ("chosen", "chosen-local", "chosen-oracleT", "chosen-v2", "threshold", "keep-parent",
+               "v2-shared", "v2-oracleT", "v2-keep-parent")
+OTHER_ARMS = ("reservoir", "uniform-head", "canopy", "tail")
 ALL_ARMS = BUDGET_ARMS + OTHER_ARMS
-STAGE1_ARMS = ("chosen", "chosen-local", "chosen-oracleT", "threshold", "keep-parent") + OTHER_ARMS
+# the mechanism, its competitors (other samplers) and its ablations (the same mechanism with one part removed)
+MECHANISM_ARMS = ("chosen", "chosen-v2")
+COMPETITOR_ARMS = ("uniform-head", "reservoir", "canopy", "tail")
+ABLATION_ARMS = ("threshold", "chosen-local", "v2-shared", "chosen-oracleT", "v2-oracleT", "keep-parent", "v2-keep-parent")
+STAGE1_ARMS = ("chosen", "chosen-local", "chosen-oracleT", "threshold", "keep-parent", "reservoir", "uniform-head", "canopy")
 # pass 2 base: local budget, uniform plan, escalation off, class key on
 V2_BASE = {"budget_scope": "local", "plan": "uniform", "escalation": "none", "use_class": True}
 # pass 3 base: + on-demand roots, frozen calibration (rate trigger), relative N_need
@@ -109,6 +115,9 @@ def make_arm(arm: str, overrides: dict):
         return UniformHeadSampler(alpha=overrides.get("alpha", 0.5))
     if arm == "canopy":
         return CanopySampler(alpha=overrides.get("alpha", 0.5))
+    if arm == "tail":
+        return TailSampler(initial_rate=overrides.get("initial_rate", 0.15), alpha=overrides.get("alpha", 0.5),
+                           timeout_slo_mult=overrides.get("timeout_slo_mult", 2.0), timeout_s=overrides.get("timeout_s"))
     raise KeyError(arm)
 
 
@@ -232,8 +241,12 @@ def exp4_jobs(seeds: list[int], extra: dict | None = None) -> list[Job]:
 
 
 def exp5_jobs(seeds: list[int], extra: dict | None = None) -> list[Job]:
-    return [Job("exp5", sc, sd, "chosen", f"use_class={uc}", {**(extra or {}), "use_class": uc})
+    """Class key on vs off, plus the tail-based baseline as the context reference
+    (its attributability and true-loss accounting next to the mechanism's)."""
+    jobs = [Job("exp5", sc, sd, "chosen", f"use_class={uc}", {**(extra or {}), "use_class": uc})
             for sc in ("mixed_size", "steady") for sd in seeds for uc in (True, False)]
+    jobs += [Job("exp5", sc, sd, "tail", "tail", {}) for sc in ("mixed_size", "steady") for sd in seeds]
+    return jobs
 
 
 def exp6_jobs(seeds: list[int], extra: dict | None = None) -> list[Job]:
@@ -251,11 +264,15 @@ def exp7_jobs(seeds: list[int], extra: dict | None = None) -> list[Job]:
 
 
 def exp8_jobs(seeds: list[int], extra: dict | None = None) -> list[Job]:
-    """chosen-v2 vs threshold-only, reservoir and uniform head at 25, 12 and 5%.
-    threshold gets the same root policy, calibration source, N_need mode and
-    cold-start prior as chosen-v2 so that the budget is the only difference."""
+    """chosen-v2 vs the competitors (uniform head, reservoir top-K, Canopy-style
+    rate target, tail-based whole-trace sampler) and vs its ablations (threshold =
+    no budget / pool / N_need, shared budget, oracle T, keep-parent) at 25, 12
+    and 5%.  threshold gets the same root policy, calibration source, N_need mode
+    and cold-start prior as chosen-v2 so that the budget is the only difference."""
     v2 = {**V4_BASE, **(extra or {})}
-    arms = [("chosen-v2", v2), ("threshold", v2), ("reservoir", {}), ("uniform-head", {})]
+    arms = [("chosen-v2", v2), ("uniform-head", {}), ("reservoir", {}), ("canopy", {}), ("tail", {}),
+            ("threshold", v2), ("v2-shared", dict(extra or {})), ("v2-oracleT", dict(extra or {})),
+            ("v2-keep-parent", dict(extra or {}))]
     return [Job("exp8", sc, sd, arm, arm, dict(ov), volume_frac=vf)
             for vf in VOLUMES for sc in SCENARIOS for sd in seeds for arm, ov in arms]
 
@@ -317,6 +334,8 @@ COLUMNS = ["exp", "scenario", "seed", "arm", "label", "overrides", "volume_frac"
            "attrib_explained", "attrib_own", "attrib_child", "attrib_clean", "attrib_loss"]
 COLUMNS += [f"loss_{g}" for g in REASON_GROUPS] + ["loss_split", "lost_outliers"]
 COLUMNS += [f"ref_{g}" for g in REASON_GROUPS] + ["refusal_split"]
+COLUMNS += ["buffer_peak_spans", "buffer_mean_spans", "buffer_peak_bytes", "decision_latency_mean", "decision_latency_p95",
+            "decision_latency_max", "evicted_traces", "cap_dropped_traces"]
 COLUMNS += ["outlier_share_p0", "outlier_precision_p0", "recall_p0", "truth_outliers_p0", "lost_outliers_p0",
             "ref_not_flagged_p0", "refusal_split_p0", "prior_periods",
             "truth_rate_median", "truth_rate_max", "truth_rate_spread", "truth_rate_by_svc", "truth_systemic", "truth_culprit_est"]
@@ -392,6 +411,10 @@ def _cell(v: float, m: str) -> str:
     if m in ("evidence_s", "evidence_flagged_s", "evidence_any_s", "budget_mean", "budget_last",
              "holes_per_kept_parent", "max_pre_ratio", "min_vol_ratio", "max_host_ratio"):
         return f"{v:.2f}"
+    if m.startswith("decision_latency"):
+        return f"{1000 * v:.1f} ms"
+    if m == "buffer_peak_bytes":
+        return f"{v / 1e6:.2f} MB"
     if m in ("max_per_request", "p99_per_request"):
         return f"{v:.1f}"
     return f"{v:.0f}"
@@ -434,16 +457,23 @@ HEAD = {"event_recall": "event recall", "p95_err_pooled": "P95 err pooled", "kep
         "lost_outliers_p0": "lost p0", "ref_not_flagged_p0": "not flagged p0", "prior_periods": "prior periods",
         "truth_rate_median": "truth rate median", "truth_rate_max": "truth rate max", "truth_rate_spread": "max/median",
         "truth_systemic": "truth systemic", "truth_culprit_est": "truth culprit", "viol_requests_frac": "SLO-miss requests",
-        "spend_top": "top kept rates", "loss_not_flagged": "loss not flagged"}
+        "spend_top": "top kept rates", "loss_not_flagged": "loss not flagged",
+        "buffer_peak_spans": "peak buffered", "buffer_mean_spans": "mean buffered", "buffer_peak_bytes": "peak buffered bytes",
+        "decision_latency_mean": "decision latency mean", "decision_latency_p95": "decision latency p95",
+        "decision_latency_max": "decision latency max", "evicted_traces": "evicted (timeout)", "cap_dropped_traces": "traces refused by cap"}
 
 HEADLINE = ["kept_per_period", "vol_ratio", "over_cap_periods", "root_share", "outlier_share", "outlier_precision",
-            "max_per_request", "max_per_host_period", "attrib_explained", "attrib_loss", "outlier_no_root",
+            "max_per_request", "max_per_host_period", "buffer_peak_spans", "attrib_explained", "attrib_loss", "outlier_no_root",
             "recall_culprit", "culprit_est", "identified", "p95_err_svc_mean", "p95_err_svc_max", "evidence_s"]
+COST_COLS = ["max_per_request", "max_per_host_period", "buffer_peak_spans", "buffer_mean_spans", "buffer_peak_bytes",
+             "decision_latency_mean", "decision_latency_p95", "decision_latency_max", "evicted_traces", "cap_dropped_traces",
+             "over_cap_periods", "evidence_s"]
 HEADLINE_NOTE = ("Headline metrics, periods >= 1: outlier share = kept non-root spans that are truth outliers "
                  "(over T_oracle or not OK); precision = spans kept *as* outliers that are truth outliers; "
                  "max/request and max/host/period in span units (a root record = 0.1); explained = kept truth "
                  "outliers whose excess can be placed (own time over its share, a kept child carries it, or every "
                  "hole was ordinary); true loss = the excess sat in a dropped child that was itself an outlier; "
+                 "bounded spend = max/request, max/host/period and peak buffered spans at the collector, real numbers for every arm; "
                  "no root = kept truth outliers without any root; P95 err/svc = |est-true|/true of the 1/p-reweighted "
                  "P95 per service pooled over routes and periods >= 1 (mean and max over services); "
                  "culprit recall and evidence time are secondary.  Span recall stays in the CSV only.\n")
@@ -473,10 +503,13 @@ def _arm_order(rows: list[dict], key: str, order: tuple) -> None:
 
 
 def _per_volume_tables(parts: list[str], rows: list[dict], key: str, order: tuple, cols: list[str],
-                       scenarios: list[str], per_scenario: bool = True) -> None:
+                       scenarios: list[str], per_scenario: bool = True, arms: tuple | None = None,
+                       title: str | None = None) -> None:
+    if arms is not None:
+        rows = [r for r in rows if r.get(key) in arms]
     for vf in _by_volume(rows):
         vrows = [r for r in rows if r.get("volume_frac", 0.25) == vf]
-        parts.append(f"## V* = {100 * vf:.0f}% of spans\n")
+        parts.append(f"## {title + ', ' if title else ''}V* = {100 * vf:.0f}% of spans\n")
         agg = _agg(vrows, (key,), cols[1:])
         _arm_order(agg, key, order)
         parts.append("### all scenarios (mean over scenarios and seeds)\n")
@@ -500,9 +533,23 @@ def summarize(exp: str, rows: list[dict]) -> str:
     parts = [f"# {exp}", ""]
     if exp in ("exp1", "exp1_tight", "exp8"):
         cols = ["arm"] + HEADLINE
-        parts.append("Chosen mechanism vs baselines at equal volume target V* and cap (1.25 V*); means over seeds. "
+        competitors = MECHANISM_ARMS + COMPETITOR_ARMS
+        parts.append("Chosen mechanism vs the competitors (uniform head, reservoir top-K, Canopy-style rate target, "
+                     "tail-based whole-trace sampler) at equal volume target V* and cap (1.25 V*); means over seeds.  "
+                     "The ablations (threshold = no budget / pool / N_need, shared instead of local budget, oracle T "
+                     "instead of calibration, keep-parent) follow in their own tables and are not competitors.  "
                      + HEADLINE_NOTE)
-        _per_volume_tables(parts, rows, "arm", ALL_ARMS, cols, scenarios)
+        _per_volume_tables(parts, rows, "arm", ALL_ARMS, cols, scenarios, arms=competitors, title="Competitors")
+        _per_volume_tables(parts, rows, "arm", ALL_ARMS, cols, scenarios, arms=MECHANISM_ARMS + ABLATION_ARMS,
+                           title="Ablations", per_scenario=False)
+        parts.append("## Collector cost and bounded spend\n")
+        parts.append("For every arm: the most span units one request contributed, the most on one host in one period, "
+                     "the most spans the arm held at the collector before deciding (tail: whole traces until the root "
+                     "ends; reservoir: its candidates until period end; budget and head arms: none), the mean held, the "
+                     "peak bytes held, the tail sampler's decision latency (root end minus the trace's first span start), "
+                     "the traces its buffer timed out (2 x SLO) and the traces its cap refused, periods over the cap, "
+                     "and the evidence time.\n")
+        _per_volume_tables(parts, rows, "arm", ALL_ARMS, ["arm"] + COST_COLS, scenarios, per_scenario=False, title="Cost")
         rcols = ["arm"] + REFUSAL_COLS + ["attrib_loss", "loss_split"]
         parts.append("## Refusals and true losses\n")
         parts.append("Refusals: why truth outliers (non-root, periods >= 1) were not kept, as shares of the lost "
@@ -552,9 +599,12 @@ def summarize(exp: str, rows: list[dict]) -> str:
             parts.append("")
     elif exp == "exp5":
         cols = ["label", "kept_per_period", "outlier_share", "recall_small", "recall_large", "recall_culprit",
-                "outlier_precision", "evidence_s", "culprit_est", "identified", "p95_err_svc_mean", "p95_within5"]
+                "outlier_precision", "evidence_s", "culprit_est", "identified", "p95_err_svc_mean", "p95_within5",
+                "attrib_explained", "attrib_loss", "max_per_request", "buffer_peak_spans"]
         parts.append("T_i keyed by (service, root, class) vs (service, root). The oracle is class-aware, so "
-                     "recall and precision are judged against per-class truth.\n")
+                     "recall and precision are judged against per-class truth.  The tail-based whole-trace sampler "
+                     "is the context reference: its attributability (explained / true loss) and bounded spend next "
+                     "to the mechanism's.\n")
         for sc in scenarios:
             sub = [r for r in rows if r["scenario"] == sc]
             parts.append(f"## {sc}\n")
@@ -647,28 +697,30 @@ def headline_check(rows: list[dict], vf: float | None = None) -> str:
     chosen_arm = "chosen-v2" if any(r["arm"] == "chosen-v2" for r in rows) else "chosen"
     title = "## Headline comparison" + (f" at V* = {100 * vf:.0f}%" if vf is not None else "")
     lines = [title, "",
-             f"{chosen_arm} vs uniform-head and reservoir: outlier share / precision / max per request / "
-             "explained / P95 err per service (mean); P95 within 5% is the only pass-fail item.", ""]
+             f"{chosen_arm} vs the competitors uniform-head, reservoir and tail (ablations excluded): outlier share / "
+             "culprit recall / max per request / explained / P95 err per service (mean); P95 within 5% is the only pass-fail item.", ""]
 
     def _m(rs, k):
         v = [r[k] for r in rs if isinstance(r.get(k), (int, float)) and not math.isnan(r[k])]
         return float(np.mean(v)) if v else math.nan
 
+    def _c(rs, k, fmt="{:.2f}"):
+        v = _m(rs, k)
+        return fmt.format(v) if not math.isnan(v) else "-"
+
     for sc in _scenarios(rows):
         ch = [r for r in rows if r["scenario"] == sc and r["arm"] == chosen_arm]
-        uh = [r for r in rows if r["scenario"] == sc and r["arm"] == "uniform-head"]
-        rv = [r for r in rows if r["scenario"] == sc and r["arm"] == "reservoir"]
         if not ch:
             continue
+        comp = {a: [r for r in rows if r["scenario"] == sc and r["arm"] == a] for a in ("uniform-head", "reservoir", "tail")}
+        comp = {a: rs for a, rs in comp.items() if rs}
         p95 = _m(ch, "p95_err_svc_mean")
-        lines.append(f"- {sc}: {chosen_arm} outlier share {_m(ch, 'outlier_share'):.2f}"
-                     + (f" (uniform-head {_m(uh, 'outlier_share'):.2f}, reservoir {_m(rv, 'outlier_share'):.2f})" if uh and rv else "")
-                     + f"; precision {_m(ch, 'outlier_precision'):.2f}; max/request {_m(ch, 'max_per_request'):.1f}"
-                     + (f" (reservoir {_m(rv, 'max_per_request'):.1f})" if rv else "")
-                     + f"; explained {_m(ch, 'attrib_explained'):.2f}, true loss {_m(ch, 'attrib_loss'):.2f}"
-                     + (f" (uniform-head {_m(uh, 'attrib_explained'):.2f}, reservoir {_m(rv, 'attrib_explained'):.2f})" if uh and rv else "")
-                     + f"; P95 err/svc {100 * p95:.1f}% -> {'PASS' if p95 <= 0.05 else 'FAIL'}"
-                     + (f" (uniform-head {100 * _m(uh, 'p95_err_svc_mean'):.1f}%, reservoir {100 * _m(rv, 'p95_err_svc_mean'):.1f}%)" if uh and rv else ""))
+        others = lambda k, fmt="{:.2f}": ", ".join(f"{a} {_c(rs, k, fmt)}" for a, rs in comp.items())   # noqa: E731
+        lines.append(f"- {sc}: {chosen_arm} outlier share {_c(ch, 'outlier_share')} ({others('outlier_share')})"
+                     f"; culprit recall {_c(ch, 'recall_culprit')} ({others('recall_culprit')})"
+                     f"; max/request {_c(ch, 'max_per_request', '{:.1f}')} ({others('max_per_request', '{:.1f}')})"
+                     f"; explained {_c(ch, 'attrib_explained')}, true loss {_c(ch, 'attrib_loss')} ({others('attrib_explained')})"
+                     f"; P95 err/svc {100 * p95:.1f}% -> {'PASS' if p95 <= 0.05 else 'FAIL'} ({others('p95_err_svc_mean', '{:.3f}')})")
     return "\n".join(lines) + "\n"
 
 

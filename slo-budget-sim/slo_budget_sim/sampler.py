@@ -112,6 +112,16 @@ class Sampler:
     def flush_period(self, period: int) -> list[tuple[int, float, str]]:
         return []
 
+    def take_releases(self) -> list[tuple[int, bool, float, str]]:
+        """Decisions for spans the arm deferred ("defer" from on_end) that it has
+        now resolved: (idx, keep, p, reason).  Drained by the replay after every
+        on_end, at the current time (tail-based arms decide at the root's end)."""
+        return []
+
+    def finish(self) -> list[tuple[int, bool, float, str]]:
+        """Resolve whatever is still deferred when the replay ends."""
+        return []
+
     def on_period_end(self, period: int, collector_volume: float) -> None:
         pass
 
@@ -628,6 +638,11 @@ def make_budget_arm(name: str, **overrides) -> BudgetSampler:
         "threshold": {"unbounded": True, "n_need": math.inf, "n_need_mode": "fixed"},
         "keep-parent": {"keep_parent": True},
     }
+    # ablations of chosen-v2: the same mechanism with one part removed or replaced
+    v2 = presets["chosen-v2"]
+    presets["v2-shared"] = {**v2, "budget_scope": "shared"}        # one budget per request instead of per (request, host)
+    presets["v2-oracleT"] = {**v2, "calib_source": "oracle"}      # the ground-truth table instead of calibration
+    presets["v2-keep-parent"] = {**v2, "keep_parent": True}        # also keep the parent of a kept outlier
     if name not in presets:
         raise KeyError(name)
     cfg = BudgetConfig(**{**presets[name], **overrides})

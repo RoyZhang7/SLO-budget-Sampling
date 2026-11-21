@@ -8,6 +8,9 @@ runs on the cluster head node with the system python3).
 
 The window [start, end) is split into `chunk`-second pieces so that no single
 query has to return the whole run; traces are de-duplicated by traceID.  The
+query API filters by service, so a shed trace that kept no span of the given
+service is invisible to it: pass every service (comma-separated) to get all
+traces.  The
 output has the query-API shape ({"data": [...]}) that `slo_budget_sim.jaeger`
 loads.  A chunk that returns exactly `limit` traces is reported as truncated.
 """
@@ -39,7 +42,7 @@ def fetch(base: str, service: str, start_s: float, end_s: float, limit: int, ret
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--base", required=True)
-    ap.add_argument("--service", required=True)
+    ap.add_argument("--service", required=True, help="service name, or several comma-separated (traces are merged by traceID)")
     ap.add_argument("--start", type=float, required=True, help="epoch seconds")
     ap.add_argument("--end", type=float, required=True, help="epoch seconds")
     ap.add_argument("--chunk", type=float, default=60.0)
@@ -51,21 +54,25 @@ def main() -> int:
     traces: list = []
     spans = 0
     t = a.start
+    services = [x.strip() for x in a.service.split(",") if x.strip()]
     while t < a.end:
         e = min(a.end, t + a.chunk)
-        data = fetch(a.base, a.service, t, e, a.limit)
-        new = 0
-        for tr in data:
-            tid = tr.get("traceID")
-            if tid in seen:
-                continue
-            seen.add(tid)
-            traces.append(tr)
-            spans += len(tr.get("spans", []))
-            new += 1
-        flag = "  TRUNCATED (raise --limit or lower --chunk)" if len(data) >= a.limit else ""
+        got, new = 0, 0
+        for service in services:
+            data = fetch(a.base, service, t, e, a.limit)
+            got += len(data)
+            for tr in data:
+                tid = tr.get("traceID")
+                if tid in seen:
+                    continue
+                seen.add(tid)
+                traces.append(tr)
+                spans += len(tr.get("spans", []))
+                new += 1
+            if len(data) >= a.limit:
+                print(f"  TRUNCATED chunk for {service} (raise --limit or lower --chunk)")
         print(f"{time.strftime('%H:%M:%S', time.gmtime(t))}-{time.strftime('%H:%M:%S', time.gmtime(e))}: "
-              f"{len(data)} traces, {new} new{flag}")
+              f"{got} traces returned over {len(services)} services, {new} new")
         t = e
     with open(a.out, "w", encoding="utf-8") as f:
         json.dump({"data": traces, "total": len(traces), "limit": a.limit, "offset": 0, "errors": None}, f)
