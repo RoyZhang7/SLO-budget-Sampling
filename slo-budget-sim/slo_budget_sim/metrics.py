@@ -38,6 +38,8 @@ Secondary:
                     service's span count; the deepest service within 50% of the
                     maximum is named unless 60% of services qualify (systemic)
   t_drift_*         T_used / T_oracle - 1 from the sampler's per-period table
+  frozen_svc_periods / frozen_by_svc   (service, period) pairs the frozen source held
+  frozen_entries / frozen_entries_by_svc   frozen-trigger firings: transitions into frozen
 Reference (CSV only): span recall, event recall, P95 per (service, route, period).
 """
 from __future__ import annotations
@@ -531,6 +533,16 @@ def compute(corpus: Corpus, arrays: CorpusArrays, res: RunResult, within: float 
         for svc in d.get("frozen", []):
             fz[svc] = fz.get(svc, 0) + 1
     out["frozen_by_svc"] = " ".join(f"{s}:{v}" for s, v in sorted(fz.items(), key=lambda kv: -kv[1])[:8])
+    # frozen-trigger firings: transitions of a service from not frozen to frozen between consecutive periods
+    entries: dict[str, int] = {}
+    prev: set[str] = set()
+    for d in res.diagnostics:
+        cur = set(d.get("frozen", []))
+        for svc in cur - prev:
+            entries[svc] = entries.get(svc, 0) + 1
+        prev = cur
+    out["frozen_entries"] = int(sum(entries.values()))
+    out["frozen_entries_by_svc"] = " ".join(f"{s}:{v}" for s, v in sorted(entries.items(), key=lambda kv: -kv[1])[:8])
     # the trailing partial period is excluded, as in the volume metrics: with a
     # handful of spans every service is under N_need and the tables are not meaningful
     partial_last = res.periods[-1].period if (len(res.periods) > 1 and pers and pers[-1] is not res.periods[-1]) else None

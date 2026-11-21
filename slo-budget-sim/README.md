@@ -10,14 +10,19 @@ mirror the sampler interface in `sampler.py` one to one.
 python -m venv .venv
 .venv/Scripts/pip install -e ".[dev]"        # Windows; use .venv/bin/pip elsewhere
 .venv/Scripts/python -m pytest
-.venv/Scripts/python -m slo_budget_sim.cli all --jobs 8          # experiments 1-13 -> results/ (resumable: rows already there are kept)
+.venv/Scripts/python -m slo_budget_sim.cli all --jobs 8          # experiments 1-14 -> results/ (resumable: rows already there are kept)
 .venv/Scripts/python -m slo_budget_sim.cli exp8 --jobs 8 --fresh # chosen-v2 vs baselines at 25 / 12 / 5 %, rerun from scratch
 .venv/Scripts/python -m slo_budget_sim.cli exp9 --jobs 8 --set n_need_frac=0.3   # overrides for every budget arm
 .venv/Scripts/python -m slo_budget_sim.cli replay --scenario saturated --arm chosen-v2 reservoir
 .venv/Scripts/python -m slo_budget_sim.cli replay --scenario saturated --arm chosen-local --set outlier_credit=reserve credit_frac=0.2
 .venv/Scripts/python -m slo_budget_sim.cli replay --jaeger traces.json --reference healthy.json --arm chosen-v2
 .venv/Scripts/python -m slo_budget_sim.cli generate --scenario cascade --out corpora/cascade.json
+.venv/Scripts/python -m slo_budget_sim.cli exp14 --jobs 8 --volumes 0.25 0.12 0.05   # healthy-tail outlier rules, fitted + drift (+dr) + heavytail (+ht) workloads
+.venv/Scripts/python -m slo_budget_sim.cli replay --scenario steady+dr --arm chosen-v2 --set n_need_healthy=true
 .venv/Scripts/python -m slo_budget_sim.derive results/remote/export-10min.json -o slo_budget_sim/workload_dsbsn.json
+python3 tools/jaeger_kept_spans.py export.json kept_spans.json                       # on node-0: server spans per service with the sampling stamps (stdlib)
+.venv/Scripts/python -m slo_budget_sim.tailfit results/remote/server_durations_us.json --service usertimeline --out slo_budget_sim/workload_dsbsn_heavytail.json --family lognormal_pareto@0.95
+.venv/Scripts/python tools/drift_workload.py results/remote/run3_kept_spans.json ../slo-budget-otel/results/cluster-20261120-165437/times.json -o slo_budget_sim/workload_dsbsn_drift.json
 python3 tools/jaeger_export.py --base http://<jaeger-query>:16686 --service unknown_service:wrk2api_service_pb_es_proc --start <epoch s> --end <epoch s> --out export.json
 bash results/remote/setup_remote.sh      # on node-0 after `tar xzf sim.tgz`: venv, tests, then run_pass4.sh detached in tmux (load, export, derive, cli all)
 ```
@@ -31,7 +36,7 @@ bash results/remote/setup_remote.sh      # on node-0 after `tar xzf sim.tgz`: ve
 | T_i from the Erms square-root split of the root SLO | `ttable.sqrt_split` | Stage budget b_i = SLO sqrt(O_i)/W over the route's critical structure, inclusive T_i = b_i + callees' T (sum, or max under a parallel fan-out), scaled so T_root = SLO. O_i is the calibration quantile of the service's own time (duration minus outbound calls, locally computable from server + client spans). `Calibrator.b` keeps the stage budgets. |
 | Keyed by (service, root, class), fallback to (service, root) below `min_class_samples` | `ttable.Calibrator` | class = route + payload-size bucket. |
 | Calibration source (`calib_source`) | `BudgetSampler._observe`, `_freeze_set`, `Calibrator.end_period` | `kept`: every kept span, 1/p-weighted (P95 per period over a window of 2 periods); `plan`: plan-sampled ordinary spans and roots kept at p = 1 only; `frozen`: as kept, but a service is held at its previous own-time and inclusive quantiles (L, O) while it is frozen and its samples from frozen periods never enter the window; `oracle`: the ground-truth table. Freeze trigger (`freeze_trigger`): `rate` (default) = the period's outlier rate >= `freeze_rate_mult` (2) x the service's healthy rate (an EWMA updated while unfrozen, at least `freeze_rate_floor` = 1%, needs `n_min` outliers); `count` = the pass-2 rule, more than N_need outliers in the period. Cold start (`cold_prior`): `none` (default) = plan sampling only until the service's first calibrated period; `equal` = the equal-share square-root split of the SLO (`ttable.equal_share_prior`: every stage of the root's critical structure gets SLO / stages, T adds up along the tree) stands in for T_i until then (exp12: on this tree it flags half of the biggest leaf's healthy spans and misses the cold-start fault, so it stays off). |
-| Outlier = duration > T_i or status not OK | `BudgetSampler._decide_span` | |
+| Outlier = duration > T_i or status not OK | `BudgetSampler._decide_span` | Pass-5 candidate rules behind switches that default to this rule (exp14, `results/REPORT-exp14.md`): `outlier_margin` m > 0 flags only duration > (1 + m) T_i and plan-samples the band in between; `calib_q` moves the split's percentile (0.975, 0.99; T_root = SLO still, so it mostly moves the shares); `n_need_healthy` keeps a span over T_i as an outlier but lets the N_need counter and the frozen trigger count only the misses beyond the service's healthy over-T rate (the EWMA kept while not frozen): n_eff = n_seen - rate x spans seen so far, trigger on rate - healthy. |
 | Keep at p = 1 until N_need per (service, period), then p = N_need/N x g(miss) | `BudgetSampler._decide_span`, `_growth` | g: const, linear (1+miss), sqrt, quadratic; miss = (duration - T)/T. Outliers are counted whether or not the coin keeps them. `n_need_mode=fixed`: N_need = `n_need`; `relative`: N_need = max(`n_min`, floor(`n_need_frac` x V* / services)). |
 | p stamped on every kept span; request budget and host pool decremented; drop when either is 0 | `BudgetSampler._spend` | `budget_scope=local` counts the budget per (request, host) (the plan's local reading). |
 | Outlier credit (`outlier_credit`) | `BudgetSampler._try_credit`, `_repayment` | An outlier refused by the request budget or the host pool: `none` drops it; `credit` keeps it while the host's credit for the period (`credit_frac` x pool) lasts and repays the debt from the next period's plan sampling on that host (plan rate scaled down, p recorded as usual; credit does not roll over; outlier keeps are never reduced); `reserve` keeps it from the `credit_frac` x pool set aside for refused outliers. Eligibility in order: the service is under N_need for the period; below `credit_low_water` of the allowance a coin with p = miss ratio clipped to [0.05, 1] (errors p = 1) decides and p is recorded; at most `credit_k` credit/reserve spans per request. |
@@ -119,6 +124,27 @@ start at 30 s unless noted.
 Ground truth: a healthy reference run of the same workload defines the SLOs
 and the oracle T table (the calibration procedure run on complete data).
 
+Workload variants (pass 5): a scenario name with a suffix runs the same scenario
+on another timing file, same structure (`synthetic.workload_variant`,
+`split_scenario`; the result rows carry the variant's workload id in their
+tag).  A service entry's `dist` object replaces its lognormal draw
+(`tailfit.py`: `lognormal`, `loglogistic` = logistic in log space with a
+power-law tail of index `shape`, `lognormal_pareto` = lognormal body spliced at
+its `tail_q` quantile to a Pareto tail of index `tail_alpha`; fitted by
+`python -m slo_budget_sim.tailfit`, the family chosen by held-out fit on the
+top 5%: conditional log-likelihood and quantile error on the other half).  A
+variant that names a `reference_variant` has its healthy reference (SLO, oracle
+T) generated from that workload: the deployment drifted from what the SLO was
+derived from.
+
+| Suffix | Variant | Content |
+| --- | --- | --- |
+| `+ht` | `heavytail` (`workload_dsbsn_heavytail.json`) | usertimeline's own time from the heavy-tailed refit of the 10-minute export (lognormal body, Pareto tail of index 14.8 spliced at P95); held-out fit picks the plain lognormal by a hair, i.e. the export has no heavy tail (P99 / P95 = 1.11, 0.15% of spans over the oracle T); the variant is the heavy-tailed candidate forced, and changes nothing measurable |
+| `+dr` | `drift` (`workload_dsbsn_drift.json`, `tools/drift_workload.py`) | the deployment as it ran during the Stage 2 cluster runs, from the spans the agents kept by the plan in run 3 outside the hog window (`tools/jaeger_kept_spans.py`): every service's level (leaves by lognormal fit of the durations, callers' own medians scaled by the inclusive-median ratio: usertimeline x1.27, hometimeline x1.16, composepost x1.11, wrk2api x1.09, the rest within 10%), usertimeline with the held-out tail family (lognormal + Pareto index 23.7, i.e. no heavy tail either), reference = fitted: the SLO and the oracle T of the pass-4 workload, so usertimeline sits with its P95 at its T and 3.7% of its healthy spans are truth outliers (0.3% on the fitted workload), as on the cluster |
+
+`+ht` and `+dr` rows are not on the fitted workload and are reported only in
+exp14.
+
 ## Metrics (`metrics.py`)
 
 Headline (all over periods >= 1, after the cold-start period; equal volume target and cap):
@@ -132,7 +158,7 @@ Headline (all over periods >= 1, after the cold-start period; equal volume targe
 - `p95_err_svc_mean` / `_max` / `p95_svc_within5` / `p95_err_root`: 1/p-reweighted P95 error per service, pooled over routes and periods >= 1
 - secondary: `recall_culprit`, `evidence_s` (first kept truth outlier of the culprit after the fault, at decision time), `culprit_est` / `identified` (reweighted kept outliers per service over the service's span count; deepest service within 50% of the maximum unless 60% of services qualify, "systemic")
 - `root_share` / `record_share`, `credit_share`, `debt_total`, `n_need_eff`
-- `t_drift_pre` / `t_drift_culprit` / `t_drift_healthy*`: T_used / T_oracle - 1 of the table in force each period; `frozen_svc_periods`, `frozen_by_svc`
+- `t_drift_pre` / `t_drift_culprit` / `t_drift_healthy*`: T_used / T_oracle - 1 of the table in force each period; `frozen_svc_periods`, `frozen_by_svc`; `frozen_entries` / `frozen_entries_by_svc` = frozen-trigger firings (transitions into frozen)
 - cold-start period (period 0, which the headline metrics leave out): `outlier_share_p0`, `outlier_precision_p0`, `recall_p0`, `lost_outliers_p0`, `ref_not_flagged_p0` (lost truth outliers the arm's T did not flag), `prior_periods` (periods in which the cold-start prior answered a lookup)
 - fault shape on complete data (fault window): `truth_rate_median` / `truth_rate_max` / `truth_rate_spread` (max over median) of the truth outlier rate per service, `truth_systemic` / `truth_culprit_est` (the culprit rule applied to complete data)
 - reference, CSV only: span recall (`recall`, `recall_window`), `event_recall`, P95 error per (service, route, period) cell and pooled per (service, route), holes, SLO-violating request coverage, drops and keeps by reason
@@ -166,7 +192,9 @@ relative N_need exp10, frozen trigger exp11, exp8 rerun, generator
 re-derivation; its numbers are on the provisional timings) and
 `results/REPORT-pass4.md` the pass-4 write-up (cold-start prior exp12,
 late-everywhere retune exp13, exp8 at three volumes on the fitted timings, the
-fitted vs provisional timings).  Every CSV is on the fitted workload; `cli all`
+fitted vs provisional timings), `results/REPORT-tail.md` the pass-5 tail-based
+baseline and `results/REPORT-exp14.md` the pass-5 outlier-rule sweep (exp14,
+with the `+dr` / `+ht` workload variants).  Every other CSV is on the fitted workload; `cli all`
 regenerates everything (about 20 minutes with 20 workers) and is resumable:
 rows already in a CSV for the same scenario, seed, arm, label, volume,
 overrides, resolved arm configuration and workload / scenario tag are kept,

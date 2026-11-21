@@ -31,6 +31,7 @@ from pathlib import Path
 import numpy as np
 
 from .model import CallGraph, Corpus, FaultTruth, Span
+from .tailfit import draw as draw_dist, drawer as dist_drawer, lognormal_spec
 from .ttable import Calibrator, split_budgets, weighted_quantile
 
 # ---------------------------------------------------------------------------
@@ -57,6 +58,34 @@ def load_workload(path: Path | str | None = None) -> dict:
 
 
 WORKLOAD = load_workload()
+# named variants of the workload: the same structure, other timings for some services; a
+# service entry's `dist` object replaces its lognormal draw (tailfit.py).  A variant whose
+# JSON names a `reference_variant` has its healthy reference (SLO, oracle T) generated from
+# that workload instead of itself: the deployment drifted from what the SLO was derived from.
+#   heavytail   usertimeline from the heavy-tailed refit of the 10-minute export (tailfit)
+#   drift       the deployment as it ran during the Stage 2 cluster runs (tools/drift_workload.py
+#               from run 3's plan-kept spans: every service's level, usertimeline's tail),
+#               reference = fitted: the SLO and the oracle were derived before the drift
+WORKLOAD_VARIANT_PATHS = {"heavytail": Path(__file__).with_name("workload_dsbsn_heavytail.json"),
+                          "drift": Path(__file__).with_name("workload_dsbsn_drift.json")}
+_VARIANTS: dict[str, dict] = {}
+
+
+def workload_variant(name: str) -> dict:
+    if name in ("", "fitted"):
+        return WORKLOAD
+    if name not in _VARIANTS:
+        if name not in WORKLOAD_VARIANT_PATHS:
+            raise KeyError(f"unknown workload variant {name}; choose from {tuple(WORKLOAD_VARIANT_PATHS)}")
+        _VARIANTS[name] = load_workload(WORKLOAD_VARIANT_PATHS[name])
+    return _VARIANTS[name]
+
+
+def workload_id(wl: dict) -> str:
+    return hashlib.sha1(json.dumps({k: wl[k] for k in ("routes", "parallel", "services")},
+                                   sort_keys=True).encode()).hexdigest()[:8]
+
+
 ROUTE_TREES: dict[str, tuple] = {r: _tuple_tree(info["tree"]) for r, info in WORKLOAD["routes"].items()}
 for _r, _t in PROVISIONAL_ROUTES.items():
     ROUTE_TREES.setdefault(_r, _t)
@@ -77,13 +106,25 @@ ALL_SERVICES = tuple(MEDIAN_MS)
 # identity of the workload the corpora are generated from (structure and timings, not the
 # labels) and the version of each scenario's tuning; result rows carry both as `tag` so
 # that a resumed experiment reruns the rows that no longer match
-WORKLOAD_ID = hashlib.sha1(json.dumps({k: WORKLOAD[k] for k in ("routes", "parallel", "services")},
-                                      sort_keys=True).encode()).hexdigest()[:8]
+WORKLOAD_ID = workload_id(WORKLOAD)
 SCENARIO_VERSION = {"late_everywhere": 2}      # pass 4: equal-rate tuning (v1: own-time P95 at 1.6 x stage budget)
+SCENARIO_SUFFIX = {"ht": "heavytail", "dr": "drift"}         # `steady+ht` = steady on the heavytail variant
+
+
+def split_scenario(name: str) -> tuple[str, str]:
+    """`steady+ht` -> ("steady", "heavytail"); `steady` -> ("steady", "fitted")."""
+    base, _, suffix = name.partition("+")
+    if not suffix:
+        return base, "fitted"
+    if suffix not in SCENARIO_SUFFIX:
+        raise KeyError(f"unknown scenario suffix +{suffix}; choose from {tuple(SCENARIO_SUFFIX)}")
+    return base, SCENARIO_SUFFIX[suffix]
 
 
 def scenario_tag(name: str) -> str:
-    return f"{WORKLOAD_ID}/{name}v{SCENARIO_VERSION.get(name, 1)}"
+    base, variant = split_scenario(name)
+    wid = WORKLOAD_ID if variant == "fitted" else workload_id(workload_variant(variant))
+    return f"{wid}/{name}v{SCENARIO_VERSION.get(base, 1)}"
 
 
 @dataclass
@@ -127,6 +168,8 @@ class ScenarioConfig:
     culprit: str | None = None
     fault_kind: str = "none"
     medians_ms: dict[str, float] = field(default_factory=lambda: dict(MEDIAN_MS))
+    workload: str = "fitted"                    # workload variant the timings come from
+    dists: dict[str, dict] = field(default_factory=dict)    # service -> own-time `dist` spec (tailfit); lognormal when absent
 
     @property
     def mean_spans_per_request(self) -> float:
@@ -204,6 +247,9 @@ def generate(cfg: ScenarioConfig, routes_slo: dict[str, float] | None = None, he
     z = _Pool(rng.standard_normal, est)
     trf = _Pool(lambda n: rng.lognormal(0.0, 0.3, n), est)       # transit = callee median x lognormal factor
     u = _Pool(rng.random, est)
+    # uniforms for the non-lognormal own-time draws of a workload variant; created after the
+    # three pools above and only when needed, so the fitted workload's corpora do not change
+    ud = _Pool(rng.random, est // 8 + 1000) if cfg.dists else None
 
     skew_rng = np.random.default_rng(cfg.seed + 7)
     hosts = sorted(set(PLACEMENT.values()))
@@ -211,6 +257,10 @@ def generate(cfg: ScenarioConfig, routes_slo: dict[str, float] | None = None, he
 
     medians = {s: m / 1000.0 for s, m in cfg.medians_ms.items()}
     sig = {s: (cfg.sigma if cfg.sigma is not None else cfg.sigmas.get(s, 0.4)) for s in medians}
+    # own-time draw per service (seconds): lognormal `median * exp(sigma * z)` unless the
+    # workload variant gives the service a `dist` (cfg.sigma does not apply to those)
+    own_of = {s: dist_drawer(cfg.dists.get(s) or lognormal_spec(cfg.medians_ms[s], sig[s]), z.next,
+                             ud.next if ud is not None else None) for s in medians}
     transit = {s: cfg.transits_ms.get(s, cfg.transit_ms) / 1000.0 for s in medians}
     err = cfg.error_rate
     spans: list[Span] = []
@@ -220,7 +270,7 @@ def generate(cfg: ScenarioConfig, routes_slo: dict[str, float] | None = None, he
     def build(node, parent_idx, depth, start, trace_id, t_hop_in, route, cls, fac):
         nonlocal next_id
         service, kids = node
-        own = medians[service] * math.exp(sig[service] * z.next()) * fac.get(service, 1.0)
+        own = own_of[service]() * fac.get(service, 1.0)
         idx = len(spans)
         sp = Span(idx, next_id, trace_id, parent_idx, service, PLACEMENT.get(service, "node-x"), start, 0.0,
                   u.next() >= err, depth, route, cls, cfg.nbytes + 2 * len(service), t_hop_in, own)
@@ -281,7 +331,8 @@ def generate(cfg: ScenarioConfig, routes_slo: dict[str, float] | None = None, he
     corpus = Corpus(name or cfg.name, spans, roots, {}, graph, hosts, skew, cfg.period, 0.0,
                     meta={"rate": cfg.rate, "duration": cfg.duration, "requests": N,
                           "mean_spans_per_request": cfg.mean_spans_per_request,
-                          "workload": WORKLOAD.get("source", ""), "timings": WORKLOAD.get("timings", "")})
+                          "workload": WORKLOAD.get("source", ""), "variant": cfg.workload,
+                          "timings": workload_variant(cfg.workload).get("timings", "")})
     corpus.finalize()
     if routes_slo is None:
         routes_slo = {}
@@ -300,11 +351,17 @@ def generate(cfg: ScenarioConfig, routes_slo: dict[str, float] | None = None, he
 # ---------------------------------------------------------------------------
 SCENARIOS = ("steady", "saturated", "cascade", "bursty", "cold_start", "late_everywhere", "mixed_size")
 SCENARIO_VARIANTS = ("late_everywhere_v1",)      # named variants outside the default set
-ALL_SCENARIOS = SCENARIOS + SCENARIO_VARIANTS
+HEAVYTAIL_SCENARIOS = tuple(f"{s}+ht" for s in SCENARIOS)    # the default set on the heavytail workload variant
+DRIFT_SCENARIOS = tuple(f"{s}+dr" for s in SCENARIOS)        # ... and on the drift variant
+ALL_SCENARIOS = SCENARIOS + SCENARIO_VARIANTS + HEAVYTAIL_SCENARIOS + DRIFT_SCENARIOS
 
 
 def scenario(name: str, seed: int = 1, **overrides) -> ScenarioConfig:
+    base, variant = split_scenario(name)
     cfg = ScenarioConfig(name=name, seed=seed)
+    if variant != "fitted":
+        _apply_workload(cfg, variant)
+    name = base
     if name == "steady":
         pass
     elif name == "saturated":
@@ -383,6 +440,12 @@ def late_everywhere_rate_factors(cfg: ScenarioConfig, reference: Corpus, route: 
     transit = {s: cfg.transits_ms.get(s, cfg.transit_ms) / 1000.0 for s in med}
     factors: dict[str, float] = {}
 
+    def own_draw(svc: str) -> np.ndarray:
+        spec = cfg.dists.get(svc)
+        if spec is None:
+            return med[svc] * np.exp(sig[svc] * rng.standard_normal(n))
+        return draw_dist(spec, rng, n) / 1000.0
+
     def solve(node) -> np.ndarray:
         svc, kids = node
         parts = []
@@ -391,7 +454,7 @@ def late_everywhere_rate_factors(cfg: ScenarioConfig, reference: Corpus, route: 
             hop = transit.get(k[0], cfg.transit_ms / 1000.0) * rng.lognormal(0.0, 0.3, n)
             parts.append(2.0 * hop + d)
         rest = (np.max(parts, axis=0) if svc in PARALLEL else np.sum(parts, axis=0)) if parts else np.zeros(n)
-        own = med[svc] * np.exp(sig[svc] * rng.standard_normal(n))
+        own = own_draw(svc)
         Ts = T.get(svc)
         if svc not in factors and Ts is not None:
             if np.mean(own + rest > Ts) >= target:
@@ -411,11 +474,28 @@ def late_everywhere_rate_factors(cfg: ScenarioConfig, reference: Corpus, route: 
     return factors
 
 
+def _apply_workload(cfg: ScenarioConfig, variant: str) -> ScenarioConfig:
+    """Timings (medians, sigmas, transits, dist specs) of a workload variant into cfg."""
+    wl = workload_variant(variant)
+    cfg.workload = variant
+    cfg.medians_ms = {s: v["median_ms"] for s, v in wl["services"].items()}
+    cfg.sigmas = {s: v["sigma"] for s, v in wl["services"].items()}
+    cfg.transits_ms = {s: (v.get("transit_ms") or DEFAULT_TRANSIT_MS) for s, v in wl["services"].items()}
+    cfg.dists = {s: dict(v["dist"]) for s, v in wl["services"].items() if v.get("dist")}
+    return cfg
+
+
 def build_scenario(name: str, seed: int = 1, **overrides) -> tuple[Corpus, Corpus]:
     """(corpus, healthy reference).  The reference fixes the SLOs and is what
-    the ground-truth T table is calibrated from."""
+    the ground-truth T table is calibrated from.  A workload variant that names a
+    `reference_variant` gets its reference from that workload (the SLO and the
+    oracle were derived before the deployment drifted)."""
     cfg = scenario(name, seed, **overrides)
-    reference = generate(cfg, healthy=True, seed_offset=7919, name=f"{name}-reference")
+    ref_variant = workload_variant(cfg.workload).get("reference_variant", cfg.workload)
+    ref_cfg = cfg
+    if ref_variant != cfg.workload:
+        ref_cfg = _apply_workload(scenario(name, seed, **overrides), ref_variant)
+    reference = generate(ref_cfg, healthy=True, seed_offset=7919, name=f"{name}-reference")
     if cfg.fault_kind == "late_all" and all(f == 1.0 for fs in cfg.faults for _, _, f in fs.entries):
         if cfg.late_tuning == "share":
             factors = late_everywhere_factors(reference, share=cfg.late_share)

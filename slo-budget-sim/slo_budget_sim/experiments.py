@@ -19,6 +19,10 @@ the scenario and the same collector cap = cap_factor * V*.
   exp11       pass 3: frozen trigger count vs rate (and kept) on steady/fault scenarios
   exp12       pass 4: cold-start prior (equal-share split) vs none on cold_start/steady/saturated
   exp13       pass 4: late_everywhere re-tuned (equal rates) vs the pass-3 tuning (late_everywhere_v1)
+  exp14       pass 5: healthy-tail outlier rules on chosen-v2 (miss margin m, calibration percentile
+              P97.5 / P99, healthy-rate N_need) at 25, 12, 5%, on the fitted workload and on the
+              drift variant (`+dr`: the deployment as it ran during the Stage 2 cluster runs, SLO and
+              oracle anchored to the fitted reference) plus steady on the heavytail refit (`+ht`)
 
 Every experiment is resumable: rows already in results/<exp>.csv for the same
 (scenario, seed, arm, label, volume, overrides, workload / scenario tag) are
@@ -40,7 +44,7 @@ from .baselines import CanopySampler, ReservoirSampler, TailSampler, UniformHead
 from .metrics import REASON_GROUPS, CorpusArrays, compute
 from .replay import replay
 from .sampler import BEST_CALIB_SOURCE, BEST_COLD_PRIOR, BEST_CREDIT, BEST_N_NEED_FRAC, BEST_ROOT_POLICY, make_budget_arm
-from .synthetic import ALL_SCENARIOS, SCENARIOS, build_scenario, scenario_tag
+from .synthetic import ALL_SCENARIOS, DRIFT_SCENARIOS, SCENARIOS, build_scenario, scenario_tag
 from .ttable import oracle_table
 
 BUDGET_ARMS = ("chosen", "chosen-local", "chosen-oracleT", "chosen-v2", "threshold", "keep-parent",
@@ -76,7 +80,13 @@ NNEED_VARIANTS = [("fixed 15", {"n_need_mode": "fixed", "n_need": 15})] + [
 FREEZE_VARIANTS = [("count", {"calib_source": "frozen", "freeze_trigger": "count"}),
                    ("rate", {"calib_source": "frozen", "freeze_trigger": "rate"}),
                    ("kept", {"calib_source": "kept"})]
+RULE_VARIANTS = [("baseline", {})] + [(f"margin m={m}", {"outlier_margin": m}) for m in (0.1, 0.2, 0.3, 0.5)] + [
+    ("P97.5", {"calib_q": 0.975}), ("P99", {"calib_q": 0.99}), ("healthy-rate N_need", {"n_need_healthy": True})]
+EXP14_SCENARIOS = SCENARIOS + DRIFT_SCENARIOS + ("steady+ht",)     # fitted, drifted deployment, heavy-tail refit (steady only)
 VOLUMES = (0.25, 0.12, 0.05)
+# BudgetConfig fields added after the result rows of passes 1-5 were written: they enter the
+# config hash only when set away from their default, so those rows stay valid
+HASH_OPTIONAL = {"outlier_margin": 0.0, "n_need_healthy": False}
 
 
 @dataclass
@@ -146,7 +156,8 @@ def _config_hash_impl(arm: str, overrides: dict) -> str:
     if arm not in BUDGET_ARMS:
         return ""
     cfg = make_budget_arm(arm, **overrides).cfg
-    text = " ".join(f"{k}={v}" for k, v in sorted(asdict(cfg).items()))
+    fields = {k: v for k, v in asdict(cfg).items() if k not in HASH_OPTIONAL or v != HASH_OPTIONAL[k]}
+    text = " ".join(f"{k}={v}" for k, v in sorted(fields.items()))
     return hashlib.sha1(text.encode()).hexdigest()[:10]
 
 
@@ -321,9 +332,22 @@ def exp13_jobs(seeds: list[int], extra: dict | None = None) -> list[Job]:
             for arm, label, ov in LATE_ARMS]
 
 
+def exp14_jobs(seeds: list[int], extra: dict | None = None) -> list[Job]:
+    """Healthy-tail outlier rules on chosen-v2: the plain over-T rule (baseline), a
+    miss margin (outlier only over (1 + m) T_i, m in 0.1 .. 0.5), the calibration
+    percentile raised to P97.5 / P99 (split unchanged otherwise) and the
+    healthy-rate N_need (the N_need counter and the frozen trigger count only the
+    misses beyond the service's healthy over-T rate), at 25, 12 and 5%, on every
+    scenario of the fitted workload and of the drift variant, plus steady on the
+    heavytail refit."""
+    return [Job("exp14", sc, sd, "chosen-v2", label, {**(extra or {}), **ov}, volume_frac=vf)
+            for vf in VOLUMES for sc in EXP14_SCENARIOS for sd in seeds for label, ov in RULE_VARIANTS]
+
+
 EXPERIMENTS = {"exp1": exp1_jobs, "exp1_tight": exp1_tight_jobs, "exp2": exp2_jobs, "exp3": exp3_jobs,
                "exp4": exp4_jobs, "exp5": exp5_jobs, "exp6": exp6_jobs, "exp7": exp7_jobs, "exp8": exp8_jobs,
-               "exp9": exp9_jobs, "exp10": exp10_jobs, "exp11": exp11_jobs, "exp12": exp12_jobs, "exp13": exp13_jobs}
+               "exp9": exp9_jobs, "exp10": exp10_jobs, "exp11": exp11_jobs, "exp12": exp12_jobs, "exp13": exp13_jobs,
+               "exp14": exp14_jobs}
 
 COLUMNS = ["exp", "scenario", "seed", "arm", "label", "overrides", "volume_frac", "tag", "config", "spans", "v_star", "cap", "fault_start",
            "kept_per_period", "vol_ratio", "min_vol_ratio", "bytes_per_period", "over_cap_periods", "max_pre_ratio",
@@ -348,7 +372,7 @@ COLUMNS += ["truth_outliers", "recall", "recall_window", "event_recall", "recall
             "holes_total", "kept_with_holes_frac", "holes_per_kept_parent",
             "viol_requests", "viol_requests_frac", "viol_coverage",
             "t_drift_pre", "t_drift_culprit", "t_drift_culprit_mean", "t_drift_healthy", "t_drift_healthy_mean",
-            "frozen_svc_periods", "frozen_by_svc", "n_need_eff", "credit_share", "debt_total",
+            "frozen_svc_periods", "frozen_by_svc", "frozen_entries", "frozen_entries_by_svc", "n_need_eff", "credit_share", "debt_total",
             "budget_mean", "budget_last", "kept_by_reason", "dropped_by_reason", "elapsed_s"]
 
 
@@ -445,6 +469,7 @@ HEAD = {"event_recall": "event recall", "p95_err_pooled": "P95 err pooled", "kep
         "t_drift_culprit": "T drift culprit", "t_drift_culprit_mean": "T drift culprit mean",
         "t_drift_healthy": "T drift healthy max", "t_drift_healthy_mean": "T drift healthy mean",
         "frozen_svc_periods": "frozen svc-periods", "frozen_by_svc": "frozen by service", "roots_full_frac": "roots kept full",
+        "frozen_entries": "freeze firings", "frozen_entries_by_svc": "firings by service", "truth_rate_by_svc": "truth rate by service",
         "kept_by_reason": "kept by reason", "attrib_explained": "explained", "attrib_own": "by own time",
         "attrib_child": "by kept child", "attrib_clean": "holes ordinary", "attrib_loss": "true loss",
         "loss_split": "loss by child's refusal", "refusal_split": "refusals", "lost_outliers": "lost outliers",
@@ -689,6 +714,38 @@ def summarize(exp: str, rows: list[dict]) -> str:
                      "culprit / identified = the same rule on what the arm kept (identified = read as systemic).  "
                      "chosen-v2 with its calibrated table and with the oracle table, uniform-head for reference.\n")
         _per_volume_tables(parts, rows, "label", tuple(l for _, l, _ in LATE_ARMS), cols, scenarios)
+    elif exp == "exp14":
+        cols = ["label", "kept_per_period", "vol_ratio", "over_cap_periods", "outlier_share", "outlier_precision",
+                "recall_culprit", "evidence_s", "culprit_est", "identified", "frozen_svc_periods", "frozen_entries",
+                "p95_err_svc_mean", "p95_err_svc_max"]
+        parts.append("Healthy-tail outlier rules on chosen-v2 (pass-4 configuration otherwise): baseline = outlier when "
+                     "duration > T_i; margin m = outlier only when duration > (1 + m) T_i, spans in between are "
+                     "plan-sampled; P97.5 / P99 = calibration percentile of the square-root split (T_root = SLO still); "
+                     "healthy-rate N_need = a span over T_i is kept as an outlier, but the N_need counter and the frozen "
+                     "trigger count only the misses beyond the service's healthy over-T rate (EWMA while not frozen).  "
+                     "Scenarios with `+dr` run on the drift workload variant (the deployment as it ran during the Stage 2 "
+                     "cluster runs: every service's level from run 3's plan-kept spans, usertimeline 7.2 ms instead of 5.7, "
+                     "with the SLO and the oracle anchored to the fitted reference); `+ht` = the heavy-tailed refit of the "
+                     "10-minute export.  frozen svc-periods = (service, period) pairs held by the frozen source; "
+                     "freeze firings = transitions into frozen.  Ground truth (outlier = over the oracle's P95-split T_i) "
+                     "is the same for every rule.\n" + HEADLINE_NOTE)
+        order = tuple(l for l, _ in RULE_VARIANTS)
+        _per_volume_tables(parts, rows, "label", order, cols, scenarios)
+        parts.append("## Frozen trigger in steady state\n")
+        parts.append("steady, steady+dr and steady+ht (no fault): firings and held service-periods per rule, by service; truth rate = "
+                     "the complete-data over-T rate per service (the healthy tail the rules have to live with).\n")
+        fcols = ["label", "frozen_entries", "frozen_svc_periods", "frozen_entries_by_svc", "frozen_by_svc", "outlier_share",
+                 "outlier_precision", "truth_rate_by_svc"]
+        for vf in _by_volume(rows):
+            for sc in ("steady", "steady+dr", "steady+ht"):
+                sub = [r for r in rows if r.get("volume_frac", 0.25) == vf and r["scenario"] == sc]
+                if not sub:
+                    continue
+                agg = _agg(sub, ("label",), fcols[1:])
+                _arm_order(agg, "label", order)
+                parts.append(f"### {sc}, V* = {100 * vf:.0f}%\n")
+                parts.append(md_table(agg, fcols, HEAD))
+                parts.append("")
     return "\n".join(parts) + "\n"
 
 
@@ -735,8 +792,8 @@ def load_rows(path: Path) -> list[dict]:
                 if v is None or v == "":
                     row[k] = math.nan if k not in ("overrides", "culprit_est", "culprit_truth", "spend_top", "label", "arm",
                                                    "scenario", "exp", "kept_by_reason", "dropped_by_reason", "refusal_split",
-                                                   "loss_split", "frozen_by_svc", "p95_err_svc", "tag", "config", "refusal_split_p0",
-                                                   "truth_rate_by_svc", "truth_culprit_est") else ""
+                                                   "loss_split", "frozen_by_svc", "frozen_entries_by_svc", "p95_err_svc", "tag",
+                                                   "config", "refusal_split_p0", "truth_rate_by_svc", "truth_culprit_est") else ""
                 elif v in ("True", "False"):
                     row[k] = v == "True"
                 else:

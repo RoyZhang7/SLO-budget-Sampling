@@ -36,6 +36,15 @@ Pluggable parts (BudgetConfig):
   cold_prior      none       no T_i before a service's first calibrated period: plan sampling only
                   equal      the equal-share square-root split of the SLO stands in for T_i until
                              the service has been calibrated once (ttable.equal_share_prior)
+  outlier_margin  m          a span is an outlier only when its duration exceeds (1 + m) T_i (or
+                             its status is not OK); spans between T_i and (1 + m) T_i are ordinary
+                             (plan-sampled).  0 = the plain rule.  Pass 5 candidate rule (exp14)
+  n_need_healthy  False/True a span over T_i is still an outlier for keeping, but the N_need
+                             counter and the frozen trigger count only the misses beyond the
+                             service's healthy over-T rate (the EWMA kept while not frozen):
+                             n_eff = n_seen - rate x spans seen so far in the period, and the
+                             trigger fires on (rate - healthy) instead of rate.  Pass 5 candidate rule
+  calib_q         q          calibration percentile of the split (0.95; exp14 sweeps 0.975 and 0.99)
   outlier_credit  none       an outlier refused by the request budget or the host pool is dropped
                   credit     ... may be kept on credit while the host's credit for the
                              period (credit_frac x pool) lasts; the debt is repaid out of
@@ -159,6 +168,8 @@ class BudgetConfig:
     freeze_rate_floor: float = 0.01 # the healthy rate is taken as at least this
     freeze_ewma: float = 0.3        # smoothing of the healthy outlier rate (updated while not frozen)
     cold_prior: str = "none"        # none | equal  (T_i before the first calibrated period, see module docstring)
+    outlier_margin: float = 0.0     # outlier only when duration > (1 + m) T_i (see module docstring)
+    n_need_healthy: bool = False    # N_need and the frozen trigger count misses beyond the healthy over-T rate
     root_policy: str = "pin"        # pin | on_demand | record | plan  (see module docstring)
     root_flag_on: str = "outlier"   # outlier: outlier/escalate/parent keeps raise the flag; any: plan keeps too
     record_cost: float = 0.1        # a root record costs this fraction of a span
@@ -192,6 +203,8 @@ class BudgetConfig:
             raise ValueError(f"unknown freeze_trigger {self.freeze_trigger}")
         if self.cold_prior not in PRIORS:
             raise ValueError(f"unknown cold_prior {self.cold_prior}; choose from {PRIORS}")
+        if self.outlier_margin < 0.0:
+            raise ValueError("outlier_margin must be >= 0")
 
 
 def _growth(rule: str):
@@ -455,7 +468,7 @@ class BudgetSampler(Sampler):
             outlier, miss = False, 0.0
         else:
             miss = (span.duration - T) / T
-            outlier = miss > 0.0 or not span.status_ok
+            outlier = miss > cfg.outlier_margin or not span.status_ok      # margin 0: the plain over-T rule
             if miss < 0.0:
                 miss = 0.0
         if outlier:
@@ -464,6 +477,11 @@ class BudgetSampler(Sampler):
                 return self._try_credit(span, req, miss, self._exhausted_reason)
             n = self._nseen.get(svc, 0) + 1
             self._nseen[svc] = n
+            if cfg.n_need_healthy:
+                # misses beyond what the service's healthy over-T rate predicts for the spans seen so far
+                h = self._healthy_rate.get(svc)
+                if h is not None and h > 0.0:
+                    n = max(1.0, n - h * self._spans_svc.get(svc, 0))
             p = 1.0 if n <= self.n_need else min(1.0, self.n_need / n * self._g(miss))
             if p < 1.0 and self.rng.random() >= p:
                 return False, p, "outlier_coin"
@@ -503,11 +521,25 @@ class BudgetSampler(Sampler):
                 continue
             rate = n_out / n_sp
             base = self._healthy_rate.get(svc)
-            if base is not None and n_out >= cfg.n_min and rate >= cfg.freeze_rate_mult * max(base, cfg.freeze_rate_floor):
+            excess = rate - base if (cfg.n_need_healthy and base is not None) else rate     # n_need_healthy: beyond the healthy rate
+            if base is not None and n_out >= cfg.n_min and excess >= cfg.freeze_rate_mult * max(base, cfg.freeze_rate_floor):
                 out.add(svc)
             else:
                 self._healthy_rate[svc] = rate if base is None else (1 - cfg.freeze_ewma) * base + cfg.freeze_ewma * rate
         return out
+
+    def _track_healthy_rates(self) -> None:
+        """The healthy over-T rate EWMA for `n_need_healthy` when the frozen
+        source (which maintains it in `_freeze_set`) is not in use."""
+        cfg = self.cfg
+        if not self.cal.table:
+            return
+        for svc, n_sp in self._spans_svc.items():
+            if n_sp <= 0:
+                continue
+            rate = self._ndet.get(svc, 0) / n_sp
+            base = self._healthy_rate.get(svc)
+            self._healthy_rate[svc] = rate if base is None else (1 - cfg.freeze_ewma) * base + cfg.freeze_ewma * rate
 
     def on_period_end(self, period: int, collector_volume: float) -> None:
         cfg, v_star = self.cfg, self.ctx.v_star
@@ -516,6 +548,8 @@ class BudgetSampler(Sampler):
                 self._frozen = self._freeze_set()
                 self.cal.end_period(self._frozen)
             else:
+                if cfg.n_need_healthy:
+                    self._track_healthy_rates()
                 self.cal.end_period()
         R = self._requests
         if R > 0:

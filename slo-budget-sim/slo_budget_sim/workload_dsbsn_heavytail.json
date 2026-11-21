@@ -1,0 +1,218 @@
+{
+ "source": "export-10min.json",
+ "derived": "2026-11-20",
+ "traces": 60000,
+ "spans": 720000,
+ "span_s": 599.917,
+ "structure": "from real traces",
+ "timings": "fitted: lognormal fit of 60000 spans per service over 600 s at 100 requests/s; usertimeline: lognormal_pareto@0.95 refit of 60000 server-span durations from server_durations_us.json (held-out top-5% choice), lognormal kept in median_ms / sigma; the heavy-tailed candidate forced: held-out picks lognormal by a hair (tail CLL -0.347 vs -0.349), the Pareto index 14.8 says the tail is not heavy",
+ "routes": {
+  "compose_post": {
+   "operation": "Wrk2APIServiceServer_ComposePost",
+   "share": 1.0,
+   "requests": 60000,
+   "tree": [
+    "wrk2api",
+    [
+     [
+      "composepost",
+      [
+       [
+        "uniqueid",
+        []
+       ],
+       [
+        "user",
+        []
+       ],
+       [
+        "media",
+        []
+       ],
+       [
+        "text",
+        [
+         [
+          "usermention",
+          []
+         ],
+         [
+          "urlshorten",
+          []
+         ]
+        ]
+       ],
+       [
+        "hometimeline",
+        [
+         [
+          "socialgraph",
+          []
+         ]
+        ]
+       ],
+       [
+        "usertimeline",
+        []
+       ],
+       [
+        "poststorage",
+        []
+       ]
+      ]
+     ]
+    ]
+   ],
+   "spans_per_request": 12.0,
+   "root_p50_ms": 13.01,
+   "root_p95_ms": 15.58
+  }
+ },
+ "parallel": [
+  "composepost",
+  "text"
+ ],
+ "services": {
+  "composepost": {
+   "median_ms": 2.901,
+   "sigma": 0.273,
+   "n": 60000,
+   "own_p50_ms": 2.875,
+   "own_p95_ms": 4.733,
+   "dur_p50_ms": 11.812,
+   "dur_p95_ms": 14.348,
+   "transit_ms": 0.516,
+   "errors": 0
+  },
+  "hometimeline": {
+   "median_ms": 2.7754,
+   "sigma": 0.368,
+   "n": 60000,
+   "own_p50_ms": 2.711,
+   "own_p95_ms": 5.1671,
+   "dur_p50_ms": 3.1985,
+   "dur_p95_ms": 5.783,
+   "transit_ms": 0.5235,
+   "errors": 0
+  },
+  "media": {
+   "median_ms": 0.0231,
+   "sigma": 0.458,
+   "n": 60000,
+   "own_p50_ms": 0.022,
+   "own_p95_ms": 0.046,
+   "dur_p50_ms": 0.022,
+   "dur_p95_ms": 0.046,
+   "transit_ms": 0.572,
+   "errors": 0
+  },
+  "poststorage": {
+   "median_ms": 0.8767,
+   "sigma": 0.322,
+   "n": 60000,
+   "own_p50_ms": 0.809,
+   "own_p95_ms": 1.712,
+   "dur_p50_ms": 0.809,
+   "dur_p95_ms": 1.712,
+   "transit_ms": 0.69,
+   "errors": 0
+  },
+  "socialgraph": {
+   "median_ms": 0.4588,
+   "sigma": 0.328,
+   "n": 60000,
+   "own_p50_ms": 0.441,
+   "own_p95_ms": 0.8,
+   "dur_p50_ms": 0.441,
+   "dur_p95_ms": 0.8,
+   "transit_ms": 0.5575,
+   "errors": 0
+  },
+  "text": {
+   "median_ms": 1.589,
+   "sigma": 0.344,
+   "n": 60000,
+   "own_p50_ms": 1.5188,
+   "own_p95_ms": 2.8239,
+   "dur_p50_ms": 2.694,
+   "dur_p95_ms": 4.41,
+   "transit_ms": 0.775,
+   "errors": 0
+  },
+  "uniqueid": {
+   "median_ms": 0.0493,
+   "sigma": 0.474,
+   "n": 60000,
+   "own_p50_ms": 0.045,
+   "own_p95_ms": 0.126,
+   "dur_p50_ms": 0.045,
+   "dur_p95_ms": 0.126,
+   "transit_ms": 0.5295,
+   "errors": 0
+  },
+  "urlshorten": {
+   "median_ms": 0.8628,
+   "sigma": 0.287,
+   "n": 60000,
+   "own_p50_ms": 0.813,
+   "own_p95_ms": 1.646,
+   "dur_p50_ms": 0.813,
+   "dur_p95_ms": 1.646,
+   "transit_ms": 0.638,
+   "errors": 0
+  },
+  "user": {
+   "median_ms": 0.0211,
+   "sigma": 0.356,
+   "n": 60000,
+   "own_p50_ms": 0.021,
+   "own_p95_ms": 0.034,
+   "dur_p50_ms": 0.021,
+   "dur_p95_ms": 0.034,
+   "transit_ms": 0.5445,
+   "errors": 0
+  },
+  "usermention": {
+   "median_ms": 0.5873,
+   "sigma": 0.3,
+   "n": 60000,
+   "own_p50_ms": 0.559,
+   "own_p95_ms": 0.991,
+   "dur_p50_ms": 0.559,
+   "dur_p95_ms": 0.991,
+   "transit_ms": 0.5555,
+   "errors": 0
+  },
+  "usertimeline": {
+   "median_ms": 5.6513,
+   "sigma": 0.159,
+   "n": 60000,
+   "own_p50_ms": 5.669,
+   "own_p95_ms": 7.258,
+   "dur_p50_ms": 5.669,
+   "dur_p95_ms": 7.258,
+   "transit_ms": 0.4835,
+   "errors": 0,
+   "dist": {
+    "type": "lognormal_pareto",
+    "median_ms": 5.669,
+    "sigma": 0.150221,
+    "tail_q": 0.95,
+    "tail_alpha": 14.822162
+   }
+  },
+  "wrk2api": {
+   "median_ms": 1.1493,
+   "sigma": 0.275,
+   "n": 60000,
+   "own_p50_ms": 1.086,
+   "own_p95_ms": 2.0179,
+   "dur_p50_ms": 13.01,
+   "dur_p95_ms": 15.58,
+   "transit_ms": null,
+   "errors": 0
+  }
+ },
+ "hosts_in_traces": [],
+ "variant": "heavytail"
+}
