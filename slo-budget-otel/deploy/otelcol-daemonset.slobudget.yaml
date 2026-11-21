@@ -29,11 +29,16 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
             - name: GOMEMLIMIT
               value: 3276MiB
           ports:
             - {containerPort: 4317, protocol: TCP}
             - {containerPort: 8080, protocol: TCP}
+            - {containerPort: 8082, protocol: TCP}
             - {containerPort: 7777, protocol: UDP}
           resources:
             limits: {cpu: "1", memory: 4Gi}

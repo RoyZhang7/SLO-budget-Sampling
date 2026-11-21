@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math"
 	"net"
 	"net/http"
@@ -49,6 +50,7 @@ type central struct {
 	vStar     float64
 	cap       float64
 	hosts     map[string]bool
+	peers     map[string]string // agent host -> kept-notice address, from the stats
 	lastServices int
 	server    *http.Server
 	addr      string
@@ -73,10 +75,12 @@ type periodSummary struct {
 	Reports     int                `json:"reports"`
 	Table       map[string]float64 `json:"table_ms"` // route-level T per service in ms
 	Demand      float64            `json:"demand"`   // admitted + pool refusals + cap drops (the refill's input when refill_input is demand)
+	RequestsSeen     int           `json:"requests_seen"`     // requests first seen by the agents
+	BudgetPropagated int           `json:"budget_propagated"` // of those, with the SDK-issued budget
 }
 
 func newCentral(set processor.Settings, cfg *Config, next consumer.Traces) (*central, error) {
-	c := &central{cfg: cfg, log: set.Logger, next: next, reports: map[int64][]slobudget.AgentStats{}, hosts: map[string]bool{}}
+	c := &central{cfg: cfg, log: set.Logger, next: next, reports: map[int64][]slobudget.AgentStats{}, hosts: map[string]bool{}, peers: map[string]string{}}
 	routesSLO := map[string]float64{}
 	for route, ms := range cfg.SLOMs {
 		routesSLO[route] = ms / 1000.0
@@ -292,6 +296,7 @@ func (c *central) closePeriod() {
 	c.s.OnPeriodEnd(int(per), refillInput)
 	c.version++
 	c.update = c.s.Export(c.version, per+1, c.cap)
+	c.update.Peers = maps.Clone(c.peers)
 	sum := periodSummary{Period: per, Received: c.received, Admitted: c.admitted, CapDropped: c.capDrops, Spans: totalSpans,
 		B: c.s.B, NNeed: c.s.NNeed, VStar: c.vStar, Frozen: c.update.Frozen, Reports: len(reports), Table: map[string]float64{},
 		Demand: demand}
@@ -299,6 +304,8 @@ func (c *central) closePeriod() {
 		sum.Requests += r.Requests
 		sum.KeptTotal += r.KeptTotal
 		sum.KeptOutlier += r.KeptOutlier
+		sum.RequestsSeen += r.RequestsSeen
+		sum.BudgetPropagated += r.BudgetPropagated
 	}
 	for k, T := range c.s.Cal.Table {
 		if k.Class == "*" {
@@ -338,6 +345,9 @@ func (c *central) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.mu.Lock()
+	if st.NoticeAddr != "" {
+		c.peers[st.Host] = st.NoticeAddr
+	}
 	if st.Period >= c.period { // on time (or early): counted for its period
 		c.reports[st.Period] = append(c.reports[st.Period], st)
 	} else { // late: folded into the period being collected
@@ -356,7 +366,7 @@ func (c *central) handleStatus(w http.ResponseWriter, r *http.Request) {
 	sort.Strings(hosts)
 	out := map[string]any{"period": c.period, "version": c.version, "v_star": c.vStar, "cap": c.cap, "hosts": hosts,
 		"received_this_period": c.received, "admitted_this_period": c.admitted, "update": c.update,
-		"graph": c.graph.export(), "history": c.history}
+		"graph": c.graph.export(), "history": c.history, "peers": c.peers}
 	c.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)

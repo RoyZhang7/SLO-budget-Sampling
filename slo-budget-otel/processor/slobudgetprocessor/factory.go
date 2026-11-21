@@ -42,6 +42,7 @@ func createDefaultConfig() component.Config {
 		ClientSpans:  "plan",
 		RequestTTL:   10 * time.Second,
 		StatsLog:     true,
+		BudgetSource: "propagated",
 	}
 }
 

@@ -27,6 +27,7 @@ type CentralUpdate struct {
 	PoolFull map[string]float64                       `json:"pool_full"` // host -> span units per period
 	Frozen   []string                                 `json:"frozen"`
 	Services int                                      `json:"services"`
+	Peers    map[string]string                        `json:"peers"` // agent host -> kept-notice address (ip:port)
 }
 
 // AgentStats is what an agent reports for one finished period.
@@ -46,6 +47,10 @@ type AgentStats struct {
 	ClientSpans  int                `json:"client_spans"`
 	RefusedPool  int                `json:"refused_pool"`   // keeps the host pool refused (demand the refill should see)
 	RefusedBudget int               `json:"refused_budget"` // keeps the request budget refused
+	NoticeAddr   string             `json:"notice_addr"`    // this agent's kept-notice address (ip:port) for unicast notices
+	RequestsSeen int                `json:"requests_seen"`  // requests first seen this period
+	BudgetPropagated int            `json:"budget_propagated"` // of those, requests whose budget came from the SDK's baggage
+	SDKPolls     int                `json:"sdk_polls"`      // SDK polls of /slobudget/sdk answered
 	Version      int                `json:"version"`       // config version in force
 }
 

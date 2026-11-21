@@ -26,6 +26,9 @@ processors:
   - gomod: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel v0.0.0
     import: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/processor/slobudgetcentralprocessor
     name: slobudgetcentralprocessor
+  - gomod: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel v0.0.0
+    import: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/processor/slobudgetreconprocessor
+    name: slobudgetreconprocessor
 
 exporters:
   - gomod: go.opentelemetry.io/collector/exporter/otlpexporter v0.139.0

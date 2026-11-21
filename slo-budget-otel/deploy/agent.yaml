@@ -30,6 +30,10 @@ data:
         client_spans: plan
         request_ttl: 10s
         stats_log: true
+        budget_source: propagated         # the SDK issues the budget at the root (slo.budget); self-issue is the fallback
+        sdk_listen: ":8082"               # the SDK's issuer polls B and this node here (Service port added by run_cluster.sh)
+        sampler:
+          root_policy: __ROOT_POLICY__    # on_demand (hold + kept-notice) or pin (every root kept)
       priority:                           # the bridges backstop, exactly as baked into the running image
         check_interval: 100ms
         soft_percentage: 50

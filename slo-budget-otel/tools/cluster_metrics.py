@@ -69,6 +69,9 @@ def main() -> int:
             svc = norm(procs.get(s.get("processID"), {}).get("serviceName", "?"))
             end = (s["startTime"] + s["duration"]) / 1e6
             k = int(end // a.period)
+            if tags.get("synthetic") in (True, "true"):  # reconstruction placeholders: not sampled volume
+                per[k]["synthetic"] += 1
+                continue
             kind = tags.get("span.kind", "?")
             is_root = not any(r.get("refType") == "CHILD_OF" for r in s.get("references", []) or [])
             reason = tags.get("slobudget.reason", "")
@@ -113,6 +116,7 @@ def main() -> int:
         "vol_ratio_normal": mean("vol_ratio", [r for r in run if r["window"] == "normal"]),
         "vol_ratio_hog": mean("vol_ratio", [r for r in run if r["window"] == "hog"]),
         "cap_dropped_total": sum(r["cap_dropped"] or 0 for r in run),
+        "synthetic_spans": sum(r.get("synthetic", 0) for r in run),
         "outlier_share_nonroot": kept_out_nonroot / kept_nonroot if kept_nonroot else None,
         "outlier_share_normal": None, "outlier_share_hog": None,
         "precision_vs_healthy_table": truth_pos / truth_tot if truth_tot else None, "precision_n": truth_tot,

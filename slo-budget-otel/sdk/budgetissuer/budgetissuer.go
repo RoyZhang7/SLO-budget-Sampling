@@ -41,10 +41,10 @@ import (
 
 // Baggage / attribute keys.
 const (
-	KeyBudget   = "slo.b"
-	KeyRoot     = "slo.r"
-	KeyClass    = "slo.c"
-	KeyRootHost = "slo.h"
+	KeyBudget   = "slo.budget"
+	KeyRoot     = "slo.root"
+	KeyClass    = "slo.class"
+	KeyRootHost = "slo.root_host"
 )
 
 // BudgetSource yields the current real-valued budget B (the refill loop's

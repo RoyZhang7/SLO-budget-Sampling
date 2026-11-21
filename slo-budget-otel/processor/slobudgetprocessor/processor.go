@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -24,10 +25,10 @@ import (
 
 // Span attributes the agent reads (baggage copies made by the SDK) and writes.
 const (
-	AttrBudget     = "slo.b" // issued request budget (int)
-	AttrRoot       = "slo.r" // root service / route
-	AttrClass      = "slo.c" // request class (route|bucket)
-	AttrRootHost   = "slo.h" // host of the root's agent
+	AttrBudget     = "slo.budget"    // the request's budget, issued at the root by the SDK (int)
+	AttrRoot       = "slo.root"      // the root operation = the route (compose_post)
+	AttrClass      = "slo.class"     // request class: route|payload bucket
+	AttrRootHost   = "slo.root_host" // the node of the root's agent
 	AttrSamplingP  = "sampling.p"
 	AttrReason     = "slobudget.reason"
 	AttrOwnUS      = "slobudget.own_us"
@@ -69,12 +70,19 @@ type agent struct {
 	version  int
 	seedTab  map[string]map[string]float64
 	notices  *noticer
-	stats    struct{ notices, rootsHeld, rootsPinned, clientSpans, refusedPool, refusedBudget int }
+	stats    agentCounters
+	sdkSrv   *http.Server
 	period   int64
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
 	httpc    *http.Client
 	lastStat slobudget.AgentStats
+}
+
+// agentCounters are the per-period counters reported to the central.
+type agentCounters struct {
+	notices, rootsHeld, rootsPinned, clientSpans, refusedPool, refusedBudget int
+	sdkPolls, budgetProp, requestsNew                                        int
 }
 
 func newAgent(set processor.Settings, cfg *Config, next consumer.Traces) (*agent, error) {
@@ -119,9 +127,20 @@ func (a *agent) Start(ctx context.Context, _ component.Host) error {
 		return err
 	}
 	a.notices = n
+	n.self = a.host
 	bg, cancel := context.WithCancel(context.Background())
 	a.cancel = cancel
 	n.start(bg)
+	if a.cfg.SDKListen != "" { // the SDK's budget issuer polls B and this host here
+		ln, err := net.Listen("tcp", a.cfg.SDKListen)
+		if err != nil {
+			return fmt.Errorf("sdk_listen: %w", err)
+		}
+		mux := http.NewServeMux()
+		mux.HandleFunc("/slobudget/sdk", a.handleSDK)
+		a.sdkSrv = &http.Server{Handler: mux, ReadHeaderTimeout: 2 * time.Second}
+		go func() { _ = a.sdkSrv.Serve(ln) }()
+	}
 	a.period = a.periodOf(time.Now())
 	a.wg.Add(2)
 	go a.periodLoop(bg)
@@ -140,6 +159,9 @@ func (a *agent) Shutdown(context.Context) error {
 	}
 	if a.notices != nil {
 		a.notices.stop()
+	}
+	if a.sdkSrv != nil {
+		_ = a.sdkSrv.Close()
 	}
 	a.wg.Wait()
 	return nil
@@ -182,6 +204,7 @@ func (a *agent) request(tid pcommon.TraceID, route, cls string, now time.Time) *
 		r = &request{children: map[pcommon.SpanID]*childStats{}, clients: map[pcommon.SpanID][]interval{}}
 		r.st = slobudget.RequestState{Route: route, Class: cls}
 		a.s.IssueBudget(&r.st)
+		a.stats.requestsNew++
 		a.reqs[tid] = r
 	}
 	r.last = now
@@ -211,10 +234,17 @@ func (a *agent) decide(rs ptrace.ResourceSpans, ss ptrace.ScopeSpans, span ptrac
 		sp.Duration = 0
 	}
 	req := a.request(span.TraceID(), route, cls, now)
-	if v, ok := attrs.Get(AttrBudget); ok { // issued by the SDK: overrides the agent's own issue once
-		if b, err := strconv.Atoi(v.AsString()); err == nil && req.st.Budget0 != b && req.children[pcommon.SpanID{}] == nil {
-			req.st.Budget, req.st.Budget0 = b, b
-			req.children[pcommon.SpanID{}] = &childStats{} // marker: budget taken from baggage
+	if a.cfg.BudgetSource != "self" {
+		// issued at the root by the SDK and carried in the trace's baggage: replaces the
+		// agent's own issue once per request (the per-host budgets start from Budget0)
+		if v, ok := attrs.Get(AttrBudget); ok && req.children[pcommon.SpanID{}] == nil {
+			if b, err := strconv.Atoi(v.AsString()); err == nil && b > 0 {
+				used := req.st.Budget0 - req.st.Budget
+				req.st.Budget0 = b
+				req.st.Budget = max(b-used, 0)
+				req.children[pcommon.SpanID{}] = &childStats{} // marker: budget taken from baggage
+				a.stats.budgetProp++
+			}
 		}
 	}
 	parent := span.ParentSpanID()
@@ -426,18 +456,21 @@ func (a *agent) periodLoop(ctx context.Context) {
 		st := a.s.Snapshot(a.host, a.period)
 		st.Notices, st.RootsHeld, st.RootsPinned, st.ClientSpans = a.stats.notices, a.stats.rootsHeld, a.stats.rootsPinned, a.stats.clientSpans
 		st.RefusedPool, st.RefusedBudget = a.stats.refusedPool, a.stats.refusedBudget
+		st.SDKPolls, st.BudgetPropagated, st.RequestsSeen = a.stats.sdkPolls, a.stats.budgetProp, a.stats.requestsNew
+		st.NoticeAddr = a.notices.selfAddr()
 		st.Version = a.version
-		a.stats = struct{ notices, rootsHeld, rootsPinned, clientSpans, refusedPool, refusedBudget int }{}
+		a.stats = agentCounters{}
 		a.s.ResetPeriod()
 		a.lastStat = st
 		a.period++
 		a.mu.Unlock()
 		if a.cfg.StatsLog {
-			sent, recv := a.notices.counts()
+			sent, recv, uni := a.notices.counts()
 			a.log.Info("slobudget period", zap.Int64("period", st.Period), zap.Int("requests", st.Requests),
 				zap.Int("spans", st.SpansHost), zap.Int("kept", st.KeptTotal), zap.Int("kept_outlier", st.KeptOutlier),
 				zap.Int("roots_held", st.RootsHeld), zap.Int("roots_pinned", st.RootsPinned), zap.Int("notices_sent", sent),
-				zap.Int("notices_recv", recv), zap.Int("refused_pool", st.RefusedPool), zap.Int("refused_budget", st.RefusedBudget),
+				zap.Int("notices_recv", recv), zap.Int("notices_unicast", uni), zap.Int("refused_pool", st.RefusedPool), zap.Int("refused_budget", st.RefusedBudget),
+				zap.Int("requests_new", st.RequestsSeen), zap.Int("budget_propagated", st.BudgetPropagated), zap.Int("sdk_polls", st.SDKPolls),
 				zap.Int("version", st.Version), zap.Float64("B", a.s.B), zap.Float64("n_need", a.s.NNeed))
 		}
 		if a.cfg.Central != "" {
@@ -445,6 +478,22 @@ func (a *agent) periodLoop(ctx context.Context) {
 			a.pullConfig(ctx, false)
 		}
 	}
+}
+
+// handleSDK answers the SDK's budget issuer: the B in force, this agent's host (the root
+// host the SDK stamps) and the config version.
+func (a *agent) handleSDK(w http.ResponseWriter, r *http.Request) {
+	a.mu.Lock()
+	out := struct {
+		Version int     `json:"version"`
+		B       float64 `json:"b"`
+		Host    string  `json:"host"`
+		Period  float64 `json:"period_s"`
+	}{a.version, a.s.B, a.host, a.cfg.Period.Seconds()}
+	a.stats.sdkPolls++
+	a.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
 }
 
 func (a *agent) postStats(ctx context.Context, st slobudget.AgentStats) {
@@ -484,6 +533,7 @@ func (a *agent) pullConfig(ctx context.Context, initial bool) {
 				newer := u.Version > a.version
 				if newer {
 					a.s.ApplyCentral(&u, a.host)
+					a.notices.setPeers(u.Peers)
 					a.version = u.Version
 				}
 				a.mu.Unlock()

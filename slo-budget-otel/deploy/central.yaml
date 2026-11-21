@@ -29,6 +29,9 @@ data:
         count_kinds: all
         call_graph_file: /etc/slobudget/callgraph.json
         stats_log: true
+      slobudgetrecon:                 # collector-side reconstruction (arm: in the pipeline or not)
+        hold: 3s
+        call_graph_file: /etc/slobudget/callgraph.json
       batch:
         send_batch_size: 512
         timeout: 200ms
@@ -53,7 +56,7 @@ data:
       pipelines:
         traces:
           receivers: [otlp]
-          processors: [slobudgetcentral, batch]
+          processors: [__CENTRAL_PROCESSORS__]
           exporters: [otlp]
 ---
 apiVersion: v1

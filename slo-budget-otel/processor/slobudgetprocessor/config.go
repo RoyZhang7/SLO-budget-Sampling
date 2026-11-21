@@ -45,6 +45,13 @@ type Config struct {
 	RequestTTL time.Duration `mapstructure:"request_ttl"`
 	// StatsLog logs the period stats line.
 	StatsLog bool `mapstructure:"stats_log"`
+	// BudgetSource: "propagated" takes the request's budget from the SDK's slo.budget
+	// attribute (issued at the root, carried in the trace's baggage) and issues it here only
+	// for requests that carry none; "self" always issues it here.
+	BudgetSource string `mapstructure:"budget_source"`
+	// SDKListen is the HTTP address the SDK's budget issuer polls (GET /slobudget/sdk ->
+	// {version, b, host}); empty disables it.
+	SDKListen string `mapstructure:"sdk_listen"`
 }
 
 func (c *Config) Validate() error {
@@ -62,6 +69,11 @@ func (c *Config) Validate() error {
 	case "plan", "drop", "decide":
 	default:
 		return fmt.Errorf("client_spans %q: choose plan, drop or decide", c.ClientSpans)
+	}
+	switch c.BudgetSource {
+	case "", "propagated", "self":
+	default:
+		return fmt.Errorf("budget_source %q: choose propagated or self", c.BudgetSource)
 	}
 	if c.Central == "" && c.StandaloneVStar <= 0 {
 		return errors.New("either central or standalone_v_star is required")

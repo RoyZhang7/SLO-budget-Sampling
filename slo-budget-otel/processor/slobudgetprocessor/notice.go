@@ -3,6 +3,7 @@ package slobudgetprocessor
 import (
 	"context"
 	"net"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -29,6 +30,11 @@ type noticer struct {
 	recv    int
 	resolve map[string]time.Time
 	addrs   []*net.UDPAddr
+
+	self     string                  // this agent's host: a notice for a root held here is a local flag
+	peerAddr map[string]*net.UDPAddr // host -> notice address, published by the central from the agents' stats
+	unicast  int
+	selfA    string
 }
 
 func newNoticer(log *zap.Logger, listen string, peers []string, port int, onFlag func([16]byte)) (*noticer, error) {
@@ -119,6 +125,9 @@ func (n *noticer) send(tid [16]byte, rootHost string) {
 	copy(msg[:16], tid[:])
 	msg[16] = 1
 	targets := n.targets(rootHost)
+	if len(targets) == 0 {
+		return
+	}
 	for _, a := range targets {
 		if _, err := n.conn.WriteToUDP(msg[:], a); err == nil {
 			n.mu.Lock()
@@ -128,15 +137,20 @@ func (n *noticer) send(tid [16]byte, rootHost string) {
 	}
 }
 
-// targets resolves the peer list (every 2 s) or the given root host.
+// targets: the root host's agent when the root host is known (slo.root_host) and the
+// central published its address; nothing when the root is held here; else every peer.
 func (n *noticer) targets(rootHost string) []*net.UDPAddr {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	if rootHost != "" {
-		if a, err := net.ResolveUDPAddr("udp", net.JoinHostPort(rootHost, strconv.Itoa(n.port))); err == nil {
+		if rootHost == n.self {
+			return nil
+		}
+		if a := n.peerAddr[rootHost]; a != nil {
+			n.unicast++
 			return []*net.UDPAddr{a}
 		}
 	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
 	if t, ok := n.resolve["peers"]; ok && time.Since(t) < 2*time.Second {
 		return n.addrs
 	}
@@ -163,8 +177,47 @@ func (n *noticer) targets(rootHost string) []*net.UDPAddr {
 	return addrs
 }
 
-func (n *noticer) counts() (sent, recv int) {
+func (n *noticer) counts() (sent, recv, unicast int) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	return n.sent, n.recv
+	return n.sent, n.recv, n.unicast
+}
+
+// setPeers installs the central's host -> "ip:port" map.
+func (n *noticer) setPeers(peers map[string]string) {
+	m := make(map[string]*net.UDPAddr, len(peers))
+	for h, addr := range peers {
+		if a, err := net.ResolveUDPAddr("udp", addr); err == nil {
+			m[h] = a
+		}
+	}
+	n.mu.Lock()
+	n.peerAddr = m
+	n.mu.Unlock()
+}
+
+// selfAddr is this agent's notice address (POD_IP or the first non-loopback IPv4, plus
+// the notice port), reported to the central for the peers map.
+func (n *noticer) selfAddr() string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.selfA != "" {
+		return n.selfA
+	}
+	ip := os.Getenv("POD_IP")
+	if ip == "" {
+		if addrs, err := net.InterfaceAddrs(); err == nil {
+			for _, a := range addrs {
+				if ipn, ok := a.(*net.IPNet); ok && !ipn.IP.IsLoopback() && ipn.IP.To4() != nil {
+					ip = ipn.IP.String()
+					break
+				}
+			}
+		}
+	}
+	if ip == "" || n.conn == nil {
+		return ""
+	}
+	n.selfA = net.JoinHostPort(ip, strconv.Itoa(n.port))
+	return n.selfA
 }

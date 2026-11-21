@@ -81,7 +81,7 @@ func TestBudgetPropagatesOverHTTPAndLandsOnBackendSpans(t *testing.T) {
 		}
 	}
 	if frontClient != 20 {
-		t.Fatalf("frontend client spans with slo.b: %d", frontClient)
+		t.Fatalf("frontend client spans with slo.budget: %d", frontClient)
 	}
 	// a hop that already carries a budget does not re-issue
 	ctx, issued := issuer.Stamp(context.Background(), "x", "any")
