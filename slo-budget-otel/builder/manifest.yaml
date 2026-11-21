@@ -26,9 +26,11 @@ processors:
   - gomod: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel v0.0.0
     import: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/processor/slobudgetcentralprocessor
     name: slobudgetcentralprocessor
-  - gomod: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel v0.0.0
-    import: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/processor/slobudgetreconprocessor
-    name: slobudgetreconprocessor
+  # the collector-side reconstruction processor is not in the default build: reconstruction is
+  # offline (tools/recon).  To build it in, add it back here and build with -tags slobudget_recon:
+  #  - gomod: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel v0.0.0
+  #    import: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/processor/slobudgetreconprocessor
+  #    name: slobudgetreconprocessor
 
 exporters:
   - gomod: go.opentelemetry.io/collector/exporter/otlpexporter v0.139.0

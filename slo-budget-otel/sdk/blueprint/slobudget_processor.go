@@ -1,3 +1,9 @@
+//go:build ignore
+
+// This file is compiled inside the Blueprint fork (runtime/plugins/otelcol), where
+// backend.GetBaggageFromContext exists; apply_bp_patch.py strips these lines when it copies
+// the file there.  Excluded from the sdk module's own build.
+
 // Package otelcol implements a tracer [backend.Tracer] client interface for the OpenTelemetry collector.
 package otelcol
 

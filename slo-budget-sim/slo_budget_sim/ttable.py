@@ -73,9 +73,11 @@ def sqrt_split(slo: float, L: dict[str, float], graph: CallGraph, route: str,
 
 
 def split_budgets(slo: float, L: dict[str, float], graph: CallGraph, route: str,
-                  O: dict[str, float] | None = None) -> tuple[dict[str, float], dict[str, float]]:
+                  O: dict[str, float] | None = None, held_T: dict[str, float] | None = None,
+                  held_b: dict[str, float] | None = None) -> tuple[dict[str, float], dict[str, float]]:
     """(inclusive T per service, stage budget b per service), both scaled so
-    that T_root = SLO."""
+    that T_root = SLO.  Services in `held_T` (frozen) keep that T; the other
+    services' stage budgets are then scaled so that T_root = SLO over them."""
     root = graph.root.get(route)
     if root is None or root not in L:
         return {}, {}
@@ -106,30 +108,57 @@ def split_budgets(slo: float, L: dict[str, float], graph: CallGraph, route: str,
     W = sum(math.sqrt(own[s]) for s in sorted(contrib))      # fixed order: bit-identical across processes and the Go port
     b = {s: slo * math.sqrt(own[s]) / W for s in own}
 
-    T: dict[str, float] = {}
-    visiting: set[str] = set()
+    held = {s: v for s, v in (held_T or {}).items() if s in own and s != root}   # frozen services keep their T
 
-    def t(s):
-        if s in T:
-            return T[s]
-        if s in visiting:          # cycle guard for odd graphs
-            return b[s]
-        visiting.add(s)
-        ks = kids_of(s)
-        if not ks:
-            v = b[s]
-        elif graph.parallel.get((route, s), False):
-            v = b[s] + max(t(c) for c in ks)
+    def t_with(k: float) -> dict[str, float]:
+        """T per service with the unfrozen stage budgets scaled by k; held services keep their T."""
+        T: dict[str, float] = {}
+        visiting: set[str] = set()
+
+        def t(s):
+            if s in T:
+                return T[s]
+            if s in held:
+                T[s] = held[s]
+                return T[s]
+            if s in visiting:          # cycle guard for odd graphs
+                return k * b[s]
+            visiting.add(s)
+            ks = kids_of(s)
+            if not ks:
+                v = k * b[s]
+            elif graph.parallel.get((route, s), False):
+                v = k * b[s] + max(t(c) for c in ks)
+            else:
+                v = k * b[s] + sum(t(c) for c in ks)
+            visiting.discard(s)
+            T[s] = v
+            return v
+
+        for s in own:
+            t(s)
+        return T
+
+    if not held or t_with(0.0)[root] >= slo:
+        # no frozen service (or the frozen ones alone exceed the SLO): the plain split, T_root = SLO
+        T = t_with(1.0)
+        scale = slo / T[root]
+        return {s: v * scale for s, v in T.items()}, {s: v * scale for s, v in b.items()}
+    # frozen services keep their T; the unfrozen stage budgets are scaled by k so that
+    # T_root = SLO (T_root is increasing and piecewise linear in k: bisection, 60 steps)
+    lo, hi = 0.0, 1.0
+    while t_with(hi)[root] < slo and hi < 1e6:
+        hi *= 2.0
+    for _ in range(60):
+        mid = (lo + hi) / 2.0
+        if t_with(mid)[root] < slo:
+            lo = mid
         else:
-            v = b[s] + sum(t(c) for c in ks)
-        visiting.discard(s)
-        T[s] = v
-        return v
-
-    for s in own:
-        t(s)
-    scale = slo / T[root]
-    return {s: v * scale for s, v in T.items()}, {s: v * scale for s, v in b.items()}
+            hi = mid
+    k = hi
+    T = t_with(k)
+    bh = held_b or {}
+    return T, {s: (bh[s] if s in held and s in bh else k * b[s]) for s in b}
 
 
 def equal_share_prior(slo: float, graph: CallGraph, route: str) -> dict[str, float]:
@@ -218,14 +247,25 @@ class Calibrator:
             if route not in self.routes_slo or route not in self.graph.root:
                 continue
             L, O = {}, {}
+            held_T: dict[str, float] = {}
+            held_b: dict[str, float] = {}
             for svc in self.graph.services(route):
                 if svc in self.freeze:
                     # frozen source: the service is over N_need, keep what the
-                    # last healthy-enough table said instead of chasing the fault
+                    # last healthy-enough table said instead of chasing the fault:
+                    # its L, O (for the split's shares) and its T itself (Stage 2c:
+                    # the renormalisation to T_root = SLO runs over the unfrozen
+                    # services only, so a frozen T no longer shrinks when others inflate)
                     pL = self.L.get((route, cls, svc), self.L.get((route, "*", svc)))
                     pO = self.O.get((route, cls, svc), self.O.get((route, "*", svc)))
                     if pL is not None and pO is not None:
                         L[svc], O[svc] = pL, pO
+                        hT = self.table.get((route, cls, svc), self.table.get((route, "*", svc)))
+                        if hT is not None:
+                            held_T[svc] = hT
+                            hb = self.b.get((route, cls, svc), self.b.get((route, "*", svc)))
+                            if hb is not None:
+                                held_b[svc] = hb
                         continue
                 if cls != "*":
                     d, o, w = merged.get((route, cls, svc), empty)
@@ -236,7 +276,7 @@ class Calibrator:
                 if len(d) >= MIN_SAMPLES:
                     L[svc] = weighted_quantile(d, w, self.q)
                     O[svc] = weighted_quantile(o, w, self.q)
-            Tsplit, bsplit = split_budgets(self.routes_slo[route], L, self.graph, route, O)
+            Tsplit, bsplit = split_budgets(self.routes_slo[route], L, self.graph, route, O, held_T, held_b)
             for svc, Tv in Tsplit.items():
                 table[(route, cls, svc)] = Tv
                 btab[(route, cls, svc)] = bsplit[svc]

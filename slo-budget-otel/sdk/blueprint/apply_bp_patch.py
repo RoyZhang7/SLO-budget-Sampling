@@ -12,7 +12,13 @@ root = pathlib.Path.home() / "blueprint-docc-mod"
 here = pathlib.Path(__file__).resolve().parent
 
 dst = root / "runtime/plugins/otelcol/slobudget_processor.go"
-shutil.copyfile(here / "slobudget_processor.go", dst)
+src = (here / "slobudget_processor.go").read_text()
+# drop the `//go:build ignore` header that keeps the file out of the sdk module's own build
+if src.startswith("//go:build ignore"):
+    src = src.split("
+
+", 2)[2]
+dst.write_text(src)
 print("copied", dst)
 
 

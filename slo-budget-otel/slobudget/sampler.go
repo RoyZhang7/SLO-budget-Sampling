@@ -301,7 +301,7 @@ func (s *Sampler) decideSpan(sp *Span, req *RequestState) Decision {
 	outlier, miss := false, 0.0
 	if hasT { // else cold start: plan sampling only
 		miss = (sp.Duration - T) / T
-		outlier = miss > 0.0 || !sp.StatusOK
+		outlier = miss > s.Cfg.OutlierMargin || !sp.StatusOK // margin 0: the plain over-T rule
 		if miss < 0.0 {
 			miss = 0.0
 		}

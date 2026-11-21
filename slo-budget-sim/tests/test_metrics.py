@@ -72,7 +72,7 @@ def test_holes_break_context_sufficiency():
             corpus.spans[r + 2].duration = 0.001
             corpus.spans[r + 1].duration = 0.0065
             corpus.spans[r].duration = 0.0105
-    res = _run(corpus, oracle, root_policy="pin", initial_plan_p=0.0)
+    res = _run(corpus, oracle, root_policy="pin", initial_plan_p=0.0, outlier_margin=0.0)   # b's miss is small: the plain rule
     A2 = CorpusArrays(corpus, oracle)
     m = compute(corpus, A2, res)
     assert m["ctx_root_kept"] == pytest.approx(1.0)

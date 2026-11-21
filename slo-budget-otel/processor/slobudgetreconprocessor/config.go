@@ -1,3 +1,5 @@
+//go:build slobudget_recon
+
 package slobudgetreconprocessor
 
 import (

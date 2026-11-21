@@ -48,6 +48,9 @@ type Config struct {
 	BMax                 float64 `json:"b_max" mapstructure:"b_max"`
 	RateEwma             float64 `json:"rate_ewma" mapstructure:"rate_ewma"`
 	OrdinaryFloor        float64 `json:"ordinary_floor" mapstructure:"ordinary_floor"`
+	// OutlierMargin m: a span is an outlier only when its duration exceeds (1 + m) T_i (or its
+	// status is an error); spans between T_i and (1 + m) T_i are ordinary.  Stage 2c default 0.1.
+	OutlierMargin float64 `json:"outlier_margin" mapstructure:"outlier_margin"`
 }
 
 // DefaultConfig is BudgetConfig() with the Python defaults.
@@ -58,7 +61,7 @@ func DefaultConfig() Config {
 		BudgetScope: "shared", CalibSource: "kept", FreezeTrigger: "rate", FreezeRateMult: 2.0, FreezeRateFloor: 0.01,
 		FreezeEwma: 0.3, ColdPrior: "none", RootPolicy: "pin", RootFlagOn: "outlier", RecordCost: 0.1,
 		OutlierCredit: "none", InitialBudget: 3.0, InitialPlanP: 0.15, PoolFactor: 1.0, BMin: 0.05, BMax: 64.0,
-		RateEwma: 0.5, OrdinaryFloor: 0.05,
+		RateEwma: 0.5, OrdinaryFloor: 0.05, OutlierMargin: 0.1,
 	}
 }
 
@@ -84,6 +87,9 @@ func ChosenV2() Config {
 func (c *Config) Validate() error {
 	if c.NNeed >= 1e300 { // the dump writes inf as 1e300 (JSON has no inf)
 		c.NNeed = math.Inf(1)
+	}
+	if c.OutlierMargin < 0 {
+		return fmt.Errorf("outlier_margin must be >= 0")
 	}
 	switch c.CalibSource {
 	case "kept", "plan", "frozen", "oracle":

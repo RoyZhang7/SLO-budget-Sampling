@@ -104,7 +104,10 @@ func ownFromInclusive(L *orderedMap, g *CallGraph, route string) *orderedMap {
 // SplitBudgets is ttable.split_budgets: (inclusive T per service, stage budget
 // b per service), both scaled so that T_root = SLO.  L are inclusive and O own
 // quantiles per service of one route; O may be nil.
-func SplitBudgets(slo float64, L *orderedMap, g *CallGraph, route string, O *orderedMap) (*orderedMap, *orderedMap) {
+// SplitBudgets is ttable.split_budgets: (inclusive T per service, stage budget b per
+// service) scaled so that T_root = SLO.  Services in heldT (frozen) keep that T; the other
+// services' stage budgets are scaled so that T_root = SLO over them.
+func SplitBudgets(slo float64, L *orderedMap, g *CallGraph, route string, O *orderedMap, heldT, heldB *orderedMap) (*orderedMap, *orderedMap) {
 	root, ok := g.Root[route]
 	if !ok || !L.has(root) {
 		return newOrderedMap(), newOrderedMap()
@@ -166,52 +169,99 @@ func SplitBudgets(slo float64, L *orderedMap, g *CallGraph, route string, O *ord
 	for _, s := range own.keys {
 		b.set(s, slo*math.Sqrt(own.vals[s])/W)
 	}
-	T := newOrderedMap()
-	visiting := map[string]bool{}
-	var t func(s string) float64
-	t = func(s string) float64 {
-		if v, ok := T.get(s); ok {
+	held := map[string]float64{} // frozen services keep their T
+	if heldT != nil {
+		for _, s := range heldT.keys {
+			if own.has(s) && s != root {
+				held[s] = heldT.vals[s]
+			}
+		}
+	}
+	// tWith: T per service with the unfrozen stage budgets scaled by k; held services keep their T
+	tWith := func(k float64) *orderedMap {
+		T := newOrderedMap()
+		visiting := map[string]bool{}
+		var t func(s string) float64
+		t = func(s string) float64 {
+			if v, ok := T.get(s); ok {
+				return v
+			}
+			if v, ok := held[s]; ok {
+				T.set(s, v)
+				return v
+			}
+			if visiting[s] {
+				return k * b.vals[s]
+			}
+			visiting[s] = true
+			ks := kidsOf(s)
+			var v float64
+			if len(ks) == 0 {
+				v = k * b.vals[s]
+			} else if g.parallel(route, s) {
+				m := t(ks[0])
+				for _, c := range ks[1:] {
+					if x := t(c); x > m {
+						m = x
+					}
+				}
+				v = k*b.vals[s] + m
+			} else {
+				parts := make([]float64, len(ks))
+				for i, c := range ks {
+					parts[i] = t(c)
+				}
+				v = k*b.vals[s] + PySum(parts)
+			}
+			delete(visiting, s)
+			T.set(s, v)
 			return v
 		}
-		if visiting[s] {
-			return b.vals[s]
+		for _, s := range own.keys {
+			t(s)
 		}
-		visiting[s] = true
-		ks := kidsOf(s)
-		var v float64
-		if len(ks) == 0 {
-			v = b.vals[s]
-		} else if g.parallel(route, s) {
-			m := t(ks[0])
-			for _, c := range ks[1:] {
-				if x := t(c); x > m {
-					m = x
-				}
-			}
-			v = b.vals[s] + m
+		return T
+	}
+	if len(held) == 0 || tWith(0.0).vals[root] >= slo {
+		// no frozen service (or the frozen ones alone exceed the SLO): the plain split, T_root = SLO
+		T := tWith(1.0)
+		scale := slo / T.vals[root]
+		Tout, bout := newOrderedMap(), newOrderedMap()
+		for _, s := range T.keys {
+			Tout.set(s, T.vals[s]*scale)
+		}
+		for _, s := range b.keys {
+			bout.set(s, b.vals[s]*scale)
+		}
+		return Tout, bout
+	}
+	// frozen services keep their T; the unfrozen stage budgets are scaled by k so that
+	// T_root = SLO (T_root is increasing and piecewise linear in k: bisection, 60 steps)
+	lo, hi := 0.0, 1.0
+	for tWith(hi).vals[root] < slo && hi < 1e6 {
+		hi *= 2.0
+	}
+	for i := 0; i < 60; i++ {
+		mid := (lo + hi) / 2.0
+		if tWith(mid).vals[root] < slo {
+			lo = mid
 		} else {
-			parts := make([]float64, len(ks))
-			for i, c := range ks {
-				parts[i] = t(c)
-			}
-			v = b.vals[s] + PySum(parts)
+			hi = mid
 		}
-		delete(visiting, s)
-		T.set(s, v)
-		return v
 	}
-	for _, s := range own.keys {
-		t(s)
-	}
-	scale := slo / T.vals[root]
-	Tout, bout := newOrderedMap(), newOrderedMap()
-	for _, s := range T.keys {
-		Tout.set(s, T.vals[s]*scale)
-	}
+	k := hi
+	T := tWith(k)
+	bout := newOrderedMap()
 	for _, s := range b.keys {
-		bout.set(s, b.vals[s]*scale)
+		if _, isHeld := held[s]; isHeld && heldB != nil {
+			if v, ok := heldB.get(s); ok {
+				bout.set(s, v)
+				continue
+			}
+		}
+		bout.set(s, k*b.vals[s])
 	}
-	return Tout, bout
+	return T, bout
 }
 
 // EqualSharePrior is ttable.equal_share_prior: the split with every own time
@@ -221,7 +271,7 @@ func EqualSharePrior(slo float64, g *CallGraph, route string) map[string]float64
 	for _, s := range g.Services(route) {
 		one.set(s, 1.0)
 	}
-	T, _ := SplitBudgets(slo, one, g, route, one)
+	T, _ := SplitBudgets(slo, one, g, route, one, nil, nil)
 	out := map[string]float64{}
 	for _, s := range T.keys {
 		out[s] = T.vals[s]
@@ -394,8 +444,11 @@ func (c *Calibrator) rebuild(merged map[TableKey]*samples) {
 			continue
 		}
 		L, O := newOrderedMap(), newOrderedMap()
+		heldT, heldB := newOrderedMap(), newOrderedMap()
 		for _, svc := range c.Graph.Services(route) {
 			if c.Freeze[svc] {
+				// frozen source: the service keeps its L, O (the split's shares) and its T itself
+				// (Stage 2c: the renormalisation runs over the unfrozen services only)
 				pL, okL := c.L[TableKey{route, cls, svc}]
 				if !okL {
 					pL, okL = c.L[TableKey{route, "*", svc}]
@@ -407,6 +460,20 @@ func (c *Calibrator) rebuild(merged map[TableKey]*samples) {
 				if okL && okO {
 					L.set(svc, pL)
 					O.set(svc, pO)
+					hT, okT := c.Table[TableKey{route, cls, svc}]
+					if !okT {
+						hT, okT = c.Table[TableKey{route, "*", svc}]
+					}
+					if okT {
+						heldT.set(svc, hT)
+						hb, okb := c.B[TableKey{route, cls, svc}]
+						if !okb {
+							hb, okb = c.B[TableKey{route, "*", svc}]
+						}
+						if okb {
+							heldB.set(svc, hb)
+						}
+					}
 					continue
 				}
 			}
@@ -433,7 +500,7 @@ func (c *Calibrator) rebuild(merged map[TableKey]*samples) {
 		if !c.UseOwn {
 			Oused = nil
 		}
-		Tsplit, bsplit := SplitBudgets(slo, L, c.Graph, route, Oused)
+		Tsplit, bsplit := SplitBudgets(slo, L, c.Graph, route, Oused, heldT, heldB)
 		for _, svc := range Tsplit.keys {
 			table[TableKey{route, cls, svc}] = Tsplit.vals[svc]
 			btab[TableKey{route, cls, svc}] = bsplit.vals[svc]

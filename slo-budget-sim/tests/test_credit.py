@@ -68,7 +68,7 @@ def test_credit_only_while_the_service_is_under_n_need():
 
 def test_low_water_coin_is_proportional_to_miss_and_errors_go_first():
     corpus = chain_corpus([6.0, 2.0, 1.0], n_traces=20)
-    s = _sampler(corpus, pool=1000, outlier_credit="credit", credit_frac=0.2, credit_k=9, credit_low_water=1.0)
+    s = _sampler(corpus, pool=1000, outlier_credit="credit", credit_frac=0.2, credit_k=9, credit_low_water=1.0, outlier_margin=0.0)
     # low water = 100% of the allowance (200): with 1.9 left every credit keep goes through the coin;
     # the main pool (1000) never runs out, so the first outlier of each request is a regular keep
     ps = []

@@ -43,7 +43,7 @@ def test_n_need_rule_p_is_one_then_decays():
 
 def test_p_rises_with_size_of_miss():
     corpus = chain_corpus([6.0, 2.0, 1.0], n_traces=10)
-    s = _sampler(corpus, n_need=1, p_rule="linear", initial_budget=1000, pool_factor=1e9)
+    s = _sampler(corpus, n_need=1, p_rule="linear", initial_budget=1000, pool_factor=1e9, outlier_margin=0.0)   # the plain over-T rule
     root = corpus.spans[0]
     req = _req(s, root)
     s.on_end(Span(1, 1, 1, 0, "c", "h1", 0.0, 0.0031, True, 2, "r", "r|any", 1), req, 0.0)   # n = 1, p = 1

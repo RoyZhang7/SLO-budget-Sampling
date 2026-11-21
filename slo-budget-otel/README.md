@@ -86,6 +86,16 @@ python3 tools/recon_report.py R/export.json --times R/times.json --status R/cent
 python3 tools/jaeger_orphans.py results/cluster-*/export.json --times results/cluster-*/times.json
 ```
 
+Stage 2c defaults (both implementations, differential test bit-identical): the
+miss margin `outlier_margin` = 0.1 (a span is an outlier when its duration
+exceeds 1.1 T_i or its status is an error; spans between T_i and 1.1 T_i are
+plan-sampled), and a frozen service keeps its T itself while the split
+renormalises to the root SLO over the unfrozen services only (previously the
+whole table was rescaled every period, so a frozen T shrank while others
+inflated and the freeze sustained itself).  Collector-side reconstruction is out
+of the default build (`-tags slobudget_recon`); reconstruction is offline,
+`tools/recon`.
+
 Stage 2b additions.  `sdk/blueprint/` holds the DSB-SN form of the budget
 issuer: `slobudget_processor.go` is a second SDK span processor in the
 Blueprint fork's `runtime/plugins/otelcol` (registered by `trace.go` beside the
@@ -108,10 +118,16 @@ issues the budget itself (`budget_source: propagated` with that fallback;
 notice address, and the central publishes `peers` (host -> ip:port) so a
 kept-notice for a root held elsewhere is unicast to `slo.root_host`'s agent
 (a root held locally needs none; unknown hosts fall back to the broadcast).
-`processor/slobudgetreconprocessor` (central pipeline, arm `RECON=1`) buffers a
-trace's kept spans for `hold` (3 s) and inserts placeholder ancestors for every
-kept span whose parent was dropped, up to the nearest kept ancestor or the
-root: the parent's id is the span's own parent id, the grandparent's the `_br`
+Reconstruction is offline since Stage 2c: `tools/recon` (`go run ./tools/recon -in
+export.json -out export.recon.json -report recon-offline.json`, see
+`tools/recon/README.md`) reads a Jaeger export and writes one with the
+placeholders added; the shared logic is `slobudget/recon`.  The collector-side
+form, `processor/slobudgetreconprocessor` (central pipeline, arm `RECON=1`), is
+out of the default build (build tag `slobudget_recon`, manifest entry commented
+out; the `slobudgetrecon:` block in `deploy/central.yaml` then has to go too, the
+collector rejects an unknown processor type).  Both buffer / read a trace's kept
+spans and insert placeholder ancestors for every kept span whose parent was
+dropped, up to the nearest kept ancestor or the root: the parent's id is the span's own parent id, the grandparent's the `_br`
 checkpoint anchor, higher ids are reused from the same (depth, service, kind)
 position or synthesised; the service comes from the call graph, the operation
 from the kept child where it is derivable (`<Svc>Client_<Method>`), start and
@@ -148,6 +164,13 @@ on node-0 as the deploy user; nothing needs root.
    instead, and the first build carries the issuer.
 3. Collector image: `tools/build-node0.sh` (tests, benchmark, ocb build with the
    fork's `.tools/builder`, push; tag in `build/IMAGE_TAG`).
+3b. Reseed before a measurement series: `make reseed` (`tools/reseed.sh`) restarts
+   the variant's Mongo and Redis deployments (no volumes: the data lives in the
+   container layer), restarts the services, and replays the profile's seed
+   (`init_social_graph.py` from the Blueprint venv: 962 users, the socfb-Reed98
+   follow graph, no posts).  Every 10-minute ComposePost run adds 60 000 posts,
+   which slows usertimeline and drifts the healthy table.  `make reseed-check`
+   runs 5 fault-free minutes at 12 % and prints the healthy outlier share.
 4. A run: `tools/run_cluster.sh` with the arm variables (`ROOT_POLICY`,
    `RECON`, `ARM`, `HOG_*`, `BURST_*`, `DUR`).  It deploys the central, the agent
    ConfigMap and headless Service, patches port 8082 onto the `otelcol-pb-es-ctr`

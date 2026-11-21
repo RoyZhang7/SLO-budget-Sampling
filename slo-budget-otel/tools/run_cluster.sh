@@ -23,7 +23,10 @@ source ~/bridges-env.sh 2>/dev/null || true
 : "${SERVICE:=$(for n in wrk2api composepost hometimeline usertimeline post_storage text urlshorten usermention socialgraph uniqueid media user; do printf 'unknown_service:%s_service_pb_es_proc,' $n; done)}"
 TAG=$(cat build/IMAGE_TAG)
 IMG=10.10.1.1:30000/otelcol-slobudget:$TAG
-PROCS="slobudgetcentral, batch"; [ "$RECON" = 1 ] && PROCS="slobudgetcentral, slobudgetrecon, batch"
+PROCS="slobudgetcentral, batch"
+# RECON=1 (collector-side reconstruction) needs an image built with -tags slobudget_recon and the
+# processor block back in deploy/central.yaml; since Stage 2c reconstruction is offline (tools/recon)
+if [ "$RECON" = 1 ]; then echo "RECON=1: the collector-side processor is out of the default build; run tools/recon on the export instead"; exit 1; fi
 R=results/cluster-$(date +%Y%m%d-%H%M%S)${ARM:+-$ARM}
 mkdir -p "$R"
 log() { echo "$(date '+%F %T') $*" | tee -a "$R/run.log"; }

@@ -1,9 +1,5 @@
-// Package slobudgetreconprocessor reconstructs the shed structure of a trace at the
-// collector: for every kept span whose parent was dropped it inserts placeholder
-// ancestors up to the nearest kept ancestor or the root, using the span's parent id, the
-// path bridge's `_br` checkpoint anchor and depth, and the call graph.  Placeholders carry
-// synthetic=true, the service (and the operation where it is known), start and end
-// bounding the kept descendants, and therefore no own time of their own.
+//go:build slobudget_recon
+
 package slobudgetreconprocessor
 
 import (

@@ -132,9 +132,12 @@ class FaultSpec:
     kind: str                                   # saturate | cascade | late_all
     start: float
     entries: list[tuple[str, float, float]]     # (service, delay after start, own-time factor)
+    end: float | None = None                    # the fault lifts at `end` (None: lasts to the end of the run)
 
     def factors(self, t: float) -> dict[str, float]:
         out: dict[str, float] = {}
+        if self.end is not None and t >= self.end:
+            return out
         for svc, delay, f in self.entries:
             if t >= self.start + delay:
                 out[svc] = out.get(svc, 1.0) * f

@@ -86,7 +86,7 @@ EXP14_SCENARIOS = SCENARIOS + DRIFT_SCENARIOS + ("steady+ht",)     # fitted, dri
 VOLUMES = (0.25, 0.12, 0.05)
 # BudgetConfig fields added after the result rows of passes 1-5 were written: they enter the
 # config hash only when set away from their default, so those rows stay valid
-HASH_OPTIONAL = {"outlier_margin": 0.0, "n_need_healthy": False}
+HASH_OPTIONAL = {"n_need_healthy": False}      # outlier_margin always enters the hash since its default moved to 0.1 (Stage 2c)
 
 
 @dataclass

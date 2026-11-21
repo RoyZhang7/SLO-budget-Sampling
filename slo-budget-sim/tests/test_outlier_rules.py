@@ -38,11 +38,11 @@ def _c_span(k, dur, ok=True):
     return Span(900 + k, 900 + k, 1, 0, "c", "h1", 0.0, dur, ok, 2, "r", "r|any", 1)
 
 
-def test_defaults_are_the_plain_rule_and_do_not_change_the_row_hash():
+def test_defaults_are_the_margin_rule_and_the_row_hash_tracks_it():
     cfg = BudgetConfig()
-    assert cfg.outlier_margin == 0.0 and cfg.n_need_healthy is False
-    assert _config_hash_impl("chosen-v2", {}) == _config_hash_impl("chosen-v2", {"outlier_margin": 0.0, "n_need_healthy": False})
-    assert _config_hash_impl("chosen-v2", {}) != _config_hash_impl("chosen-v2", {"outlier_margin": 0.1})
+    assert cfg.outlier_margin == 0.1 and cfg.n_need_healthy is False      # Stage 2c: m = 0.1 is the default
+    assert _config_hash_impl("chosen-v2", {}) == _config_hash_impl("chosen-v2", {"outlier_margin": 0.1, "n_need_healthy": False})
+    assert _config_hash_impl("chosen-v2", {}) != _config_hash_impl("chosen-v2", {"outlier_margin": 0.0})
     assert _config_hash_impl("chosen-v2", {}) != _config_hash_impl("chosen-v2", {"n_need_healthy": True})
     with pytest.raises(ValueError):
         BudgetConfig(outlier_margin=-0.1)

@@ -1,0 +1,29 @@
+{"data": [
+ {"traceID": "0102030405060708090a0b0c0d0e0f10",
+  "spans": [
+   {"traceID": "0102030405060708090a0b0c0d0e0f10", "spanID": "0000000000000040", "operationName": "UserTimelineServiceServer_WriteUserTimeline",
+    "references": [{"refType": "CHILD_OF", "traceID": "0102030405060708090a0b0c0d0e0f10", "spanID": "0000000000000031"}],
+    "startTime": 1000, "duration": 500, "processID": "p1", "logs": [], "warnings": ["invalid parent span IDs=0000000000000031; skipping clock skew adjustment"],
+    "tags": [{"key": "span.kind", "type": "string", "value": "server"}, {"key": "_br", "type": "binary", "value": "BAAAAAAAAAAgAAAA"}, {"key": "slo.root", "type": "string", "value": "compose_post"}]},
+   {"traceID": "0102030405060708090a0b0c0d0e0f10", "spanID": "0000000000000050", "operationName": "SocialGraphServiceClient_GetFollowers",
+    "references": [{"refType": "CHILD_OF", "traceID": "0102030405060708090a0b0c0d0e0f10", "spanID": "0000000000000042"}],
+    "startTime": 1200, "duration": 700, "processID": "p2", "logs": [], "warnings": null,
+    "tags": [{"key": "span.kind", "type": "string", "value": "client"}, {"key": "_d", "type": "binary", "value": "BQ=="}]}
+  ],
+  "processes": {"p1": {"serviceName": "unknown_service:usertimeline_service_pb_es_proc", "tags": []},
+                "p2": {"serviceName": "unknown_service:hometimeline_service_pb_es_proc", "tags": []}},
+  "warnings": null},
+ {"traceID": "0102030405060708090a0b0c0d0e0f11",
+  "spans": [
+   {"traceID": "0102030405060708090a0b0c0d0e0f11", "spanID": "0000000000000001", "operationName": "Wrk2APIServiceServer_ComposePost",
+    "references": [], "startTime": 100, "duration": 900, "processID": "p1", "logs": [], "warnings": null,
+    "tags": [{"key": "span.kind", "type": "string", "value": "server"}, {"key": "_br", "type": "binary", "value": "AAAAAAAAAAAAAAAA"}]},
+   {"traceID": "0102030405060708090a0b0c0d0e0f11", "spanID": "0000000000000020", "operationName": "ComposePostServiceServer_ComposePost",
+    "references": [{"refType": "CHILD_OF", "traceID": "0102030405060708090a0b0c0d0e0f11", "spanID": "0000000000000011"}],
+    "startTime": 150, "duration": 800, "processID": "p2", "logs": [], "warnings": null,
+    "tags": [{"key": "span.kind", "type": "string", "value": "server"}, {"key": "_br", "type": "binary", "value": "AgAAAAAAAAABAAAA"}]}
+  ],
+  "processes": {"p1": {"serviceName": "unknown_service:wrk2api_service_pb_es_proc", "tags": []},
+                "p2": {"serviceName": "unknown_service:composepost_service_pb_es_proc", "tags": []}},
+  "warnings": null}
+], "total": 2, "limit": 50000, "offset": 0, "errors": null}

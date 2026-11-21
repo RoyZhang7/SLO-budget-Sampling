@@ -168,7 +168,7 @@ class BudgetConfig:
     freeze_rate_floor: float = 0.01 # the healthy rate is taken as at least this
     freeze_ewma: float = 0.3        # smoothing of the healthy outlier rate (updated while not frozen)
     cold_prior: str = "none"        # none | equal  (T_i before the first calibrated period, see module docstring)
-    outlier_margin: float = 0.0     # outlier only when duration > (1 + m) T_i (see module docstring)
+    outlier_margin: float = 0.1     # outlier only when duration > (1 + m) T_i (see module docstring); Stage 2c default
     n_need_healthy: bool = False    # N_need and the frozen trigger count misses beyond the healthy over-T rate
     root_policy: str = "pin"        # pin | on_demand | record | plan  (see module docstring)
     root_flag_on: str = "outlier"   # outlier: outlier/escalate/parent keeps raise the flag; any: plan keeps too
