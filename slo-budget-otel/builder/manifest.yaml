@@ -1,0 +1,46 @@
+# OpenTelemetry Collector Builder (ocb) manifest for the SLO-budget collector:
+# the stock OTLP receiver / exporters, the bridges fork's priority processor
+# and configdiscovery receiver (so the agent pipeline keeps serving the SDK and
+# the priority backstop), the stock probabilistic sampler (benchmark reference)
+# and the two SLO-budget processors.  tools/build-node0.sh fills in the two
+# local paths and runs the fork's builder (.tools/builder, v0.139.1).
+dist:
+  module: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/build/otelcol-slobudget
+  name: otelcol-slobudget
+  description: OpenTelemetry Collector with the SLO-budget sampler (agent and central) and the bridges priority processor
+  version: 0.1.0
+  output_path: ./build/otelcol-slobudget
+
+receivers:
+  - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.139.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/receiver/configdiscoveryreceiver v0.139.0
+
+processors:
+  - gomod: go.opentelemetry.io/collector/processor/batchprocessor v0.139.0
+  - gomod: go.opentelemetry.io/collector/processor/memorylimiterprocessor v0.139.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/priorityprocessor v0.139.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/probabilisticsamplerprocessor v0.139.0
+  - gomod: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel v0.0.0
+    import: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/processor/slobudgetprocessor
+    name: slobudgetprocessor
+  - gomod: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel v0.0.0
+    import: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/processor/slobudgetcentralprocessor
+    name: slobudgetcentralprocessor
+
+exporters:
+  - gomod: go.opentelemetry.io/collector/exporter/otlpexporter v0.139.0
+  - gomod: go.opentelemetry.io/collector/exporter/debugexporter v0.139.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/fileexporter v0.139.0
+
+extensions:
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/extension/healthcheckextension v0.139.0
+
+providers:
+  - gomod: go.opentelemetry.io/collector/confmap/provider/envprovider v1.45.0
+  - gomod: go.opentelemetry.io/collector/confmap/provider/fileprovider v1.45.0
+  - gomod: go.opentelemetry.io/collector/confmap/provider/yamlprovider v1.45.0
+
+replaces:
+  - github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel => __SLOBUDGET_OTEL_DIR__
+  - github.com/open-telemetry/opentelemetry-collector-contrib/processor/priorityprocessor => __COLLECTOR_SRC__/processor/priorityprocessor
+  - github.com/open-telemetry/opentelemetry-collector-contrib/receiver/configdiscoveryreceiver => __COLLECTOR_SRC__/receiver/configdiscoveryreceiver

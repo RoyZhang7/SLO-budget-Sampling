@@ -1,0 +1,121 @@
+# Central collector of the SLO-budget sampler: receives the agents' kept spans,
+# calibrates T_i (frozen trigger), runs the refill, applies the hard cap and
+# serves the config channel; forwards to the existing Jaeger.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slobudget-central-config
+  labels: {app: slobudget-central}
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+            max_recv_msg_size_mib: 32
+    processors:
+      slobudgetcentral:
+        period: 5s
+        grace: 400ms
+        listen: ":8081"
+        v_star: 1380                  # 12 % of the deployment's 11 500 spans per period at 100 req/s (fixed, like the simulator's V*)
+        v_star_frac: 0.12             # used only when v_star is 0: 12 % of the observed spans per period (full periods only)
+        cap_factor: 1.25
+        refill_input: demand
+        slo_ms:
+          compose_post: 23.4
+        default_route: compose_post
+        count_kinds: all
+        call_graph_file: /etc/slobudget/callgraph.json
+        stats_log: true
+      batch:
+        send_batch_size: 512
+        timeout: 200ms
+    exporters:
+      otlp:
+        endpoint: jaeger-pb-es-ctr:4317
+        tls:
+          insecure: true
+        sending_queue:
+          enabled: true
+          num_consumers: 10
+          queue_size: 2000
+        retry_on_failure:
+          enabled: true
+          initial_interval: 1s
+          max_interval: 10s
+          max_elapsed_time: 0
+    service:
+      telemetry:
+        logs:
+          level: INFO
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [slobudgetcentral, batch]
+          exporters: [otlp]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slobudget-callgraph
+  labels: {app: slobudget-central}
+data:
+  # the compose_post call structure derived from the deployment's traces (slo-budget-sim/slo_budget_sim/workload_dsbsn.json)
+  callgraph.json: |
+    {"root": {"compose_post": "wrk2api"},
+     "children": {"compose_post": {
+        "wrk2api": ["composepost"],
+        "composepost": ["hometimeline", "media", "poststorage", "text", "uniqueid", "user", "usertimeline"],
+        "hometimeline": ["socialgraph"], "text": ["urlshorten", "usermention"],
+        "socialgraph": [], "media": [], "poststorage": [], "uniqueid": [], "user": [], "usertimeline": [], "urlshorten": [], "usermention": []}},
+     "parallel": {"compose_post": {"composepost": true, "text": true}}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slobudget-central
+  labels: {app: slobudget-central}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: slobudget-central}
+  template:
+    metadata:
+      labels: {app: slobudget-central}
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: node-3
+      containers:
+        - name: otelcol
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["--config", "/etc/otelcol/config.yaml"]
+          ports:
+            - {containerPort: 4317, name: otlp}
+            - {containerPort: 8081, name: config}
+          env:
+            - {name: GOMEMLIMIT, value: 3276MiB}
+          resources:
+            requests: {cpu: "2", memory: 4Gi}
+            limits: {cpu: "2", memory: 4Gi}
+          volumeMounts:
+            - {name: config, mountPath: /etc/otelcol}
+            - {name: callgraph, mountPath: /etc/slobudget}
+      volumes:
+        - name: config
+          configMap: {name: slobudget-central-config}
+        - name: callgraph
+          configMap: {name: slobudget-callgraph}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: slobudget-central
+  labels: {app: slobudget-central}
+spec:
+  selector: {app: slobudget-central}
+  ports:
+    - {name: otlp, port: 4317, targetPort: 4317}
+    - {name: config, port: 8081, targetPort: 8081}

@@ -1,0 +1,52 @@
+# The deployment's otelcol DaemonSet (same name, labels and selector, so the
+# node-local Service keeps routing the SDKs to it) running the SLO-budget
+# collector image with the agent config for the duration of the run.  Restore
+# with `kubectl rollout undo daemonset/otelcol-pb-es-ctr`.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  labels:
+    io.kompose.service: otelcol-pb-es-ctr
+  name: otelcol-pb-es-ctr
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      io.kompose.service: otelcol-pb-es-ctr
+  template:
+    metadata:
+      labels:
+        io.kompose.service: otelcol-pb-es-ctr
+        slobudget: agent
+    spec:
+      containers:
+        - name: otelcol-pb-es-ctr
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["--config", "/etc/otelcol/config.yaml"]
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: GOMEMLIMIT
+              value: 3276MiB
+          ports:
+            - {containerPort: 4317, protocol: TCP}
+            - {containerPort: 8080, protocol: TCP}
+            - {containerPort: 7777, protocol: UDP}
+          resources:
+            limits: {cpu: "1", memory: 4Gi}
+            requests: {cpu: "1", memory: 4Gi}
+          volumeMounts:
+            - {name: config, mountPath: /etc/otelcol}
+      volumes:
+        - name: config
+          configMap: {name: slobudget-agent-config}
+      hostname: otelcol-pb-es-ctr
+      restartPolicy: Always
+  updateStrategy:
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+    type: RollingUpdate

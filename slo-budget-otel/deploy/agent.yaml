@@ -1,0 +1,81 @@
+# Agent side: the collector config of the per-node agents (the existing
+# otelcol-pb-es-ctr DaemonSet runs our image with this config for the run) and
+# a headless service that resolves to every agent pod, the kept-notice peers.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slobudget-agent-config
+  labels: {app: slobudget-agent}
+data:
+  config.yaml: |
+    receivers:
+      otlp:                               # as in the running image's pipeline (grpc 4317)
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+      configdiscovery:                    # the SDK still fetches its checkpoint distance here (same value as the running image)
+        endpoint: ":8080"
+        config_map:
+          cpd: 2
+    processors:
+      slobudget:
+        period: 5s
+        central: http://slobudget-central:8081
+        host: ${env:NODE_NAME}
+        default_route: compose_post
+        root_hold: 2s
+        notice_listen: ":7777"
+        notice_port: 7777
+        notice_peers: ["slobudget-agents"]
+        client_spans: plan
+        request_ttl: 10s
+        stats_log: true
+      priority:                           # the bridges backstop, exactly as baked into the running image
+        check_interval: 100ms
+        soft_percentage: 50
+        hard_percentage: 70
+        cp_safety_factor: 1
+        force_gc: true
+        gc_soft_interval: 1s
+        gc_ultrasoft_interval: 0s
+    exporters:
+      otlp:
+        endpoint: slobudget-central:4317
+        tls:
+          insecure: true
+        sending_queue:
+          enabled: true
+          num_consumers: 10
+          queue_size: 1000
+        retry_on_failure:
+          enabled: true
+          initial_interval: 5s
+          max_interval: 30s
+          max_elapsed_time: 0
+      debug:
+        verbosity: basic
+    service:
+      telemetry:
+        logs:
+          level: INFO
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [slobudget, priority]
+          exporters: [otlp]
+        logs/configdiscovery:
+          receivers: [configdiscovery]
+          processors: []
+          exporters: [debug]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: slobudget-agents
+  labels: {app: slobudget-agent}
+spec:
+  clusterIP: None
+  selector:
+    io.kompose.service: otelcol-pb-es-ctr
+  ports:
+    - {name: notice, port: 7777, targetPort: 7777, protocol: UDP}
