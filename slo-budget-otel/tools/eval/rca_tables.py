@@ -7,8 +7,9 @@ Per scenario and volume: first the full data (the 100 % shadow, every run of the
 then per arm and variant (recon, true, true_ref) Acc@1, Acc@3 and MRR of TraceRCA and MicroRank,
 and the spans per trace of the arm's normal set (recon and true share the kept spans; true_ref's
 normal set is the shadow's).  Headline: RCAEval's own scoring (an operation counts for the
-service that emitted the span); next to it the version where a client operation counts for the
-service it calls.  In each cell the headline counts a run where the method crashed (an operation
+service that emitted the span); for saturated, cascade and cold_start, next to it the version
+where a client operation counts for the service it calls (noisy_neighbour: RCAEval's scoring
+only).  In each cell the headline counts a run where the method crashed (an operation
 with no pre-fault span: KeyError on the normal statistics; no ranking) as a miss; when a run
 crashed, the ranked-only numbers follow in parentheses, and the last table counts the crashes per
 arm and volume.  noisy_neighbour is scored against the node-level truth, the other scenarios
@@ -75,8 +76,8 @@ def fmt(a: dict) -> str:
     return s
 
 
-def cells(vs: list[dict]) -> str:
-    return " | ".join(fmt(acc([v.get(m) for v in vs], sfx)) for m in METHODS for sfx in ("", "_callee"))
+def cells(vs: list[dict], sfxs: tuple[str, ...]) -> str:
+    return " | ".join(fmt(acc([v.get(m) for v in vs], sfx)) for m in METHODS for sfx in sfxs)
 
 
 def _mean(xs) -> float:
@@ -91,20 +92,21 @@ def _vol(r: dict) -> float:
 def tables(runs: list[dict], volume: float | None) -> str:
     lines = []
     vols = sorted({_vol(r) for r in runs}) if volume is None else [volume]
-    header = ("| arm | variant | runs | " + " | ".join(f"{NAMES[m]}{', client counts for callee' if sfx else ' (RCAEval scoring)'}"
-                                                   for m in METHODS for sfx in ("", "_callee"))
-              + " | normal set spans/trace | fault set spans/trace |")
     for vol in vols:
         for sc in SCENARIOS:
             rs = [r for r in runs if r.get("scenario") == sc and abs(_vol(r) - vol) < 1e-6]
             if not rs:
                 continue
+            sfxs = ("",) if sc == "noisy_neighbour" else ("", "_callee")
+            header = ("| arm | variant | runs | " + " | ".join(f"{NAMES[m]}{', client counts for callee' if sfx else ' (RCAEval scoring)'}"
+                                                           for m in METHODS for sfx in sfxs)
+                      + " | normal set spans/trace | fault set spans/trace |")
             truth = "node-level truth (a service only on the culprit's node)" if sc == "noisy_neighbour" else "single culprit"
             lines += [f"### {sc.replace('_', '-')}, V* = {vol:.0%}, {truth}", "",
                       "Acc@1 / Acc@3 / MRR over every scored run, a crash counting as a miss; when runs crashed, the "
-                      "ranked-only numbers follow in parentheses.", "", header, "|---" * 9 + "|"]
+                      "ranked-only numbers follow in parentheses.", "", header, "|---" * (5 + 2 * len(sfxs)) + "|"]
             sh = [r["variants"].get("shadow") for r in rs if r["variants"].get("shadow")]
-            lines.append(f"| (every run) | full data (100 % shadow) | {len(sh)} | {cells(sh)} | "
+            lines.append(f"| (every run) | full data (100 % shadow) | {len(sh)} | {cells(sh, sfxs)} | "
                          f"{_mean([v['normal_set']['spans_per_trace'] for v in sh]):.1f} | "
                          f"{_mean([v['fault_set']['spans_per_trace'] for v in sh]):.1f} |")
             for arm in ARMS:
@@ -112,12 +114,12 @@ def tables(runs: list[dict], volume: float | None) -> str:
                 if not ar:
                     continue
                 own = [r["variants"].get("shadow") for r in ar if r["variants"].get("shadow")]
-                lines.append(f"| {arm} | full data of its runs | {len(own)} | {cells(own)} | | |")
+                lines.append(f"| {arm} | full data of its runs | {len(own)} | {cells(own, sfxs)} | | |")
                 for var in ARM_VARIANTS:
                     vs = [r["variants"].get(var) for r in ar if r["variants"].get(var) and not r["variants"][var].get("error")]
                     if not vs:
                         continue
-                    lines.append(f"| {arm} | {var} | {len(vs)} | {cells(vs)} | "
+                    lines.append(f"| {arm} | {var} | {len(vs)} | {cells(vs, sfxs)} | "
                                  f"{_mean([v['normal_set']['spans_per_trace'] for v in vs]):.2f} | "
                                  f"{_mean([v['fault_set']['spans_per_trace'] for v in vs]):.2f} |")
             lines.append("")
