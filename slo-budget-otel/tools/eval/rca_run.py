@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Stage 3 root-cause ranking of one run (sloeval/rca.py): RCAEval's TraceRCA and MicroRank on the
-100 % shadow (the ceiling) and on the arm's kept spans with the reconstructed structure, the true
+100 % shadow (the full data) and on the arm's kept spans with the reconstructed structure, the true
 structure, and the true structure with the shadow's pre-fault spans as the normal reference.
 Writes <run_dir>/rca.json; variants already there are kept unless named again.
 

@@ -6,7 +6,7 @@ cold_start), the anomalous period the fault window; only spans that end inside [
 fault end] are passed, with inject_time = the fault start.  Times are the shadow's (us).
 
 Variants (one row per span, the columns RCAEval reads):
-  shadow    every span of the 100 % shadow, true parents: the ceiling
+  shadow    every span of the 100 % shadow, true parents: the full data
   recon     the arm's kept spans, each parent the nearest kept ancestor in the reconstructed export
             (tools/recon's placeholders are contracted: they carry no measurement, and an operation
             with no normal-period span makes both methods fail)

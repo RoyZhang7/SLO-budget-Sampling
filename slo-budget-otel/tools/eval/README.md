@@ -163,7 +163,7 @@ scored scenarios (saturated, cascade, cold_start: the culprit; noisy_neighbour: 
 the culprit's node) and writes `rca.json`: per variant the services each method ranks, the rank
 of the first correct one (`rank`, RCAEval's operation-to-service mapping; `rank_callee`, a client
 operation counted for its callee), hit@1, hit@3, the reciprocal rank, failures, and the span and
-trace counts of the normal and fault sets.  Variants: `shadow` (100 %, the ceiling), `recon` and
+trace counts of the normal and fault sets.  Variants: `shadow` (100 %, the full data), `recon` and
 `true` (the arm's kept spans, parents = the nearest kept ancestor in the reconstruction or in the
 shadow), `true_ref` (`true` with the shadow's pre-fault spans as the normal set).
 `rca_tables.py <runs dir> [--volume V] [--md out.md]` tabulates Acc@1 / Acc@3 / MRR.  It needs

@@ -3,13 +3,16 @@
 
     python3 tools/eval/rca_tables.py /storage/royno7/stage3/runs [--volume 0.12] [--md out.md]
 
-Per scenario and volume: first the ceiling (the 100 % shadow, every run of the scenario pooled),
-then per arm and variant (recon, true, true_ref) Acc@1, Acc@3 and MRR of TraceRCA and MicroRank
-over the runs (n; failures = runs where the method raised), and the spans per trace of the arm's
-normal set (recon and true share the kept spans; true_ref's normal set is the shadow's).
-noisy_neighbour is scored against the node-level truth, the other scenarios against the culprit.
-Each method twice: RCAEval's mapping of an operation to a service (the span's own service) and
-"client -> callee" (a client operation counts for the service it calls; see sloeval/rca.py).
+Per scenario and volume: first the full data (the 100 % shadow, every run of the scenario pooled),
+then per arm and variant (recon, true, true_ref) Acc@1, Acc@3 and MRR of TraceRCA and MicroRank,
+and the spans per trace of the arm's normal set (recon and true share the kept spans; true_ref's
+normal set is the shadow's).  Headline: RCAEval's own scoring (an operation counts for the
+service that emitted the span); next to it the version where a client operation counts for the
+service it calls.  In each cell the headline counts a run where the method crashed (an operation
+with no pre-fault span: KeyError on the normal statistics; no ranking) as a miss; when a run
+crashed, the ranked-only numbers follow in parentheses, and the last table counts the crashes per
+arm and volume.  noisy_neighbour is scored against the node-level truth, the other scenarios
+against the culprit.
 """
 from __future__ import annotations
 
@@ -23,6 +26,7 @@ SCENARIOS = ("saturated", "cascade", "cold_start", "noisy_neighbour")
 ARMS = ("chosen", "head", "tail", "reservoir", "canopy", "keep-parent", "threshold")
 ARM_VARIANTS = ("recon", "true", "true_ref")
 METHODS = ("tracerca", "microrank")
+NAMES = {"tracerca": "TraceRCA", "microrank": "MicroRank"}
 
 
 def load(root: str) -> list[dict]:
@@ -35,24 +39,44 @@ def load(root: str) -> list[dict]:
     return out
 
 
-def acc(results: list[dict], sfx: str = "") -> dict:
-    rs = [r for r in results if r]
-    n = len(rs)
+def crashed(r: dict | None) -> str | None:
+    """'no-prefault' (KeyError on the normal statistics), 'other', or None (the method ranked)."""
+    if not r or not r.get("error"):
+        return None
+    return "no-prefault" if str(r["error"]).startswith("KeyError") else "other"
+
+
+def _scores(pool: list[dict], sfx: str) -> dict | None:
+    n = len(pool)
     if not n:
-        return {"n": 0}
-    return {"n": n, "acc1": sum(bool(r.get("hit1" + sfx)) for r in rs) / n, "acc3": sum(bool(r.get("hit3" + sfx)) for r in rs) / n,
-            "mrr": sum(float(r.get("rr" + sfx) or 0.0) for r in rs) / n, "failed": sum(1 for r in rs if r.get("error"))}
+        return None
+    return {"acc1": sum(bool(r.get("hit1" + sfx)) for r in pool) / n, "acc3": sum(bool(r.get("hit3" + sfx)) for r in pool) / n,
+            "mrr": sum(float(r.get("rr" + sfx) or 0.0) for r in pool) / n}
+
+
+def acc(results: list[dict], sfx: str = "") -> dict:
+    """`all`: every scored run, a crash (no ranking) counting as a miss (the headline);
+    `ranked`: only the runs the method ranked."""
+    rs = [r for r in results if r]
+    ranked = [r for r in rs if crashed(r) is None]
+    return {"runs": len(rs), "crashed": len(rs) - len(ranked), "all": _scores(rs, sfx), "ranked": _scores(ranked, sfx)}
+
+
+def _triple(x: dict) -> str:
+    return f"{x['acc1']:.2f} / {x['acc3']:.2f} / {x['mrr']:.2f}"
+
+
+def fmt(a: dict) -> str:
+    if not a.get("runs"):
+        return "-"
+    s = _triple(a["all"])
+    if a["crashed"]:
+        s += f" (ranked only: {_triple(a['ranked']) if a['ranked'] else '-'}; {a['crashed']} of {a['runs']} crashed)"
+    return s
 
 
 def cells(vs: list[dict]) -> str:
     return " | ".join(fmt(acc([v.get(m) for v in vs], sfx)) for m in METHODS for sfx in ("", "_callee"))
-
-
-def fmt(a: dict) -> str:
-    if not a.get("n"):
-        return "-"
-    s = f"{a['acc1']:.2f} / {a['acc3']:.2f} / {a['mrr']:.2f}"
-    return s + (f" ({a['failed']} failed)" if a.get("failed") else "")
 
 
 def _mean(xs) -> float:
@@ -60,22 +84,27 @@ def _mean(xs) -> float:
     return sum(xs) / len(xs) if xs else math.nan
 
 
+def _vol(r: dict) -> float:
+    return float(r["volume_frac"])
+
+
 def tables(runs: list[dict], volume: float | None) -> str:
     lines = []
-    vols = sorted({float(r["volume_frac"]) for r in runs}) if volume is None else [volume]
+    vols = sorted({_vol(r) for r in runs}) if volume is None else [volume]
+    header = ("| arm | variant | runs | " + " | ".join(f"{NAMES[m]}{', client counts for callee' if sfx else ' (RCAEval scoring)'}"
+                                                   for m in METHODS for sfx in ("", "_callee"))
+              + " | normal set spans/trace | fault set spans/trace |")
     for vol in vols:
         for sc in SCENARIOS:
-            rs = [r for r in runs if r.get("scenario") == sc and abs(float(r["volume_frac"]) - vol) < 1e-6]
+            rs = [r for r in runs if r.get("scenario") == sc and abs(_vol(r) - vol) < 1e-6]
             if not rs:
                 continue
             truth = "node-level truth (a service only on the culprit's node)" if sc == "noisy_neighbour" else "single culprit"
             lines += [f"### {sc.replace('_', '-')}, V* = {vol:.0%}, {truth}", "",
-                      "Acc@1 / Acc@3 / MRR over runs.", "",
-                      "| arm | variant | runs | TraceRCA | TraceRCA, client -> callee | MicroRank | MicroRank, client -> callee "
-                      "| normal set spans/trace | fault set spans/trace |",
-                      "|---|---|---|---|---|---|---|---|---|"]
+                      "Acc@1 / Acc@3 / MRR over every scored run, a crash counting as a miss; when runs crashed, the "
+                      "ranked-only numbers follow in parentheses.", "", header, "|---" * 9 + "|"]
             sh = [r["variants"].get("shadow") for r in rs if r["variants"].get("shadow")]
-            lines.append(f"| (all: 100 % shadow) | ceiling | {len(sh)} | {cells(sh)} | "
+            lines.append(f"| (every run) | full data (100 % shadow) | {len(sh)} | {cells(sh)} | "
                          f"{_mean([v['normal_set']['spans_per_trace'] for v in sh]):.1f} | "
                          f"{_mean([v['fault_set']['spans_per_trace'] for v in sh]):.1f} |")
             for arm in ARMS:
@@ -83,7 +112,7 @@ def tables(runs: list[dict], volume: float | None) -> str:
                 if not ar:
                     continue
                 own = [r["variants"].get("shadow") for r in ar if r["variants"].get("shadow")]
-                lines.append(f"| {arm} | its runs' shadow | {len(own)} | {cells(own)} | | |")
+                lines.append(f"| {arm} | full data of its runs | {len(own)} | {cells(own)} | | |")
                 for var in ARM_VARIANTS:
                     vs = [r["variants"].get(var) for r in ar if r["variants"].get(var) and not r["variants"][var].get("error")]
                     if not vs:
@@ -92,6 +121,25 @@ def tables(runs: list[dict], volume: float | None) -> str:
                                  f"{_mean([v['normal_set']['spans_per_trace'] for v in vs]):.2f} | "
                                  f"{_mean([v['fault_set']['spans_per_trace'] for v in vs]):.2f} |")
             lines.append("")
+        # crashes per arm at this volume (every scored scenario together)
+        rs = [r for r in runs if abs(_vol(r) - vol) < 1e-6]
+        cols = [(m, v) for m in METHODS for v in ("shadow",) + ARM_VARIANTS]
+        lines += [f"### Crashes (an operation with no pre-fault span), V* = {vol:.0%}", "",
+                  "Crashed runs / scored runs, every scored scenario together; `other` counts any other error.", "",
+                  "| arm | " + " | ".join(f"{NAMES[m]} {'full data' if v == 'shadow' else v}" for m, v in cols) + " |",
+                  "|---" * (len(cols) + 1) + "|"]
+        for arm in ARMS:
+            ar = [r for r in rs if r.get("arm") == arm]
+            if not ar:
+                continue
+            row = []
+            for m, v in cols:
+                res = [r["variants"][v].get(m) for r in ar if r["variants"].get(v) and not r["variants"][v].get("error")]
+                kinds = [crashed(x) for x in res]
+                c, o = kinds.count("no-prefault"), kinds.count("other")
+                row.append(f"{c} / {len(res)}" + (f" (+{o} other)" if o else "") if res else "-")
+            lines.append(f"| {arm} | " + " | ".join(row) + " |")
+        lines.append("")
     return "\n".join(lines) + "\n"
 
 

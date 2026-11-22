@@ -2,6 +2,8 @@
 # CPU fault on DSB-SN service containers (node-0; needs ssh to the nodes and docker there).
 #
 #   tools/hog/fault.sh spin  <service|all> <threads> <seconds> [duty]       spinning threads inside each container
+#   tools/hog/fault.sh spinf <service|all> <threads> <seconds> <f>          as spin, plus one thread spinning a fraction f
+#                                                                            of every 10 ms (no CPU limit on the container)
 #   tools/hog/fault.sh quota <service|all> <quota_us> <seconds> [period_us]  CPU quota on each container (docker update)
 #   tools/hog/fault.sh burn  <service|all> <threads> <seconds> <quota_us>/<period_us>
 #                                                                            spinning threads inside each container under a
@@ -22,7 +24,7 @@ set -u
 SUFFIX=${SUFFIX:-pb-es-ctr}
 HOG_BIN=${HOG_BIN:-$(cd "$(dirname "$0")" && pwd)/hog}
 MODE=$1; TARGET=$2; LEVEL=${3:-}; SECS=${4:-0}; EXTRA=${5:-}
-case "$MODE" in spin|quota|burn|clear) ;; *) echo "usage: fault.sh spin|quota|burn|clear <service|all> ..."; exit 2 ;; esac
+case "$MODE" in spin|spinf|quota|burn|clear) ;; *) echo "usage: fault.sh spin|spinf|quota|burn|clear <service|all> ..."; exit 2 ;; esac
 if [ "$MODE" = burn ]; then
     case "$EXTRA" in */*) ;; *) echo "burn needs <quota_us>/<period_us>"; exit 2 ;; esac
 fi
@@ -38,7 +40,7 @@ for pod in $PODS; do
     NODE[$pod]=$(kubectl get pod "$pod" -o jsonpath='{.spec.nodeName}')
     CID[$pod]=$(kubectl get pod "$pod" -o jsonpath='{.status.containerStatuses[0].containerID}' | sed 's#^docker://##')
 done
-if [ "$MODE" = spin ] || [ "$MODE" = burn ]; then   # the hog binary to each node once
+if [ "$MODE" = spin ] || [ "$MODE" = spinf ] || [ "$MODE" = burn ]; then   # the hog binary to each node once
     for node in $(printf '%s\n' "${NODE[@]}" | sort -u); do
         scp -q -o BatchMode=yes "$HOG_BIN" "$node:/tmp/slobudget-hog" || { echo "copy to $node failed"; exit 1; }
     done
@@ -52,6 +54,11 @@ one() {
         ssh -o BatchMode=yes "$node" "docker cp /tmp/slobudget-hog $cid:/slobudget-hog && docker exec -d $cid /slobudget-hog -threads $LEVEL -duty $duty -dur ${SECS}s" \
             || { echo "spin failed on $pod"; return; }
         echo "$node $pod spin threads=$LEVEL duty=$duty dur=${SECS}s"
+        ;;
+    spinf)
+        ssh -o BatchMode=yes "$node" "docker cp /tmp/slobudget-hog $cid:/slobudget-hog && docker exec -d $cid /slobudget-hog -threads $LEVEL -extra-duty $EXTRA -extra-period 10ms -dur ${SECS}s" \
+            || { echo "spinf failed on $pod"; return; }
+        echo "$node $pod spinf threads=$LEVEL extra=$EXTRA/10ms dur=${SECS}s"
         ;;
     burn)
         local quota=${EXTRA%/*} period=${EXTRA#*/}

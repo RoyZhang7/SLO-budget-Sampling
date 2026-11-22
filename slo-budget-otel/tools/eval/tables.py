@@ -5,7 +5,9 @@
 
 One row per arm x scenario: the mean over seeds with the seed spread as (min-max) and the
 number of seeds; a row is flagged when a seed in --seeds is missing, or when its runs ran
-different collector images (meta.json digests; "images" column).  Tables: (1) competitors
+different collector images (meta.json digests; "images" column).  Rows of faulted scenarios
+list each run's measured share of requests over the SLO in the fault window ("over SLO, by seed";
+late_everywhere's spinner sets the severity only roughly).  Tables: (1) competitors
 (chosen, head, tail, reservoir, canopy, hindsight / vaif when their runs exist), (2)
 ablations (chosen, threshold, keep-parent), (3) the fault window under each truth (Stage 3:
 single culprit, own time, the culprit's node, duration), (4) reconstruction coverage.  The
@@ -20,7 +22,7 @@ import math
 import os
 
 SCENARIOS = ("steady", "saturated", "noisy_neighbour", "cascade", "bursty", "cold_start", "late_everywhere")
-SCENARIO_LABELS = {"late_everywhere": "late-everywhere (mild systemic)", "noisy_neighbour": "noisy-neighbour"}
+SCENARIO_LABELS = {"noisy_neighbour": "noisy-neighbour"}
 COMPETITORS = ("chosen", "head", "tail", "reservoir", "canopy", "hindsight", "vaif", "slo-budget+vaif")
 ABLATIONS = ("chosen", "threshold", "keep-parent")
 
@@ -143,7 +145,8 @@ def build(summaries, volume, scenarios, seeds, arms, columns):
                 continue
             got = sorted(int(s.get("seed", -1)) for s in rs)
             row = {"arm": arm, "scenario": sc, "seeds": got, "missing": sorted(set(seeds) - set(got)) if seeds else [],
-                   "images": sorted({s.get("_image", "?") for s in rs})}
+                   "images": sorted({s.get("_image", "?") for s in rs}),
+                   "over_slo_runs": [s.get("over_slo_frac_window") for s in sorted(rs, key=lambda x: int(x.get("seed", -1)))]}
             for _, key, _, _ in columns:
                 if key == "identified":
                     vals = [s.get("identified") for s in rs if s.get("identified") is not None]
@@ -159,7 +162,9 @@ def build(summaries, volume, scenarios, seeds, arms, columns):
 def markdown(rows, columns, title, extra=None) -> str:
     if not rows:
         return f"### {title}\n\n(no runs)\n"
-    hdr = ["arm", "scenario", "seeds"] + [c[0] for c in columns] + ([extra[0]] if extra else []) + ["images"]
+    per_run = any(_num(v) is not None for r in rows for v in r.get("over_slo_runs") or [])
+    hdr = (["arm", "scenario", "seeds"] + [c[0] for c in columns] + ([extra[0]] if extra else [])
+           + (["over SLO, by seed"] if per_run else []) + ["images"])
     lines = [f"### {title}", "", "| " + " | ".join(hdr) + " |", "|" + "---|" * len(hdr)]
     for r in rows:
         seeds = str(len(r["seeds"])) + (f" (missing {','.join(map(str, r['missing']))})" if r["missing"] else "")
@@ -172,6 +177,9 @@ def markdown(rows, columns, title, extra=None) -> str:
                 cells.append(cell(r[key], fmt, scale))
         if extra:
             cells.append(r.get(extra[1], "-"))
+        if per_run:
+            vals = [_num(v) for v in r.get("over_slo_runs") or []]
+            cells.append(" / ".join(f"{100 * v:.1f}%" for v in vals if v is not None) or "-")
         ims = r.get("images") or []
         cells.append(ims[0].split(":")[-1][:12] if len(ims) == 1 else f"MIXED ({len(ims)})")
         lines.append("| " + " | ".join(cells) + " |")

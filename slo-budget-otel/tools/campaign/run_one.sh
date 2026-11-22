@@ -10,9 +10,11 @@
 # Faults (faults.env): saturated, cascade and cold_start burn CPU inside the target container
 # under a CPU limit on it (confined to the target); noisy_neighbour (the unconfined spinner on
 # socialgraph, the saturated scenario before 2026-11-22) spins unconfined; late_everywhere spins in
-# every service pod, unconfined or (LATE_EVERYWHERE_MODE=burn) under a CPU limit per pod.
+# every service pod, unconfined (spin; spinf: plus a seventh thread spinning a fraction f of every
+# 10 ms) or under a CPU limit per pod (burn).
 # meta.json records the image digests the pods ran (images.*_digest) and the source commit of
-# the synced tree (images.source_commit, from SOURCE.json; source_dirty lists files that differ).
+# the synced tree (images.source_commit and source_tree, the commit's tree hash, which a reworded
+# commit keeps; from SOURCE.json; source_dirty lists files that differ).
 set -u
 cd "$(dirname "$0")/../.."
 MOD=$(pwd)
@@ -124,6 +126,10 @@ if [ -n "$FAULT_TARGET" ]; then   # the fault size, before the load starts (a fa
         [ -n "$LEVEL" ] && [ -n "$FAULT_LIMIT" ] || fail "no burner size for $FAULT_TARGET in faults.env"
         FEXTRA=$FAULT_LIMIT
     fi
+    if [ "$FAULT_MODE" = spinf ]; then   # LEVEL full threads plus one spinning this fraction of every 10 ms
+        FEXTRA=${FAULT_EXTRA_DUTY_ALL:-}
+        [ -n "$FEXTRA" ] || fail "no FAULT_EXTRA_DUTY_ALL in faults.env"
+    fi
 fi
 python3 -c "import time; t=time.time(); time.sleep((5 - t % 5) % 5 + 0.2)"     # first period complete
 T0=$(python3 -c "import time; print(round(time.time(), 3))")
@@ -186,7 +192,7 @@ def load(n):
 fault = load("fault.json")
 if fault:
     fault.update({"kind": "cpu-$FAULT_MODE", "culprit": $CULPRIT, "targets": ["$FAULT_TARGET".replace("post-storage", "poststorage")],
-                  "limit": "${FAULT_LIMIT:-}" or None})
+                  "limit": "${FAULT_LIMIT:-}" or None, "extra_duty": "${FEXTRA:-}" if "$FAULT_MODE" == "spinf" else None})
 burst = load("burst.json")
 def digests(text):   # "container=docker-pullable://repo@sha256:... ..." -> {container: [digests]}
     out = {}
@@ -208,7 +214,8 @@ try:
     src = json.load(open("$MOD/SOURCE.json"))
 except (OSError, ValueError):
     src = {}
-images.update({"source_commit": src.get("commit"), "source_dirty": src.get("dirty"), "source_synced": src.get("synced")})
+images.update({"source_commit": src.get("commit"), "source_tree": src.get("tree"), "source_dirty": src.get("dirty"),
+               "source_synced": src.get("synced")})
 placement, placement_nodes = {}, {}
 for item in "$PLACEMENT".split():
     lab, _, node = item.partition("=")
