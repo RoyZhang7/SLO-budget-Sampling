@@ -119,6 +119,9 @@ def main() -> int:
         rows_svc = r["svc"]
         if not target:
             line += "  " + " ".join(f"{s}:{v['own_p95']:.2f}/{v['b_ms']:.1f}" for s, v in sorted(rows_svc.items()))
+        elif target == "all":     # every service: own-time P95 x base, the four that slowed most
+            xs = sorted(((s, v["own_p95"] / base[s]) for s, v in rows_svc.items() if s in base), key=lambda kv: -kv[1])
+            line += "  own P95 x base: " + " ".join(f"{s}:{x:.2f}" for s, x in xs[:4])
         print(line)
     return 0
 

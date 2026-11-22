@@ -21,7 +21,9 @@ Differences from the simulator, forced by the span model or the data:
   the culprit's server ancestors (the services the own-time trigger is meant to spare).
 - Stage 3: the node-level truth (noisy neighbour: the unconfined spinner slows every service on
   the culprit's node) counts an outlier keep in the fault window as right when its service runs
-  on the culprit's node (`outlier_precision_node_window`, placement from meta.json).
+  only on the culprit's node (`outlier_precision_node_window`).  A service with pods on several
+  nodes (wrk2api, a DaemonSet) is not on the node: meta.json's `placement` names one of its pods
+  only, so `placement_nodes` (every node) decides, and runs without it treat wrk2api as everywhere.
 - drop reasons of unkept spans are not logged on the cluster: chosen-family arms
   split a lost outlier into not_flagged (duration <= (1 + m) x the table in force
   in its period, or no table yet) and refused (budget, pool, N_need or cap);
@@ -39,6 +41,19 @@ from .spans import CLIENT, SERVER, KeptSet, SpanTable, own_client
 CHOSEN_FAMILY = ("chosen", "threshold", "keep-parent")
 FLAG_REASONS = ("outlier", "escalate")
 EVIDENCE_FLAG_REASONS = ("outlier", "escalate", "parent")
+
+
+MULTI_NODE = ("wrk2api",)   # DaemonSet services: one pod per node
+
+
+def node_services(meta: dict, node: str | None) -> list[str]:
+    """Services whose pods all run on `node` (none for node None)."""
+    if not node:
+        return []
+    nodes = meta.get("placement_nodes")
+    if nodes:
+        return sorted(s for s, ns in nodes.items() if list(ns) == [node])
+    return sorted(s for s, h in (meta.get("placement") or {}).items() if h == node and s not in MULTI_NODE)
 
 
 def _safe_div(a, b) -> float:
@@ -475,7 +490,7 @@ def compute(meta: dict, t: SpanTable, kept: KeptSet, kidx: np.ndarray, cal, stat
             out["caller_truth_dur_window"] = int((callers & window & SP & truth).sum())
             # Stage 3 node-level truth: an outlier keep in the window is right on any service of the culprit's node
             cnode = placement.get(culprit)
-            node_ids = [scode[s] for s, h in placement.items() if cnode and h == cnode and s in scode]
+            node_ids = [scode[s] for s in node_services(meta, cnode) if s in scode]
             on_node = np.isin(t.svc, node_ids)
             out["culprit_node"] = cnode or "none"
             out["culprit_node_services"] = sorted(t.services[i] for i in node_ids)

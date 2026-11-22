@@ -2,3 +2,4 @@ build/
 results/
 *.test
 tools/hog/hog
+SOURCE.json

@@ -123,6 +123,8 @@ class SpanTable:
     n_traces: int
     duplicates: int = 0
     lines: int = 0
+    name: np.ndarray = field(default=None, repr=False)        # int32 span-name code (shadow: name, export: operationName)
+    names: list = field(default_factory=list)
     # derived by finish()
     pidx: np.ndarray = field(default=None, repr=False)        # parent index (-1: root or parent missing)
     depth: np.ndarray = field(default=None, repr=False)       # bridge depth, else depth by parent chain
@@ -232,8 +234,8 @@ def read_shadow(path: str, default_route: str = DEFAULT_ROUTE) -> SpanTable:
     """Parse the shadow's OTLP JSON lines into a SpanTable (duplicates by span id dropped)."""
     sid, pid, trace, start, end = array("Q"), array("Q"), array("q"), array("q"), array("q")
     kind, err, bdepth = bytearray(), bytearray(), array("h")
-    svc, cls, route = array("i"), array("i"), array("i")
-    svcs, clss, routes, traces = _Codes(), _Codes(), _Codes(), _Codes()
+    svc, cls, route, nm = array("i"), array("i"), array("i"), array("i")
+    svcs, clss, routes, traces, nms = _Codes(), _Codes(), _Codes(), _Codes(), _Codes()
     seen: set[int] = set()
     dups = lines = 0
     for line in open_lines(path):
@@ -280,6 +282,7 @@ def read_shadow(path: str, default_route: str = DEFAULT_ROUTE) -> SpanTable:
                     err.append(1 if st in (2, "STATUS_CODE_ERROR") else 0)
                     bdepth.append(depth if 0 <= depth < 32000 else -1)
                     svc.append(sc)
+                    nm.append(nms.code(sp.get("name", "")))
                     cls.append(clss.code(c_cls or f"{r}|any"))
                     route.append(routes.code(r))
     t = SpanTable(
@@ -295,7 +298,8 @@ def read_shadow(path: str, default_route: str = DEFAULT_ROUTE) -> SpanTable:
         err=np.frombuffer(bytes(err), dtype=np.uint8).astype(bool),
         bdepth=np.frombuffer(bdepth, dtype=np.int16).copy() if len(bdepth) else np.zeros(0, np.int16),
         services=svcs.names, classes=clss.names, routes=routes.names, n_traces=len(traces.names),
-        duplicates=dups, lines=lines)
+        duplicates=dups, lines=lines,
+        name=np.frombuffer(nm, dtype=np.int32).copy() if len(nm) else np.zeros(0, np.int32), names=nms.names)
     return t.finish()
 
 
@@ -315,8 +319,8 @@ def read_export_table(path: str, default_route: str = DEFAULT_ROUTE) -> SpanTabl
     (reconstruction) spans are skipped."""
     sid, pid, trace, start, end = array("Q"), array("Q"), array("q"), array("q"), array("q")
     kind, err, bdepth = bytearray(), bytearray(), array("h")
-    svc, cls, route = array("i"), array("i"), array("i")
-    svcs, clss, routes, traces = _Codes(), _Codes(), _Codes(), _Codes()
+    svc, cls, route, nm = array("i"), array("i"), array("i"), array("i")
+    svcs, clss, routes, traces, nms = _Codes(), _Codes(), _Codes(), _Codes(), _Codes()
     seen: set[int] = set()
     dups = 0
     for tr in _iter_export_traces(path):
@@ -348,6 +352,7 @@ def read_export_table(path: str, default_route: str = DEFAULT_ROUTE) -> SpanTabl
             err.append(1 if e in (True, "true") or tags.get("otel.status_code") == "ERROR" else 0)
             bdepth.append(-1)
             svc.append(svcs.code(norm_service((procs.get(sp.get("processID")) or {}).get("serviceName", "?"))))
+            nm.append(nms.code(str(sp.get("operationName", ""))))
             cls.append(clss.code(str(tags.get("slo.class") or f"{r}|any")))
             route.append(routes.code(r))
     t = SpanTable(
@@ -363,7 +368,8 @@ def read_export_table(path: str, default_route: str = DEFAULT_ROUTE) -> SpanTabl
         err=np.frombuffer(bytes(err), dtype=np.uint8).astype(bool),
         bdepth=np.frombuffer(bdepth, dtype=np.int16).copy() if len(bdepth) else np.zeros(0, np.int16),
         services=svcs.names, classes=clss.names, routes=routes.names, n_traces=len(traces.names),
-        duplicates=dups, lines=0)
+        duplicates=dups, lines=0,
+        name=np.frombuffer(nm, dtype=np.int32).copy() if len(nm) else np.zeros(0, np.int32), names=nms.names)
     return t.finish()
 
 @dataclass
@@ -381,9 +387,13 @@ class KeptSet:
 
 
 def _iter_export_traces(path: str):
-    """Yield the traces of a Jaeger export ({"data": [...]} or a bare list) one at a time."""
-    with open(path, encoding="utf-8") as f:
-        text = f.read()
+    """Yield the traces of a Jaeger export ({"data": [...]} or a bare list, plain or .zst / .gz)
+    one at a time."""
+    if path.endswith((".zst", ".gz")):
+        text = "".join(open_lines(path))
+    else:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
     dec = json.JSONDecoder()
     i = 0
     n = len(text)

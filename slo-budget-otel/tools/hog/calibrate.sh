@@ -18,6 +18,10 @@ mkdir -p "$R"
 : "${PHASES:=base;spin socialgraph 80;spin socialgraph 240;quota socialgraph 1500;quota socialgraph 500;spin post-storage 240;quota post-storage 1000;quota post-storage 400;spin all 80;quota all 3000;quota all 1500}"
 kubectl get ds otelcol-pb-es-ctr -o jsonpath='{.spec.template.spec.containers[0].image}' | tee "$R/collector-image.txt"; echo
 kubectl get pods -o wide --no-headers | awk '{print $1, $7}' > "$R/placement.txt"
+if [ "${RESEED:-0}" = 1 ]; then   # as a run starts: fresh data, then a 30-s warm-up
+    bash tools/reseed.sh > "$R/reseed.log" 2>&1 || { echo "reseed failed: $(tail -1 "$R/reseed.log")"; exit 1; }
+    wrk -t2 -c10 -d30s -s "$LUA" "$URL" -R"$RPS" > "$R/wrk-warmup.log" 2>&1
+fi
 IFS=';' read -ra PH <<< "$PHASES"
 echo "[" > "$R/phases.json"
 first=1

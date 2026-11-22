@@ -9,8 +9,10 @@
 # Writes /storage/royno7/stage3/runs/<run_id>/ (meta.json, run.log, collected / failed markers).
 # Faults (faults.env): saturated, cascade and cold_start burn CPU inside the target container
 # under a CPU limit on it (confined to the target); noisy_neighbour (the unconfined spinner on
-# socialgraph, the saturated scenario before 2026-11-22) and late_everywhere spin unconfined.
-# meta.json records the image digests the pods ran (images.*_digest).
+# socialgraph, the saturated scenario before 2026-11-22) spins unconfined; late_everywhere spins in
+# every service pod, unconfined or (LATE_EVERYWHERE_MODE=burn) under a CPU limit per pod.
+# meta.json records the image digests the pods ran (images.*_digest) and the source commit of
+# the synced tree (images.source_commit, from SOURCE.json; source_dirty lists files that differ).
 set -u
 cd "$(dirname "$0")/../.."
 MOD=$(pwd)
@@ -106,7 +108,7 @@ case "$SCENARIO" in
     cascade) FAULT_TARGET=post-storage; FAULT_AT=240; CULPRIT='"poststorage"'; FAULT_MODE=burn ;;
     cold_start) FAULT_TARGET=socialgraph; FAULT_AT=120; CULPRIT='"socialgraph"'; FAULT_MODE=burn ;;
     noisy_neighbour) FAULT_TARGET=socialgraph; FAULT_AT=240; CULPRIT='"socialgraph"'; FAULT_MODE=spin ;;
-    late_everywhere) FAULT_TARGET=all; FAULT_AT=240; FAULT_MODE=spin ;;
+    late_everywhere) FAULT_TARGET=all; FAULT_AT=240; FAULT_MODE=${LATE_EVERYWHERE_MODE:-spin} ;;
     bursty) BURST_AT=360 ;;
     *) fail "unknown scenario $SCENARIO" ;;
 esac
@@ -202,14 +204,22 @@ images = {"collector": "$IMG", "app": "$APPIMG",
           "collector_digest": col[0] if len(col) == 1 else (col or None),       # a list if the agents disagree
           "central_digest": cen[0] if len(cen) == 1 else (cen or None), "agent_containers": agents,
           "app_digest": "$APP_IMAGEID".rpartition("@")[2] or None, "shadow_sha256": "$SHADOW_SHA" or None}
-placement = {}
+try:
+    src = json.load(open("$MOD/SOURCE.json"))
+except (OSError, ValueError):
+    src = {}
+images.update({"source_commit": src.get("commit"), "source_dirty": src.get("dirty"), "source_synced": src.get("synced")})
+placement, placement_nodes = {}, {}
 for item in "$PLACEMENT".split():
     lab, _, node = item.partition("=")
     if lab.endswith("-service-pb-es-ctr"):
-        placement[lab[: -len("-service-pb-es-ctr")].replace("-", "")] = node
+        svc = lab[: -len("-service-pb-es-ctr")].replace("-", "")
+        placement[svc] = node
+        placement_nodes.setdefault(svc, set()).add(node)
 meta = {"run_id": "$RUN_ID", "arm": "$ARM", "scenario": "$SCENARIO", "volume_frac": $VOL, "v_star": round($VOL * 11500),
         "cap": 1.25 * round($VOL * 11500), "seed": $SEED, "slo_ms": {"compose_post": 23.4}, "period_s": 5, "margin": 0.1,
         "t0": $T0, "t1": $T1, "delta_s": $DELTA, "fault": fault, "burst": burst, "placement": placement,
+        "placement_nodes": {k: sorted(v) for k, v in placement_nodes.items()},
         "arm_params": {"head_r": $VOL, "tail_p": $VOL, "tail_decision_wait_s": float("$TAIL_WAIT".rstrip("s")),
                        "reservoir_shares": json.loads('$RESERVOIR_SHARES')},
         "images": images, "tee": $TEE == 1, "agent_restarts": "$RESTARTS".split(),
