@@ -16,6 +16,9 @@ source ~/bridges-env.sh 2>/dev/null || true
 : "${DUR:=600}" ; : "${RPS:=100}" ; : "${HOG_AT:=240}" ; : "${HOG_FOR:=180}" ; : "${HOG_NODE:=node-2}" ; : "${HOG_PROCS:=40}"
 : "${BURST_AT:=0}" ; : "${BURST_FOR:=60}" ; : "${BURST_RPS:=200}"
 : "${ROOT_POLICY:=on_demand}" ; : "${RECON:=0}" ; : "${ARM:=}"
+# WARMUP: seconds of load against the stock collector before the switch (warms the app's
+# caches and connections after a reseed); ALIGN=1 starts the load on a 5-s period boundary
+: "${WARMUP:=0}" ; : "${ALIGN:=1}"
 : "${URL:=${WRK2API_URL:-http://10.10.1.1:22903}}"
 : "${LUA:=$HOME/blueprint-docc-mod/examples/dsb_sn/scripts/compose-post.lua}"
 : "${JQ:=http://192.168.134.21:16686}"
@@ -42,6 +45,10 @@ echo "{\"root_policy\": \"$ROOT_POLICY\", \"recon\": $RECON, \"arm\": \"$ARM\", 
 kubectl get ds otelcol-pb-es-ctr -o yaml > "$R/otelcol-ds.original.yaml"
 kubectl get pods -o wide > "$R/pods.before.txt"
 
+if [ "$WARMUP" -gt 0 ]; then
+    log "warm-up: ${WARMUP}s at $RPS rps against the stock collector"
+    wrk -t2 -c10 -d"${WARMUP}"s -s "$LUA" "$URL" -R"$RPS" > "$R/wrk-warmup.log" 2>&1
+fi
 log "deploy: central (processors: $PROCS), agent config, headless peers service, SDK port, DaemonSet switch"
 sed -e "s#__IMAGE__#$IMG#" -e "s#__CENTRAL_PROCESSORS__#$PROCS#" deploy/central.yaml | kubectl apply -f - | tee -a "$R/run.log"
 sed -e "s#__ROOT_POLICY__#$ROOT_POLICY#" deploy/agent.yaml | kubectl apply -f - | tee -a "$R/run.log"
@@ -59,6 +66,9 @@ log "central status before load:"; curl -s "http://$CENTRAL:8081/slobudget/statu
 log "sdk endpoint from node-0 via the agents' pod IPs:"
 for ip in $(kubectl get pods -l io.kompose.service=otelcol-pb-es-ctr -o jsonpath='{.items[*].status.podIP}'); do curl -s -m 2 "http://$ip:8082/slobudget/sdk" | tee -a "$R/run.log"; echo; done
 
+if [ "$ALIGN" = 1 ]; then   # start on a 5-s period boundary (+0.2 s), so the first period is complete
+    python3 -c "import time; t=time.time(); time.sleep((5 - t % 5) % 5 + 0.2)"
+fi
 T0=$(date +%s)
 log "phase a: wrk -t2 -c10 -d${DUR}s -R$RPS ComposePost only"
 wrk -t2 -c10 -d"${DUR}"s -L -s "$LUA" "$URL" -R"$RPS" > "$R/wrk.log" 2>&1 &

@@ -86,6 +86,7 @@ class FaultTruth:
     services: tuple[str, ...]       # services whose own time was inflated
     start: float                    # injection time (s)
     culprit: str | None             # the single root cause, None when systemic
+    onsets: dict = field(default_factory=dict)     # service -> (onset, end) of its injected own-time factor (> 1)
 
 
 @dataclass

@@ -23,6 +23,12 @@ the scenario and the same collector cap = cap_factor * V*.
               P97.5 / P99, healthy-rate N_need) at 25, 12, 5%, on the fitted workload and on the
               drift variant (`+dr`: the deployment as it ran during the Stage 2 cluster runs, SLO and
               oracle anchored to the fitted reference) plus steady on the heavytail refit (`+ht`)
+              (pinned to the duration trigger since Stage 2d)
+  exp15       Stage 2d: the own-time trigger (own time > (1 + m) x own-time share) with m in 0 .. 0.3
+              vs the full-duration trigger (m = 0.1) on chosen-v2, at 25, 12, 5%, every scenario plus
+              the drift workload's steady and saturated; every metric under both truths
+  exp16       Stage 2d A4: trace-consistent plan coin and decaying N_need counts on the own trigger
+              (exp14-16 are pinned to the Stage 2c freeze release, freeze_release=1, since Stage 3)
 
 Every experiment is resumable: rows already in results/<exp>.csv for the same
 (scenario, seed, arm, label, volume, overrides, workload / scenario tag) are
@@ -43,7 +49,7 @@ import numpy as np
 from .baselines import CanopySampler, ReservoirSampler, TailSampler, UniformHeadSampler
 from .metrics import REASON_GROUPS, CorpusArrays, compute
 from .replay import replay
-from .sampler import BEST_CALIB_SOURCE, BEST_COLD_PRIOR, BEST_CREDIT, BEST_N_NEED_FRAC, BEST_ROOT_POLICY, make_budget_arm
+from .sampler import BEST_CALIB_SOURCE, BEST_COLD_PRIOR, BEST_CREDIT, BEST_N_NEED_FRAC, BEST_ROOT_POLICY, BudgetConfig, make_budget_arm
 from .synthetic import ALL_SCENARIOS, DRIFT_SCENARIOS, SCENARIOS, build_scenario, scenario_tag
 from .ttable import oracle_table
 
@@ -86,7 +92,17 @@ EXP14_SCENARIOS = SCENARIOS + DRIFT_SCENARIOS + ("steady+ht",)     # fitted, dri
 VOLUMES = (0.25, 0.12, 0.05)
 # BudgetConfig fields added after the result rows of passes 1-5 were written: they enter the
 # config hash only when set away from their default, so those rows stay valid
-HASH_OPTIONAL = {"n_need_healthy": False}      # outlier_margin always enters the hash since its default moved to 0.1 (Stage 2c)
+HASH_OPTIONAL = {"n_need_healthy": False, "plan_coin": "span", "n_need_decay": 0.0,      # outlier_margin always enters the hash since its default moved to 0.1 (Stage 2c)
+                 "freeze_release": 1}       # Stage 3: rows before the field existed used the release at the first quiet period
+# Stage 2d: outlier_trigger and own_margin enter the hash only for the own trigger, so that a
+# duration-trigger configuration hashes as it did before the fields existed
+TRIGGER_VARIANTS = [("duration m=0.1", {"outlier_trigger": "duration", "outlier_margin": 0.1})] + [
+    (f"own m={m}", {"outlier_trigger": "own", "own_margin": m}) for m in (0.0, 0.1, 0.2, 0.3)]
+EXP15_SCENARIOS = SCENARIOS + ("steady+dr", "saturated+dr")
+EXP16_M = 0.1                   # the own-time margin chosen from exp15 (sampler default)
+A4_VARIANTS = [(f"own m={EXP16_M} (base)", {"outlier_trigger": "own", "own_margin": EXP16_M}),
+               ("trace plan coin", {"outlier_trigger": "own", "own_margin": EXP16_M, "plan_coin": "trace"})] + [
+    (f"N_need decay {d}", {"outlier_trigger": "own", "own_margin": EXP16_M, "n_need_decay": d}) for d in (0.25, 0.5, 0.75)]
 
 
 @dataclass
@@ -149,14 +165,24 @@ def _parse_kv(text: str) -> dict:
     return out
 
 
+DEFAULT_TRUTH = BudgetConfig().outlier_trigger      # the truth the baselines are judged under (Stage 2d: own)
+
+
 def _config_hash_impl(arm: str, overrides: dict) -> str:
     """Hash of the resolved BudgetConfig of a budget arm (every field), so that
     a changed preset or default invalidates a result row even when the job's
-    own overrides did not change; "" for the other arms."""
+    own overrides did not change.  The other arms have no configuration: ""
+    while they were judged under the duration truth (rows written before
+    Stage 2d), "truth=<trigger>" since they follow the default trigger's truth."""
     if arm not in BUDGET_ARMS:
-        return ""
+        return "" if DEFAULT_TRUTH == "duration" else f"truth={DEFAULT_TRUTH}"
     cfg = make_budget_arm(arm, **overrides).cfg
     fields = {k: v for k, v in asdict(cfg).items() if k not in HASH_OPTIONAL or v != HASH_OPTIONAL[k]}
+    if cfg.outlier_trigger == "duration":
+        fields.pop("outlier_trigger", None)
+        fields.pop("own_margin", None)
+    if cfg.calib_source != "frozen" or cfg.freeze_trigger != "rate":
+        fields.pop("freeze_release", None)      # it acts only on the frozen source's rate trigger
     text = " ".join(f"{k}={v}" for k, v in sorted(fields.items()))
     return hashlib.sha1(text.encode()).hexdigest()[:10]
 
@@ -170,7 +196,8 @@ def run_job(job: Job) -> dict:
     cap = job.cap_factor * v_star
     sampler = make_arm(job.arm, job.overrides)
     res = replay(corpus, sampler, v_star, cap, seed=1000 + job.seed, oracle=oracle)
-    m = compute(corpus, arrays, res)
+    truth = sampler.cfg.outlier_trigger if job.arm in BUDGET_ARMS else DEFAULT_TRUTH
+    m = compute(corpus, arrays, res, truth=truth)
     m.update({"exp": job.exp, "scenario": job.scenario, "seed": job.seed, "label": job.label, "arm": job.arm,
               "volume_frac": job.volume_frac, "tag": scenario_tag(job.scenario),
               "config": _config_hash(job.arm, job.overrides),
@@ -340,14 +367,31 @@ def exp14_jobs(seeds: list[int], extra: dict | None = None) -> list[Job]:
     misses beyond the service's healthy over-T rate), at 25, 12 and 5%, on every
     scenario of the fitted workload and of the drift variant, plus steady on the
     heavytail refit."""
-    return [Job("exp14", sc, sd, "chosen-v2", label, {**(extra or {}), **ov}, volume_frac=vf)
+    return [Job("exp14", sc, sd, "chosen-v2", label, {"outlier_trigger": "duration", "freeze_release": 1, **(extra or {}), **ov},
+                volume_frac=vf)
             for vf in VOLUMES for sc in EXP14_SCENARIOS for sd in seeds for label, ov in RULE_VARIANTS]
+
+
+def exp15_jobs(seeds: list[int], extra: dict | None = None) -> list[Job]:
+    """Stage 2d: the own-time trigger (outlier when own time > (1 + m) x the own-time
+    share of the square-root split; m in 0, 0.1, 0.2, 0.3) vs the full-duration trigger
+    (duration > 1.1 T_i, the Stage 2c rule) on chosen-v2, at 25, 12 and 5%, on every
+    scenario plus the drift workload's steady and saturated."""
+    return [Job("exp15", sc, sd, "chosen-v2", label, {"freeze_release": 1, **(extra or {}), **ov}, volume_frac=vf)
+            for vf in VOLUMES for sc in EXP15_SCENARIOS for sd in seeds for label, ov in TRIGGER_VARIANTS]
+
+
+def exp16_jobs(seeds: list[int], extra: dict | None = None) -> list[Job]:
+    """Stage 2d A4 on the own trigger: the trace-consistent plan coin and N_need
+    counts that decay (d = 0.25, 0.5, 0.75) instead of resetting each period."""
+    return [Job("exp16", sc, sd, "chosen-v2", label, {"freeze_release": 1, **(extra or {}), **ov}, volume_frac=vf)
+            for vf in VOLUMES for sc in SCENARIOS for sd in seeds for label, ov in A4_VARIANTS]
 
 
 EXPERIMENTS = {"exp1": exp1_jobs, "exp1_tight": exp1_tight_jobs, "exp2": exp2_jobs, "exp3": exp3_jobs,
                "exp4": exp4_jobs, "exp5": exp5_jobs, "exp6": exp6_jobs, "exp7": exp7_jobs, "exp8": exp8_jobs,
                "exp9": exp9_jobs, "exp10": exp10_jobs, "exp11": exp11_jobs, "exp12": exp12_jobs, "exp13": exp13_jobs,
-               "exp14": exp14_jobs}
+               "exp14": exp14_jobs, "exp15": exp15_jobs, "exp16": exp16_jobs}
 
 COLUMNS = ["exp", "scenario", "seed", "arm", "label", "overrides", "volume_frac", "tag", "config", "spans", "v_star", "cap", "fault_start",
            "kept_per_period", "vol_ratio", "min_vol_ratio", "bytes_per_period", "over_cap_periods", "max_pre_ratio",
@@ -426,8 +470,11 @@ def _cell(v: float, m: str) -> str:
     if m.startswith(("recall", "p95_within", "p95_svc_within", "p95_pooled_within", "vol_ratio", "outlier_share",
                      "outlier_precision", "culprit_confirmable", "viol_coverage", "viol_requests_frac",
                      "kept_with_holes_frac", "root_share", "record_share", "roots_", "ctx_", "outlier_no_root",
-                     "attrib_", "loss_", "ref_", "credit_share", "truth_rate_")):
+                     "attrib_", "loss_", "ref_", "credit_share", "truth_rate_", "faulty_cov", "orphans_",
+                     "outlier_orphan")):
         return f"{v:.2f}"
+    if m in ("mean_per_request",) or m.startswith(("faulty_kept", "faulty_outlier", "faulty_pp")):
+        return f"{v:.1f}"
     if m.startswith("p95_err"):
         return f"{100 * v:.1f}%"
     if m.startswith("t_drift"):
@@ -485,7 +532,17 @@ HEAD = {"event_recall": "event recall", "p95_err_pooled": "P95 err pooled", "kep
         "spend_top": "top kept rates", "loss_not_flagged": "loss not flagged",
         "buffer_peak_spans": "peak buffered", "buffer_mean_spans": "mean buffered", "buffer_peak_bytes": "peak buffered bytes",
         "decision_latency_mean": "decision latency mean", "decision_latency_p95": "decision latency p95",
-        "decision_latency_max": "decision latency max", "evicted_traces": "evicted (timeout)", "cap_dropped_traces": "traces refused by cap"}
+        "decision_latency_max": "decision latency max", "evicted_traces": "evicted (timeout)", "cap_dropped_traces": "traces refused by cap",
+        "faulty_cov": "faulty-span coverage", "faulty_kept_pp_svc": "faulty kept/period/svc",
+        "faulty_outlier_pp_svc": "faulty kept as outliers/period/svc", "faulty_truth_own": "faulty spans over b (own truth)",
+        "faulty_truth_dur": "faulty spans over T (duration truth)",
+        "faulty_pp": "faulty spans/period", "orphans_per_kept_outlier": "orphans/kept outlier",
+        "outlier_orphan_share": "kept outliers orphaned", "mean_per_request": "mean/request",
+        "outlier_precision_own": "precision (own truth)", "outlier_precision_dur": "precision (duration truth)",
+        "recall_culprit_own": "culprit recall (own truth)", "recall_culprit_dur": "culprit recall (duration truth)",
+        "identified_own": "identified (own truth)", "identified_dur": "identified (duration truth)",
+        "outlier_share_own": "outlier share (own truth)", "outlier_share_dur": "outlier share (duration truth)",
+        "faulty_services": "faulty services"}
 
 HEADLINE = ["kept_per_period", "vol_ratio", "over_cap_periods", "root_share", "outlier_share", "outlier_precision",
             "max_per_request", "max_per_host_period", "buffer_peak_spans", "attrib_explained", "attrib_loss", "outlier_no_root",
@@ -746,6 +803,35 @@ def summarize(exp: str, rows: list[dict]) -> str:
                 parts.append(f"### {sc}, V* = {100 * vf:.0f}%\n")
                 parts.append(md_table(agg, fcols, HEAD))
                 parts.append("")
+    elif exp in ("exp15", "exp16"):
+        a_cols = ["label", "vol_ratio", "over_cap_periods", "recall_culprit", "identified", "evidence_s", "faulty_cov",
+                  "faulty_kept_pp_svc", "faulty_outlier_pp_svc", "n_need_eff", "orphans_per_kept_outlier", "outlier_orphan_share",
+                  "mean_per_request", "max_per_request", "max_per_host_period", "outlier_share", "outlier_precision",
+                  "p95_err_svc_mean", "p95_err_svc_max"]
+        b_cols = ["label", "outlier_precision_own", "outlier_precision_dur", "recall_culprit_own", "recall_culprit_dur",
+                  "identified_own", "identified_dur", "outlier_share_own", "outlier_share_dur"]
+        if exp == "exp15":
+            parts.append("Stage 2d: own-time trigger on chosen-v2 (outlier when own time > (1 + m) x the own-time share b_i "
+                         "of the square-root split, i.e. the stage budget before the shares are summed into inclusive "
+                         "budgets; m in 0 .. 0.3) vs the full-duration trigger (duration > 1.1 T_i, Stage 2c).  The "
+                         "first table reads every variant under its own trigger's truth (own: own time > b_oracle; "
+                         "duration: duration > T_oracle); the second table judges every variant under both truths.  "
+                         "faulty-span coverage = share kept of the spans whose own time carries the injected fault "
+                         "(any reason: the faulty spans below the threshold are plan-sampled); faulty kept as "
+                         "outliers/period/svc against N_need (the plateau); orphans/kept outlier = kept spans whose "
+                         "parent was not kept, in traces holding a kept truth outlier, over kept truth outliers.  "
+                         "Attributability holds by construction for own-trigger keeps and is in the CSV only.  "
+                         "`+dr` = the drift workload.\n")
+            order = tuple(l for l, _ in TRIGGER_VARIANTS)
+        else:
+            parts.append("Stage 2d A4 on the own trigger (m = " + str(EXP16_M) + "): trace-consistent plan coin (an ordinary "
+                         "span is kept only if the trace's random value is under the plan rate) and N_need counts that "
+                         "decay by d at each period end instead of resetting.  Same columns as exp15.\n")
+            order = tuple(l for l, _ in A4_VARIANTS)
+        if exp == "exp16":
+            a_cols = a_cols + ["ctx_no_holes", "ctx_sufficient"]
+        _per_volume_tables(parts, rows, "label", order, a_cols, scenarios, title="Under each trigger's truth")
+        _per_volume_tables(parts, rows, "label", order, b_cols, scenarios, per_scenario=False, title="Both truths")
     return "\n".join(parts) + "\n"
 
 
@@ -789,8 +875,9 @@ def load_rows(path: Path) -> list[dict]:
         for raw in csv.DictReader(f):
             row = {}
             for k, v in raw.items():
+                kb = k[:-4] if k.endswith(("_own", "_dur")) else k          # truth-suffixed copies (Stage 2d)
                 if v is None or v == "":
-                    row[k] = math.nan if k not in ("overrides", "culprit_est", "culprit_truth", "spend_top", "label", "arm",
+                    row[k] = math.nan if kb not in ("overrides", "culprit_est", "culprit_truth", "spend_top", "label", "arm",
                                                    "scenario", "exp", "kept_by_reason", "dropped_by_reason", "refusal_split",
                                                    "loss_split", "frozen_by_svc", "frozen_entries_by_svc", "p95_err_svc", "tag",
                                                    "config", "refusal_split_p0", "truth_rate_by_svc", "truth_culprit_est") else ""
@@ -799,8 +886,8 @@ def load_rows(path: Path) -> list[dict]:
                 else:
                     try:
                         fv = float(v)
-                        row[k] = int(fv) if k in ("seed", "spans", "over_cap_periods", "kept_total", "records_total",
-                                                  "lost_outliers", "kept_outliers", "truth_outliers") and fv.is_integer() else fv
+                        row[k] = int(fv) if kb in ("seed", "spans", "over_cap_periods", "kept_total", "records_total",
+                                                   "lost_outliers", "kept_outliers", "truth_outliers") and fv.is_integer() else fv
                     except ValueError:
                         row[k] = v
             rows.append(row)
@@ -829,9 +916,16 @@ def with_volumes(jobs: list[Job], volumes: list[float] | None) -> list[Job]:
     return out
 
 
+def _ov_key(text: str) -> str:
+    # an explicit duration trigger is what every row written before Stage 2d ran, and the
+    # Stage 2c freeze release what every row written before Stage 3 ran; the config hash
+    # tells the other rows apart
+    return " ".join(t for t in (text or "").split() if t not in ("outlier_trigger=duration", "freeze_release=1"))
+
+
 def _job_key(j: Job) -> tuple:
     return (j.scenario, int(j.seed), j.arm, j.label, float(j.volume_frac),
-            " ".join(f"{k}={v}" for k, v in j.overrides.items()), _config_hash(j.arm, j.overrides),
+            _ov_key(" ".join(f"{k}={v}" for k, v in j.overrides.items())), _config_hash(j.arm, j.overrides),
             scenario_tag(j.scenario))
 
 
@@ -843,7 +937,7 @@ def _row_key(r: dict) -> tuple:
     config = r.get("config")
     if config is None:
         config = _config_hash(r["arm"], _parse_kv(ov))
-    return (r["scenario"], int(r["seed"]), r["arm"], r["label"], float(r.get("volume_frac", 0.25)), ov, config, tag)
+    return (r["scenario"], int(r["seed"]), r["arm"], r["label"], float(r.get("volume_frac", 0.25)), _ov_key(ov), config, tag)
 
 
 def run_experiment(exp: str, results_dir: Path, seeds: list[int], jobs_parallel: int = 1,

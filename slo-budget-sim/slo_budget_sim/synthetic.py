@@ -345,7 +345,16 @@ def generate(cfg: ScenarioConfig, routes_slo: dict[str, float] | None = None, he
     corpus.routes_slo = dict(routes_slo)
     if faults:
         services = tuple(sorted({svc for fs in faults for svc, _, _ in fs.entries}))
-        corpus.fault = FaultTruth(cfg.fault_kind, services, min(fs.start for fs in faults), cfg.culprit)
+        # the spans whose own time carries the fault: the target's spans of requests arriving
+        # in [start + delay, end) (the factor is applied per request at its arrival)
+        onsets: dict[str, tuple[float, float]] = {}
+        for fs in faults:
+            for svc, delay, f in fs.entries:
+                if f > 1.0:
+                    on, end = fs.start + delay, (fs.end if fs.end is not None else math.inf)
+                    if svc not in onsets or on < onsets[svc][0]:
+                        onsets[svc] = (on, end)
+        corpus.fault = FaultTruth(cfg.fault_kind, services, min(fs.start for fs in faults), cfg.culprit, onsets)
     return corpus
 
 

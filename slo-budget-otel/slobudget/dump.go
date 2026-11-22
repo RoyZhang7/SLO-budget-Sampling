@@ -90,6 +90,11 @@ func LoadEvents(path string) (*EventsDump, *Corpus, error) {
 			c.Roots = append(c.Roots, i)
 		}
 	}
+	for i := range c.Spans { // keep_parent forces the parent by span id
+		if p := c.Spans[i].ParentIdx; p >= 0 {
+			c.Spans[i].ParentSpanID = c.Spans[p].SpanID
+		}
+	}
 	return &d, c, nil
 }
 

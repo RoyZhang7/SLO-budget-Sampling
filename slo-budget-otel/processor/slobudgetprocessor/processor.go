@@ -3,6 +3,7 @@ package slobudgetprocessor
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -35,6 +36,7 @@ const (
 	AttrChildren   = "slobudget.children_seen"
 	AttrDropped    = "slobudget.dropped_children"
 	AttrRootPinned = "slobudget.root_pinned"
+	AttrBR         = "_br" // path bridge: uvarint(depth) || 8-byte checkpoint anchor || bloom
 )
 
 type interval struct{ start, end float64 }
@@ -48,6 +50,18 @@ type request struct {
 }
 
 type childStats struct{ seen, dropped int }
+
+// pendingServer is a non-root server span waiting for its client children (server_hold).
+type pendingServer struct {
+	td       ptrace.Traces // one resource / scope / span
+	deadline time.Time
+	heldAt   time.Time
+	sp       slobudget.Span
+	req      *request
+	sid      pcommon.SpanID
+	parent   pcommon.SpanID
+	bytes    int
+}
 
 type pendingRoot struct {
 	td       ptrace.Traces // one resource / scope / span
@@ -77,12 +91,38 @@ type agent struct {
 	wg       sync.WaitGroup
 	httpc    *http.Client
 	lastStat slobudget.AgentStats
+
+	// keep_parent ablation (sampler.keep_parent): span ids forced here (locally or by a
+	// peer's force-notice), span ids this agent broadcast, and recently decided span ids
+	// (to tell a late force from one that will be honoured)
+	forcedAt  map[uint64]time.Time
+	sentForce map[uint64]time.Time
+	decided   map[uint64]decidedSpan
+
+	// server_hold (Stage 2d): held server spans, recently released ones (to count client
+	// children that arrive too late), and the batch of released spans the flush loop forwards
+	pendingSrv map[pcommon.SpanID]*pendingServer
+	released   map[pcommon.SpanID]time.Time
+	out        ptrace.Traces
+	heldBytes  int
+}
+
+type decidedSpan struct {
+	at   time.Time
+	kept bool
 }
 
 // agentCounters are the per-period counters reported to the central.
 type agentCounters struct {
 	notices, rootsHeld, rootsPinned, clientSpans, refusedPool, refusedBudget int
 	sdkPolls, budgetProp, requestsNew                                        int
+	// keep_parent: kept because forced, forced but refused (budget / pool), forces that
+	// arrived after the span was decided (dropped / kept anyway), forces never used
+	forcedKept, forcedRefused, forceLate, forceLateKept, forcedExpired int
+	// server_hold: spans held, client spans that arrived after their parent was released
+	// (own time overestimated), summed hold time, peak spans and bytes held at once
+	srvHeld, srvLateClients, srvHeldPeak, srvBytesPeak int
+	srvHoldNs                                         int64
 }
 
 func newAgent(set processor.Settings, cfg *Config, next consumer.Traces) (*agent, error) {
@@ -94,7 +134,9 @@ func newAgent(set processor.Settings, cfg *Config, next consumer.Traces) (*agent
 		host, _ = os.Hostname()
 	}
 	a := &agent{cfg: cfg, log: set.Logger, next: next, host: host, reqs: map[pcommon.TraceID]*request{},
-		pending: map[pcommon.TraceID]*pendingRoot{}, httpc: &http.Client{Timeout: 2 * time.Second}}
+		pending: map[pcommon.TraceID]*pendingRoot{}, pendingSrv: map[pcommon.SpanID]*pendingServer{},
+		released: map[pcommon.SpanID]time.Time{}, out: ptrace.NewTraces(), httpc: &http.Client{Timeout: 2 * time.Second},
+		forcedAt: map[uint64]time.Time{}, sentForce: map[uint64]time.Time{}, decided: map[uint64]decidedSpan{}}
 	graph := &slobudget.CallGraph{Root: map[string]string{}, Children: map[string]map[string][]string{}, Parallel: map[string]map[string]bool{}}
 	vStar := cfg.StandaloneVStar
 	if vStar <= 0 {
@@ -122,7 +164,7 @@ func newAgent(set processor.Settings, cfg *Config, next consumer.Traces) (*agent
 func (a *agent) Capabilities() consumer.Capabilities { return consumer.Capabilities{MutatesData: true} }
 
 func (a *agent) Start(ctx context.Context, _ component.Host) error {
-	n, err := newNoticer(a.log, a.cfg.NoticeListen, a.cfg.NoticePeers, a.cfg.NoticePort, a.onNotice)
+	n, err := newNoticer(a.log, a.cfg.NoticeListen, a.cfg.NoticePeers, a.cfg.NoticePort, a.onNotice, a.onForce)
 	if err != nil {
 		return err
 	}
@@ -229,7 +271,7 @@ func (a *agent) decide(rs ptrace.ResourceSpans, ss ptrace.ScopeSpans, span ptrac
 	end := float64(span.EndTimestamp()) / 1e9
 	sp := slobudget.Span{SpanID: spanIDToU64(span.SpanID()), TraceID: traceIDToU64(span.TraceID()), IsRoot: span.ParentSpanID().IsEmpty(),
 		Service: svc, Host: a.host, Start: start, Duration: end - start, StatusOK: span.Status().Code() != ptrace.StatusCodeError,
-		Route: route, ReqClass: cls}
+		Route: route, ReqClass: cls, ParentSpanID: spanIDToU64(span.ParentSpanID())}
 	if sp.Duration < 0 {
 		sp.Duration = 0
 	}
@@ -252,18 +294,27 @@ func (a *agent) decide(rs ptrace.ResourceSpans, ss ptrace.ScopeSpans, span ptrac
 	if isClient {
 		a.stats.clientSpans++
 		req.clients[parent] = append(req.clients[parent], interval{start, end})
+		if _, gone := a.released[parent]; gone {
+			a.stats.srvLateClients++
+		}
 		switch a.cfg.ClientSpans {
 		case "drop":
 			a.noteChild(req, parent, false)
 			return false
 		case "plan":
-			// an ordinary span of the caller: plan coin only, never an outlier
+			// an ordinary span of the caller: plan coin only, never an outlier (a span
+			// forced by keep_parent is kept at p = 1 before the plan coin)
+			forced := a.cfg.Sampler.KeepParent && a.s.IsForced(sp.SpanID)
 			d := a.planOnly(&sp, req)
+			a.afterDecision(span, &sp, d, forced, now)
 			a.countRefusal(d)
 			a.noteChild(req, parent, d.Keep)
 			if d.Keep {
 				attrs.PutDouble(AttrSamplingP, d.P)
 				attrs.PutStr(AttrReason, d.Reason)
+				if d.Reason == "parent" { // a flag reason, as for a server span: pin the root
+					a.notify(span.TraceID(), attrs)
+				}
 			}
 			return d.Keep
 		}
@@ -278,7 +329,13 @@ func (a *agent) decide(rs ptrace.ResourceSpans, ss ptrace.ScopeSpans, span ptrac
 		a.holdRoot(rs, ss, span, sp, req, now)
 		return false
 	}
+	if a.cfg.ServerHold > 0 {
+		a.holdServer(rs, ss, span, sp, req, now)
+		return false
+	}
+	forced := a.cfg.Sampler.KeepParent && a.s.IsForced(sp.SpanID)
 	d := a.s.OnEnd(&sp, &req.st)
+	a.afterDecision(span, &sp, d, forced, now)
 	a.countRefusal(d)
 	a.noteChild(req, parent, d.Keep)
 	if !d.Keep {
@@ -289,6 +346,110 @@ func (a *agent) decide(rs ptrace.ResourceSpans, ss ptrace.ScopeSpans, span ptrac
 		a.notify(span.TraceID(), attrs)
 	}
 	return true
+}
+
+// afterDecision is the keep_parent bookkeeping around one decision: the outcome of a
+// forced span, and for a kept outlier the force of its parent (already forced in the
+// sampler) and of its `_br` anchor, broadcast to the peers.  Called with a.mu held.
+func (a *agent) afterDecision(span ptrace.Span, sp *slobudget.Span, d slobudget.Decision, forced bool, now time.Time) {
+	if !a.cfg.Sampler.KeepParent {
+		return
+	}
+	if forced {
+		delete(a.forcedAt, sp.SpanID)
+		switch {
+		case d.Keep && d.Reason == "parent":
+			a.stats.forcedKept++
+		case !d.Keep:
+			a.stats.forcedRefused++
+		}
+	}
+	a.decided[sp.SpanID] = decidedSpan{now, d.Keep}
+	if !d.Keep || d.Reason != "outlier" || sp.IsRoot {
+		return
+	}
+	tid := [16]byte(span.TraceID())
+	a.forceHere(sp.ParentSpanID, now)
+	a.broadcastForce(tid, span.ParentSpanID(), sp.ParentSpanID, now)
+	if a.cfg.KeepParentAnchor {
+		if anchor, ok := brAnchor(span.Attributes()); ok {
+			if aid := spanIDToU64(anchor); aid != 0 && aid != sp.ParentSpanID {
+				a.s.Force(aid)
+				a.forceHere(aid, now)
+				a.broadcastForce(tid, anchor, aid, now)
+			}
+		}
+	}
+}
+
+// forceHere records a local force; a span already decided here makes it late.
+func (a *agent) forceHere(id uint64, now time.Time) {
+	if d, ok := a.decided[id]; ok {
+		a.s.Unforce(id)
+		if d.kept {
+			a.stats.forceLateKept++
+		} else {
+			a.stats.forceLate++
+		}
+		return
+	}
+	a.forcedAt[id] = now
+}
+
+func (a *agent) broadcastForce(tid [16]byte, sid pcommon.SpanID, id uint64, now time.Time) {
+	a.sentForce[id] = now
+	a.notices.sendForce(tid, [8]byte(sid))
+}
+
+// onForce honours a peer's force-notice for a span this agent may see.
+func (a *agent) onForce(_ [16]byte, sid [8]byte) {
+	id := spanIDToU64(pcommon.SpanID(sid))
+	now := time.Now()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.cfg.Sampler.KeepParent {
+		return
+	}
+	if _, mine := a.sentForce[id]; mine { // our own broadcast coming back
+		return
+	}
+	if _, ok := a.forcedAt[id]; ok {
+		return
+	}
+	if d, ok := a.decided[id]; ok {
+		if d.kept {
+			a.stats.forceLateKept++
+		} else {
+			a.stats.forceLate++
+		}
+		return
+	}
+	a.s.Force(id)
+	a.forcedAt[id] = now
+}
+
+// brAnchor decodes the checkpoint anchor (the caller's server span) from `_br`.
+func brAnchor(attrs pcommon.Map) (pcommon.SpanID, bool) {
+	v, ok := attrs.Get(AttrBR)
+	if !ok {
+		return pcommon.SpanID{}, false
+	}
+	var raw []byte
+	switch v.Type() {
+	case pcommon.ValueTypeBytes:
+		raw = v.Bytes().AsRaw()
+	case pcommon.ValueTypeStr:
+		raw = []byte(v.Str())
+	default:
+		return pcommon.SpanID{}, false
+	}
+	_, n := binary.Uvarint(raw)
+	if n <= 0 || len(raw) < n+8 {
+		return pcommon.SpanID{}, false
+	}
+	var id pcommon.SpanID
+	copy(id[:], raw[n:n+8])
+	return id, !id.IsEmpty()
 }
 
 // countRefusal records pool / budget refusals: the volume the arm wanted but could not keep.
@@ -386,7 +547,9 @@ func (a *agent) releaseRoot(tid pcommon.TraceID, p *pendingRoot, flagged bool) {
 	if own := p.sp.Duration - unionLength(p.req.clients[p.sid]); own >= 0 {
 		p.sp.Own = own
 	}
+	forced := a.cfg.Sampler.KeepParent && a.s.IsForced(p.sp.SpanID)
 	d := a.s.OnEnd(&p.sp, &p.req.st)
+	a.afterDecision(p.td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0), &p.sp, d, forced, time.Now())
 	a.countRefusal(d)
 	if !d.Keep {
 		return
@@ -397,11 +560,67 @@ func (a *agent) releaseRoot(tid pcommon.TraceID, p *pendingRoot, flagged bool) {
 	span := p.td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
 	a.stamp(span, &p.sp, d, p.req)
 	span.Attributes().PutBool(AttrRootPinned, flagged)
-	go func(td ptrace.Traces) {
-		if err := a.next.ConsumeTraces(context.Background(), td); err != nil {
-			a.log.Warn("forwarding a root failed", zap.Error(err))
-		}
-	}(p.td)
+	p.td.ResourceSpans().MoveAndAppendTo(a.out.ResourceSpans())
+}
+
+// holdServer takes a non-root server span out of the batch for server_hold.  Called with a.mu held.
+func (a *agent) holdServer(rs ptrace.ResourceSpans, ss ptrace.ScopeSpans, span ptrace.Span, sp slobudget.Span, req *request, now time.Time) {
+	td := ptrace.NewTraces()
+	nrs := td.ResourceSpans().AppendEmpty()
+	rs.Resource().CopyTo(nrs.Resource())
+	nss := nrs.ScopeSpans().AppendEmpty()
+	ss.Scope().CopyTo(nss.Scope())
+	span.CopyTo(nss.Spans().AppendEmpty())
+	var sizer ptrace.ProtoMarshaler
+	p := &pendingServer{td: td, deadline: now.Add(a.cfg.ServerHold), heldAt: now, sp: sp, req: req,
+		sid: span.SpanID(), parent: span.ParentSpanID(), bytes: sizer.TracesSize(td)}
+	a.pendingSrv[p.sid] = p
+	a.heldBytes += p.bytes
+	a.stats.srvHeld++
+	if n := len(a.pendingSrv); n > a.stats.srvHeldPeak {
+		a.stats.srvHeldPeak = n
+	}
+	if a.heldBytes > a.stats.srvBytesPeak {
+		a.stats.srvBytesPeak = a.heldBytes
+	}
+}
+
+// releaseServer decides a held server span with the client children seen so far and adds a
+// kept one to the outgoing batch.  Called with a.mu held.
+func (a *agent) releaseServer(p *pendingServer, now time.Time) {
+	delete(a.pendingSrv, p.sid)
+	a.heldBytes -= p.bytes
+	a.released[p.sid] = now
+	a.stats.srvHoldNs += now.Sub(p.heldAt).Nanoseconds()
+	if own := p.sp.Duration - unionLength(p.req.clients[p.sid]); own >= 0 {
+		p.sp.Own = own
+	} else {
+		p.sp.Own = 0
+	}
+	span := p.td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
+	forced := a.cfg.Sampler.KeepParent && a.s.IsForced(p.sp.SpanID)
+	d := a.s.OnEnd(&p.sp, &p.req.st)
+	a.afterDecision(span, &p.sp, d, forced, now)
+	a.countRefusal(d)
+	a.noteChild(p.req, p.parent, d.Keep)
+	if !d.Keep {
+		return
+	}
+	a.stamp(span, &p.sp, d, p.req)
+	if d.Reason != "plan" || a.cfg.Sampler.RootFlagOn == "any" {
+		a.notify(span.TraceID(), span.Attributes())
+	}
+	p.td.ResourceSpans().MoveAndAppendTo(a.out.ResourceSpans())
+}
+
+// drainOut hands the batch of released spans to the next consumer (call without a.mu).
+func (a *agent) drainOut(out ptrace.Traces) {
+	if out.SpanCount() == 0 {
+		return
+	}
+	if err := a.next.ConsumeTraces(context.Background(), out); err != nil {
+		a.log.Warn("forwarding released spans failed", zap.Error(err))
+	}
 }
 
 func (a *agent) onNotice(tid [16]byte) {
@@ -415,14 +634,28 @@ func (a *agent) onNotice(tid [16]byte) {
 // flushLoop releases roots whose hold expired and evicts stale request state.
 func (a *agent) flushLoop(ctx context.Context) {
 	defer a.wg.Done()
-	tick := time.NewTicker(100 * time.Millisecond)
+	tick := time.NewTicker(25 * time.Millisecond)
 	defer tick.Stop()
+	n := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case now := <-tick.C:
 			a.mu.Lock()
+			for _, p := range a.pendingSrv {
+				if !now.Before(p.deadline) {
+					a.releaseServer(p, now)
+				}
+			}
+			n++
+			if n%4 != 0 {
+				out := a.out
+				a.out = ptrace.NewTraces()
+				a.mu.Unlock()
+				a.drainOut(out)
+				continue
+			}
 			for tid, p := range a.pending {
 				if !now.Before(p.deadline) {
 					a.releaseRoot(tid, p, a.notices.isFlagged(tid))
@@ -432,11 +665,38 @@ func (a *agent) flushLoop(ctx context.Context) {
 			for tid, r := range a.reqs {
 				if r.last.Before(cut) {
 					if _, held := a.pending[tid]; !held {
-						delete(a.reqs, tid)
+						delete(a.reqs, tid) // held server spans keep their own *request
 					}
 				}
 			}
+			for id, t := range a.forcedAt { // keep_parent: forces whose span never came here
+				if t.Before(cut) {
+					if a.s.IsForced(id) {
+						a.s.Unforce(id)
+						a.stats.forcedExpired++
+					}
+					delete(a.forcedAt, id)
+				}
+			}
+			for id, t := range a.sentForce {
+				if t.Before(cut) {
+					delete(a.sentForce, id)
+				}
+			}
+			for id, d := range a.decided {
+				if d.at.Before(cut) {
+					delete(a.decided, id)
+				}
+			}
+			for id, t := range a.released {
+				if t.Before(cut) {
+					delete(a.released, id)
+				}
+			}
+			out := a.out
+			a.out = ptrace.NewTraces()
 			a.mu.Unlock()
+			a.drainOut(out)
 			a.notices.expire(a.cfg.RequestTTL + a.cfg.RootHold)
 		}
 	}
@@ -459,6 +719,7 @@ func (a *agent) periodLoop(ctx context.Context) {
 		st.SDKPolls, st.BudgetPropagated, st.RequestsSeen = a.stats.sdkPolls, a.stats.budgetProp, a.stats.requestsNew
 		st.NoticeAddr = a.notices.selfAddr()
 		st.Version = a.version
+		kp := a.stats // keep_parent counters for the log line
 		a.stats = agentCounters{}
 		a.s.ResetPeriod()
 		a.lastStat = st
@@ -471,7 +732,19 @@ func (a *agent) periodLoop(ctx context.Context) {
 				zap.Int("roots_held", st.RootsHeld), zap.Int("roots_pinned", st.RootsPinned), zap.Int("notices_sent", sent),
 				zap.Int("notices_recv", recv), zap.Int("notices_unicast", uni), zap.Int("refused_pool", st.RefusedPool), zap.Int("refused_budget", st.RefusedBudget),
 				zap.Int("requests_new", st.RequestsSeen), zap.Int("budget_propagated", st.BudgetPropagated), zap.Int("sdk_polls", st.SDKPolls),
-				zap.Int("version", st.Version), zap.Float64("B", a.s.B), zap.Float64("n_need", a.s.NNeed))
+				zap.Int("version", st.Version), zap.Float64("B", a.s.B), zap.Float64("n_need", a.s.NNeed),
+				zap.Int("server_held", kp.srvHeld), zap.Int("server_late_clients", kp.srvLateClients),
+				zap.Float64("server_hold_ms_mean", holdMs(kp)), zap.Int("server_held_peak", kp.srvHeldPeak),
+				zap.Int("server_held_bytes_peak", kp.srvBytesPeak))
+			if a.cfg.Sampler.KeepParent {
+				a.notices.mu.Lock()
+				fs, fr := a.notices.forceSent, a.notices.forceRecv
+				a.notices.mu.Unlock()
+				a.log.Info("slobudget keep_parent", zap.Int64("period", st.Period), zap.Int("forced_kept", kp.forcedKept),
+					zap.Int("forced_refused", kp.forcedRefused), zap.Int("force_late", kp.forceLate),
+					zap.Int("force_late_kept", kp.forceLateKept), zap.Int("forced_expired", kp.forcedExpired),
+					zap.Int("force_notices_sent", fs), zap.Int("force_notices_recv", fr))
+			}
 		}
 		if a.cfg.Central != "" {
 			a.postStats(ctx, st)
@@ -550,6 +823,13 @@ func (a *agent) pullConfig(ctx context.Context, initial bool) {
 		case <-time.After(300 * time.Millisecond):
 		}
 	}
+}
+
+func holdMs(c agentCounters) float64 {
+	if c.srvHeld == 0 {
+		return 0
+	}
+	return float64(c.srvHoldNs) / float64(c.srvHeld) / 1e6
 }
 
 func unionLength(iv []interval) float64 {

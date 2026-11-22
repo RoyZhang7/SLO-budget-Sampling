@@ -1,3 +1,4 @@
 build/
 results/
 *.test
+tools/hog/hog

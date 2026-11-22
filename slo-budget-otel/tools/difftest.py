@@ -3,6 +3,7 @@
 then replay them with the Go port and demand identical decisions.
 
     python tools/difftest.py [--dumps DIR] [--volume-frac 0.12] [--seeds 1 2 3] [--go /path/to/go]
+                             [--arm v2-keep-parent] [--set key=value ...]
 
 Runs `python -m slo_budget_sim.cli dump` in ../slo-budget-sim (its venv) and
 `go test -run TestDifferentialAgainstPythonDumps ./slobudget/` here with
@@ -28,6 +29,8 @@ def main() -> int:
     ap.add_argument("--volume-frac", type=float, default=0.12)
     ap.add_argument("--seeds", type=int, nargs="+", default=[1, 2, 3])
     ap.add_argument("--scenario", nargs="+")
+    ap.add_argument("--arm", default="chosen-v2", help="simulator arm (preset) to dump, e.g. v2-keep-parent")
+    ap.add_argument("--set", nargs="*", metavar="KEY=VALUE", help="BudgetConfig overrides passed to `cli dump`")
     ap.add_argument("--go", default=shutil.which("go") or "go")
     ap.add_argument("--keep", action="store_true", help="keep the dumps")
     a = ap.parse_args()
@@ -38,6 +41,10 @@ def main() -> int:
     cmd = [str(py), "-m", "slo_budget_sim.cli", "dump", "--volume-frac", str(a.volume_frac), "--seeds", *map(str, a.seeds), "--out", str(dumps)]
     if a.scenario:
         cmd += ["--scenario", *a.scenario]
+    if a.arm != "chosen-v2":
+        cmd += ["--arm", a.arm]
+    if a.set:
+        cmd += ["--set", *a.set]
     print("+", " ".join(cmd))
     subprocess.run(cmd, cwd=SIM, check=True)
     env = dict(os.environ, SLOBUDGET_DUMPS=str(dumps), GOFLAGS="-mod=mod")

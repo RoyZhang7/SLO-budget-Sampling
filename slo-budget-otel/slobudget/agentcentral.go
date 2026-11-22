@@ -23,11 +23,25 @@ type CentralUpdate struct {
 	VStar    float64                                  `json:"v_star"`
 	Cap      float64                                  `json:"cap"`
 	Table    map[string]map[string]map[string]float64 `json:"table"`     // route -> class -> service -> T (s)
+	BTable   map[string]map[string]map[string]float64 `json:"btable"`    // route -> class -> service -> own-time share b (s), Stage 2d
 	PlanP    map[string]float64                       `json:"plan_p"`    // service -> ordinary-span rate
 	PoolFull map[string]float64                       `json:"pool_full"` // host -> span units per period
 	Frozen   []string                                 `json:"frozen"`
 	Services int                                      `json:"services"`
 	Peers    map[string]string                        `json:"peers"` // agent host -> kept-notice address (ip:port)
+}
+
+// WireInf is +Inf on the JSON config channel: encoding/json rejects infinities, and the
+// threshold ablation's N_need is +Inf (unbounded, or n_need: .inf), so the central sends
+// 1e300 instead, as the replay dumps do, and ApplyCentral maps it back.
+const WireInf = 1e300
+
+// WireFloat is x as the config channel carries it (+Inf -> WireInf).
+func WireFloat(x float64) float64 {
+	if math.IsInf(x, 1) {
+		return WireInf
+	}
+	return x
 }
 
 // AgentStats is what an agent reports for one finished period.
@@ -97,11 +111,25 @@ func (s *Sampler) ApplyCentral(u *CentralUpdate, host string) {
 		s.Cal.Table = table
 		s.Cal.Version++
 	}
+	if u.BTable != nil {
+		btab := map[TableKey]float64{}
+		for route, byCls := range u.BTable {
+			for cls, bySvc := range byCls {
+				for svc, b := range bySvc {
+					btab[TableKey{route, cls, svc}] = b
+				}
+			}
+		}
+		s.Cal.B = btab
+	}
 	if u.B > 0 {
 		s.B = u.B
 	}
 	if u.NNeed > 0 {
 		s.NNeed = u.NNeed
+		if s.NNeed >= WireInf {
+			s.NNeed = math.Inf(1)
+		}
 	}
 	if u.VStar > 0 {
 		s.VStar = u.VStar
@@ -219,9 +247,25 @@ func (s *Sampler) SetVolumeTarget(vStar float64, nServices int) {
 
 // Export builds the update to publish after a central period end.
 func (s *Sampler) Export(version int, period int64, cap float64) *CentralUpdate {
-	u := &CentralUpdate{Version: version, Period: period, B: s.B, NNeed: s.NNeed, VStar: s.VStar, Cap: cap,
-		Table: map[string]map[string]map[string]float64{}, PlanP: map[string]float64{}, PoolFull: map[string]float64{},
-		Frozen: s.Frozen(), Services: s.nExp.len()}
+	u := &CentralUpdate{Version: version, Period: period, B: s.B, NNeed: WireFloat(s.NNeed), VStar: s.VStar, Cap: cap,
+		Table: map[string]map[string]map[string]float64{}, BTable: map[string]map[string]map[string]float64{},
+		PlanP: map[string]float64{}, PoolFull: map[string]float64{}, Frozen: s.Frozen(), Services: s.nExp.len()}
+	put := func(m map[string]map[string]map[string]float64, k TableKey, v float64) {
+		byCls := m[k.Route]
+		if byCls == nil {
+			byCls = map[string]map[string]float64{}
+			m[k.Route] = byCls
+		}
+		bySvc := byCls[k.Class]
+		if bySvc == nil {
+			bySvc = map[string]float64{}
+			byCls[k.Class] = bySvc
+		}
+		bySvc[k.Service] = v
+	}
+	for k, b := range s.Cal.B {
+		put(u.BTable, k, b)
+	}
 	for k, T := range s.Cal.Table {
 		byCls := u.Table[k.Route]
 		if byCls == nil {

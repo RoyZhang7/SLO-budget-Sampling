@@ -1,8 +1,9 @@
 # OpenTelemetry Collector Builder (ocb) manifest for the SLO-budget collector:
 # the stock OTLP receiver / exporters, the bridges fork's priority processor
 # and configdiscovery receiver (so the agent pipeline keeps serving the SDK and
-# the priority backstop), the stock probabilistic sampler (benchmark reference)
-# and the two SLO-budget processors.  tools/build-node0.sh fills in the two
+# the priority backstop), the stock probabilistic sampler (benchmark reference
+# and the Stage 3 uniform-head arm), the stock tail_sampling processor (the
+# tail arm), the two SLO-budget processors and the Stage 3 arm processors.  tools/build-node0.sh fills in the two
 # local paths and runs the fork's builder (.tools/builder, v0.139.1).
 dist:
   module: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/build/otelcol-slobudget
@@ -20,12 +21,24 @@ processors:
   - gomod: go.opentelemetry.io/collector/processor/memorylimiterprocessor v0.139.0
   - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/priorityprocessor v0.139.0
   - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/probabilisticsamplerprocessor v0.139.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor v0.139.0
   - gomod: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel v0.0.0
     import: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/processor/slobudgetprocessor
     name: slobudgetprocessor
   - gomod: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel v0.0.0
     import: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/processor/slobudgetcentralprocessor
     name: slobudgetcentralprocessor
+  # Stage 3 arms: the common cap gate (central), the Canopy-style rate target (central), the
+  # reservoir top-K (agent)
+  - gomod: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel v0.0.0
+    import: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/processor/capgateprocessor
+    name: capgateprocessor
+  - gomod: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel v0.0.0
+    import: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/processor/canopyprocessor
+    name: canopyprocessor
+  - gomod: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel v0.0.0
+    import: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/processor/reservoirprocessor
+    name: reservoirprocessor
   # the collector-side reconstruction processor is not in the default build: reconstruction is
   # offline (tools/recon).  To build it in, add it back here and build with -tags slobudget_recon:
   #  - gomod: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel v0.0.0

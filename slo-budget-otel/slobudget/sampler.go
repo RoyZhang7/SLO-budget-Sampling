@@ -65,6 +65,8 @@ type Sampler struct {
 	svcHost     map[string]string
 	frozen      map[string]bool
 	healthyRate map[string]float64
+	quiet       map[string]int  // frozen services: consecutive periods below the trigger
+	forced      map[uint64]bool // keep_parent: span ids to keep at p = 1 when they end (_forced)
 
 	// per-period counters (reset at the period end)
 	nseen        map[string]int // outliers counted by the N_need rule (kept or coin-dropped)
@@ -142,9 +144,21 @@ func NewSampler(cfg Config, graph *CallGraph, routesSLO map[string]float64, host
 	s.svcHost = map[string]string{}
 	s.frozen = map[string]bool{}
 	s.healthyRate = map[string]float64{}
+	s.quiet = map[string]int{}
+	s.forced = map[uint64]bool{}
 	s.resetCounters()
 	return s, nil
 }
+
+// Force marks a span id to be kept at p = 1 (reason "parent") when it ends: the
+// collector agent calls it for a parent forced by another agent (keep_parent).
+func (s *Sampler) Force(spanID uint64) { s.forced[spanID] = true }
+
+// Unforce drops a forced span id (the agent expires entries whose span never came).
+func (s *Sampler) Unforce(spanID uint64) { delete(s.forced, spanID) }
+
+// IsForced reports whether a span id is forced.
+func (s *Sampler) IsForced(spanID uint64) bool { return s.forced[spanID] }
 
 func (s *Sampler) resetCounters() {
 	s.nseen = map[string]int{}
@@ -186,6 +200,14 @@ func (s *Sampler) OnRootStart(sp *Span, req *RequestState) {
 	if s.Cfg.BudgetScope == "local" {
 		req.BudgetByHost = map[string]int{}
 	}
+}
+
+// LookupB is _lookup_b: the own-time share b_i in force for (route, class, service).
+func (s *Sampler) LookupB(route, cls, service string) (float64, bool) {
+	if !s.calibrated {
+		return s.Oracle.LookupB(route, cls, service)
+	}
+	return s.Cal.LookupB(route, cls, service)
 }
 
 // Lookup is _lookup_key: the T_i in force for (route, class, service).
@@ -297,9 +319,20 @@ func (s *Sampler) spansSvcGet(svc string) float64 {
 // span, the baggage state and the per-period counters only.
 func (s *Sampler) decideSpan(sp *Span, req *RequestState) Decision {
 	svc := sp.Service
-	T, hasT := s.Lookup(sp.Route, sp.ReqClass, svc)
+	if s.Cfg.KeepParent && s.forced[sp.SpanID] { // the parent of a kept outlier
+		delete(s.forced, sp.SpanID)
+		return s.spend(sp, req, 1.0, "parent")
+	}
 	outlier, miss := false, 0.0
-	if hasT { // else cold start: plan sampling only
+	if s.Cfg.OutlierTrigger == "own" {
+		if b, ok := s.LookupB(sp.Route, sp.ReqClass, svc); ok { // else cold start: plan sampling only
+			miss = (sp.Own - b) / b
+			outlier = miss > s.Cfg.OwnMargin || !sp.StatusOK // own time over its share
+			if miss < 0.0 {
+				miss = 0.0
+			}
+		}
+	} else if T, hasT := s.Lookup(sp.Route, sp.ReqClass, svc); hasT { // else cold start: plan sampling only
 		miss = (sp.Duration - T) / T
 		outlier = miss > s.Cfg.OutlierMargin || !sp.StatusOK // margin 0: the plain over-T rule
 		if miss < 0.0 {
@@ -320,7 +353,11 @@ func (s *Sampler) decideSpan(sp *Span, req *RequestState) Decision {
 		if p < 1.0 && s.rng.Random() >= p {
 			return Decision{false, p, "outlier_coin"}
 		}
-		return s.spend(sp, req, p, "outlier")
+		d := s.spend(sp, req, p, "outlier")
+		if d.Keep && s.Cfg.KeepParent && !sp.IsRoot {
+			s.forced[sp.ParentSpanID] = true
+		}
+		return d
 	}
 	p, ok := s.planP[svc]
 	if !ok {
@@ -343,7 +380,8 @@ func (s *Sampler) OnEnd(sp *Span, req *RequestState) Decision {
 	return s.decideSpan(sp, req)
 }
 
-// freezeSet is _freeze_set: services whose calibration is held for the next table.
+// freezeSet is _freeze_set: services whose calibration is held for the next table.  A service
+// the rate trigger froze stays frozen until its FreezeRelease-th consecutive period below it.
 func (s *Sampler) freezeSet() map[string]bool {
 	cfg := s.Cfg
 	out := map[string]bool{}
@@ -364,10 +402,17 @@ func (s *Sampler) freezeSet() map[string]bool {
 		base, hasBase := s.healthyRate[svc]
 		if hasBase && nOut >= cfg.NMin && rate >= cfg.FreezeRateMult*math.Max(base, cfg.FreezeRateFloor) {
 			out[svc] = true
-		} else if !hasBase {
-			s.healthyRate[svc] = rate
+			s.quiet[svc] = 0
+		} else if s.frozen[svc] && s.quiet[svc]+1 < cfg.FreezeRelease {
+			s.quiet[svc]++ // below the trigger, not yet released
+			out[svc] = true
 		} else {
-			s.healthyRate[svc] = (1-cfg.FreezeEwma)*base + cfg.FreezeEwma*rate
+			delete(s.quiet, svc)
+			if !hasBase {
+				s.healthyRate[svc] = rate
+			} else {
+				s.healthyRate[svc] = (1-cfg.FreezeEwma)*base + cfg.FreezeEwma*rate
+			}
 		}
 	}
 	return out

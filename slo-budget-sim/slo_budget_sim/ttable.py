@@ -189,11 +189,16 @@ class Calibrator:
             raise ValueError(f"unknown prior {prior}; choose from {PRIORS}")
         self.prior = prior
         self.prior_table: dict[tuple[str, str], float] = {}      # (route, service) -> T before the first calibration
+        self.prior_b: dict[tuple[str, str], float] = {}          # (route, service) -> own-time share of the prior split
         if prior == "equal":
             for route, slo in routes_slo.items():
                 if route in graph.root:
-                    for svc, T in equal_share_prior(slo, graph, route).items():
+                    one = {s: 1.0 for s in graph.services(route)}
+                    Tp, bp = split_budgets(slo, one, graph, route, one)       # equal_share_prior and its shares
+                    for svc, T in Tp.items():
                         self.prior_table[(route, svc)] = T
+                    for svc, bv in bp.items():
+                        self.prior_b[(route, svc)] = bv
         self.calibrated: set[tuple[str, str]] = set()           # (route, service) calibrated at least once
         self.prior_hits = 0                                      # lookups answered by the prior
         self._buf: deque = deque(maxlen=max(1, window))
@@ -298,10 +303,16 @@ class Calibrator:
         return v
 
     def lookup_b(self, route: str, cls: str, service: str) -> float | None:
-        """Stage budget (own-time share) of a service, same fallback as lookup."""
+        """Stage budget (own-time share) of a service, same fallback as lookup
+        (the class entry, else the route entry, else the prior's share before the
+        service's first calibration)."""
         v = self.b.get((route, cls, service))
         if v is None:
             v = self.b.get((route, "*", service))
+        if v is None and self.prior_b and (route, service) not in self.calibrated:
+            v = self.prior_b.get((route, service))
+            if v is not None:
+                self.prior_hits += 1
         return v
 
 

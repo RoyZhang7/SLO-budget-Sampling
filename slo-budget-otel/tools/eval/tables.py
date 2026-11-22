@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""Stage 3 tables from the run summaries (tools/eval/eval_run.py).
+
+    python3 tools/eval/tables.py /storage/royno7/stage3/runs --volume 0.12 [--scenarios steady saturated] [--seeds 1 2 3] [--json]
+
+One row per arm x scenario: the mean over seeds with the seed spread as (min-max) and the
+number of seeds; a row is flagged when a seed in --seeds is missing, or when its runs ran
+different collector images (meta.json digests; "images" column).  Tables: (1) competitors
+(chosen, head, tail, reservoir, canopy, hindsight / vaif when their runs exist), (2)
+ablations (chosen, threshold, keep-parent), (3) the fault window under each truth (Stage 3:
+single culprit, own time, the culprit's node, duration), (4) reconstruction coverage.  The
+Stage 2d series (run ids 2d-*, tools/eval/compare2d.py), invalid-* and smoke-* runs are left out.
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import math
+import os
+
+SCENARIOS = ("steady", "saturated", "noisy_neighbour", "cascade", "bursty", "cold_start", "late_everywhere")
+SCENARIO_LABELS = {"late_everywhere": "late-everywhere (mild systemic)", "noisy_neighbour": "noisy-neighbour"}
+COMPETITORS = ("chosen", "head", "tail", "reservoir", "canopy", "hindsight", "vaif", "slo-budget+vaif")
+ABLATIONS = ("chosen", "threshold", "keep-parent")
+
+# (column header, summary key, format, scale)
+COLUMNS = [
+    ("vol/V*", "vol_ratio", "{:.2f}", 1.0),
+    ("KB/period", "bytes_per_period", "{:.0f}", 1e-3),
+    ("periods>cap", "over_cap_periods", "{:.1f}", 1.0),
+    ("max/request", "max_per_request", "{:.1f}", 1.0),
+    ("max/host/period", "max_per_host_period", "{:.0f}", 1.0),
+    ("peak buffered", "buffer_peak_spans", "{:.0f}", 1.0),
+    ("outlier share", "outlier_share", "{:.1f}%", 100.0),
+    ("precision", "outlier_precision", "{:.2f}", 1.0),
+    ("evidence s", "evidence_s", "{:.2f}", 1.0),
+    ("culprit recall", "recall_culprit", "{:.2f}", 1.0),
+    ("identified", "identified", None, None),
+    ("explained", "attrib_explained", "{:.2f}", 1.0),
+    ("true loss", "attrib_loss", "{:.2f}", 1.0),
+    ("P95 err mean", "p95_err_svc_mean", "{:.1f}%", 100.0),
+    ("P95 err max", "p95_err_svc_max", "{:.1f}%", 100.0),
+    ("agent us/span", "agent_cpu_us_per_span", "{:.2f}", 1.0),
+]
+FAULT_COLUMNS = [
+    ("over-SLO in fault", "over_slo_frac_window", "{:.1f}%", 100.0),
+    ("prec. culprit", "outlier_precision_culprit_window", "{:.2f}", 1.0),
+    ("prec. own", "outlier_precision_own_window", "{:.2f}", 1.0),
+    ("prec. node", "outlier_precision_node_window", "{:.2f}", 1.0),
+    ("prec. duration", "outlier_precision_window", "{:.2f}", 1.0),
+    ("culprit recall", "recall_culprit", "{:.2f}", 1.0),
+    ("own recall in fault", "recall_own_window", "{:.2f}", 1.0),
+    ("faulty-span coverage", "faulty_span_coverage", "{:.2f}", 1.0),
+    ("culprit keeps/period", "culprit_outlier_keeps_per_period", "{:.1f}", 1.0),
+    ("caller share", "outlier_keeps_callers_window_frac", "{:.2f}", 1.0),
+]
+RECON_COLUMNS = [
+    ("orphans/kept", "recon_orphans_frac_of_kept", "{:.0f}%", 100.0),
+    ("placeable (known ids)", "recon_placeable_frac_of_orphans", "{:.1f}%", 100.0),
+    ("hole = 1", "recon_hole_1_frac_of_orphans", "{:.1f}%", 100.0),
+    ("one tree before", "recon_traces_one_tree_before_frac", "{:.1f}%", 100.0),
+    ("one tree, known ids", "recon_traces_one_tree_after_known_ids_only_frac", "{:.1f}%", 100.0),
+    ("one tree, synthesised", "recon_traces_one_tree_after_frac", "{:.1f}%", 100.0),
+    ("placeholders/real span", "recon_placeholders_per_real_span", "{:.2f}", 1.0),
+]
+
+
+def load(root: str) -> list[dict]:
+    out = []
+    for p in sorted(glob.glob(os.path.join(root, "*", "summary.json"))):
+        name = os.path.basename(os.path.dirname(p))
+        if name.startswith(("2d-", "invalid-", "smoke-")):
+            continue
+        with open(p, encoding="utf-8") as f:
+            s = json.load(f)
+        s["_dir"] = os.path.dirname(p)
+        try:
+            with open(os.path.join(s["_dir"], "meta.json"), encoding="utf-8") as f:
+                im = json.load(f).get("images") or {}
+            s["_image"] = str(im.get("collector_digest") or im.get("collector") or "?")
+        except (OSError, ValueError):
+            s["_image"] = "?"
+        out.append(s)
+    return out
+
+
+def _num(v):
+    if isinstance(v, bool):
+        return float(v)
+    if isinstance(v, (int, float)) and math.isfinite(v):
+        return float(v)
+    return None
+
+
+def agg(rows: list[dict], key: str) -> dict:
+    vals = [x for x in (_num(r.get(key)) for r in rows) if x is not None]
+    if not vals:
+        return {"mean": None, "min": None, "max": None, "n": 0}
+    return {"mean": sum(vals) / len(vals), "min": min(vals), "max": max(vals), "n": len(vals)}
+
+
+def cell(a: dict, fmt: str, scale: float) -> str:
+    if a["mean"] is None:
+        return "-"
+    m = fmt.format(a["mean"] * scale)
+    if a["n"] > 1 and a["max"] != a["min"]:
+        lo, hi = fmt.format(a["min"] * scale), fmt.format(a["max"] * scale)
+        return f"{m} ({lo}-{hi})"
+    return m
+
+
+def hole_dist(rows: list[dict]) -> str:
+    """Mean over seeds of the full-reconstruction hole-length shares (1 / 2 / 3 / 4+)."""
+    acc = {"1": [], "2": [], "3": [], "4+": []}
+    for r in rows:
+        h = r.get("recon_hole_hist_full") or {}
+        tot = sum(h.values())
+        if not tot:
+            continue
+        c = {"1": 0, "2": 0, "3": 0, "4+": 0}
+        for k, v in h.items():
+            try:
+                kk = int(k)
+            except ValueError:
+                continue
+            c[str(kk) if kk <= 3 else "4+"] += v
+        for k in acc:
+            acc[k].append(c[k] / tot)
+    if not acc["1"]:
+        return "-"
+    return " / ".join(f"{100 * sum(v) / len(v):.0f}%" for v in acc.values())
+
+
+def build(summaries, volume, scenarios, seeds, arms, columns):
+    rows = []
+    for arm in arms:
+        for sc in scenarios:
+            rs = [s for s in summaries if s.get("arm") == arm and s.get("scenario") == sc
+                  and s.get("volume_frac") is not None and abs(float(s["volume_frac"]) - volume) < 1e-6
+                  and (not seeds or int(s.get("seed", -1)) in seeds)]
+            if not rs:
+                continue
+            got = sorted(int(s.get("seed", -1)) for s in rs)
+            row = {"arm": arm, "scenario": sc, "seeds": got, "missing": sorted(set(seeds) - set(got)) if seeds else [],
+                   "images": sorted({s.get("_image", "?") for s in rs})}
+            for _, key, _, _ in columns:
+                if key == "identified":
+                    vals = [s.get("identified") for s in rs if s.get("identified") is not None]
+                    row[key] = {"k": int(sum(1 for v in vals if v)), "n": len(vals)}
+                else:
+                    row[key] = agg(rs, key)
+            if columns is RECON_COLUMNS:
+                row["hole_dist"] = hole_dist(rs)
+            rows.append(row)
+    return rows
+
+
+def markdown(rows, columns, title, extra=None) -> str:
+    if not rows:
+        return f"### {title}\n\n(no runs)\n"
+    hdr = ["arm", "scenario", "seeds"] + [c[0] for c in columns] + ([extra[0]] if extra else []) + ["images"]
+    lines = [f"### {title}", "", "| " + " | ".join(hdr) + " |", "|" + "---|" * len(hdr)]
+    for r in rows:
+        seeds = str(len(r["seeds"])) + (f" (missing {','.join(map(str, r['missing']))})" if r["missing"] else "")
+        cells = [r["arm"], SCENARIO_LABELS.get(r["scenario"], r["scenario"].replace("_", "-")), seeds]
+        for name, key, fmt, scale in columns:
+            if key == "identified":
+                v = r[key]
+                cells.append(f"{v['k']}/{v['n']}" if v["n"] else "-")
+            else:
+                cells.append(cell(r[key], fmt, scale))
+        if extra:
+            cells.append(r.get(extra[1], "-"))
+        ims = r.get("images") or []
+        cells.append(ims[0].split(":")[-1][:12] if len(ims) == 1 else f"MIXED ({len(ims)})")
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("runs_root")
+    ap.add_argument("--volume", type=float, required=True)
+    ap.add_argument("--scenarios", nargs="+", default=list(SCENARIOS))
+    ap.add_argument("--seeds", nargs="+", type=int, default=[1, 2, 3])
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+    summaries = load(a.runs_root)
+    comp = build(summaries, a.volume, a.scenarios, a.seeds, COMPETITORS, COLUMNS)
+    abl = build(summaries, a.volume, a.scenarios, a.seeds, ABLATIONS, COLUMNS)
+    arms_present = [x for x in dict.fromkeys(s.get("arm") for s in summaries) if x]
+    present = [x for x in COMPETITORS + ABLATIONS[1:] if x in arms_present]
+    rec = build(summaries, a.volume, a.scenarios, a.seeds, present, RECON_COLUMNS)
+    faulted = [sc for sc in a.scenarios if sc not in ("steady", "bursty")]
+    flt = build(summaries, a.volume, faulted, a.seeds, present, FAULT_COLUMNS)
+    if a.json:
+        print(json.dumps({"volume": a.volume, "competitors": comp, "ablations": abl, "fault": flt, "recon": rec}, indent=1))
+        return 0
+    v = f"V* = {a.volume:.0%}"
+    print(markdown(comp, COLUMNS, f"Competitors, {v}"))
+    print(markdown(abl, COLUMNS, f"Ablations, {v}"))
+    print(markdown(flt, FAULT_COLUMNS, f"Fault window under each truth, {v}"))
+    print(markdown(rec, RECON_COLUMNS, f"Reconstruction coverage, {v}", extra=("hole length 1/2/3/4+", "hole_dist")))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

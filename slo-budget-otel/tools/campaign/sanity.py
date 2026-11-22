@@ -76,7 +76,7 @@ def main() -> int:
     if os.path.exists(sp):
         s = json.load(open(sp))
         vr = s.get("vol_ratio")
-        if isinstance(vr, (int, float)) and meta["scenario"] in ("steady", "saturated", "cascade", "cold_start") and not (0.6 <= vr <= 1.3):
+        if isinstance(vr, (int, float)) and meta["scenario"] in ("steady", "saturated", "noisy_neighbour", "cascade", "cold_start") and not (0.6 <= vr <= 1.3):
             probs.append(f"volume over V* out of range: {vr:.3f}")
         sh = s.get("shadow_spans")
         exp = 23 * meta["rps"] * meta["dur_s"]

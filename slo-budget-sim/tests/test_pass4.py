@@ -45,7 +45,7 @@ def test_calibrator_prior_answers_until_the_first_calibration(chain):
     with pytest.raises(ValueError):
         Calibrator(chain.graph, chain.routes_slo, prior="nope")
     with pytest.raises(ValueError):
-        BudgetConfig(cold_prior="nope")
+        BudgetConfig(outlier_trigger="duration", cold_prior="nope")
 
 
 def test_cold_prior_flags_outliers_before_the_first_table():
@@ -85,7 +85,7 @@ def _p0_corpus():
 
 
 def _run(corpus, oracle, **kw):
-    cfg = BudgetConfig(initial_budget=10, b_min=10, b_max=10, n_need=1000, initial_plan_p=0.0,
+    cfg = BudgetConfig(outlier_trigger="duration", initial_budget=10, b_min=10, b_max=10, n_need=1000, initial_plan_p=0.0,
                        plan_fill=0.0, ordinary_floor=0.0, **kw)
     return replay(corpus, BudgetSampler(cfg), v_star=1e9, cap=1e9, seed=1, oracle=oracle)
 
@@ -160,9 +160,9 @@ def test_run_experiment_resumes_and_reruns_what_changed(tmp_path, monkeypatch, c
     assert "4 of 4 runs already" in capsys.readouterr().out
     assert [(r["seed"], r["arm"]) for r in rows2] == [(r["seed"], r["arm"]) for r in rows]
     assert all(r["tag"] == scenario_tag("steady") for r in rows2)
-    assert all(len(r["config"]) == 10 for r in rows2 if r["arm"] == "chosen") and rows2[1]["config"] == ""
+    assert all(len(r["config"]) == 10 for r in rows2 if r["arm"] == "chosen") and rows2[1]["config"] == "truth=own"
     # a changed preset (or default) invalidates the rows even with empty overrides
-    monkeypatch.setattr(ex, "_config_hash", lambda arm, ov: "changed" if arm == "chosen" else "")
+    monkeypatch.setattr(ex, "_config_hash", lambda arm, ov: "changed" if arm == "chosen" else ex._config_hash_impl(arm, ov))
     run_experiment("tiny", tmp_path, [1, 2])
     assert "2 of 4 runs already" in capsys.readouterr().out
     monkeypatch.setattr(ex, "_config_hash", ex._config_hash_impl)

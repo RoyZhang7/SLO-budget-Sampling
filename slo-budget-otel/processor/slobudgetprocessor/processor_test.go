@@ -31,9 +31,11 @@ func testConfig(t *testing.T) *Config {
 	cfg.StandaloneVStar = 1000
 	cfg.Host = "node-test"
 	cfg.RootHold = 50 * time.Millisecond
+	cfg.ServerHold = 0 // Stage 2 behaviour (decide on arrival); TestServerHold covers the hold
 	cfg.NoticeListen = "127.0.0.1:0"
 	cfg.ClientSpans = "drop"
 	cfg.Sampler.ColdPrior = "file"
+	cfg.Sampler.OutlierTrigger = "duration" // the seeded prior file holds T only; the own trigger is tested on the sampler and in hold_test
 	cfg.TTableFile = seedFile(t)
 	cfg.StatsLog = false
 	if err := cfg.Validate(); err != nil {

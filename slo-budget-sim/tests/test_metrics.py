@@ -25,7 +25,7 @@ def _corpus():
 
 
 def _run(corpus, oracle, **kw):
-    cfg = BudgetConfig(table="oracle", initial_budget=10, b_min=10, b_max=10, n_need=1000, **kw)
+    cfg = BudgetConfig(outlier_trigger="duration", table="oracle", initial_budget=10, b_min=10, b_max=10, n_need=1000, **kw)
     if cfg.initial_plan_p == 0.0:
         cfg.plan_fill = cfg.ordinary_floor = 0.0          # no plan keeps after the first replan either
     return replay(corpus, BudgetSampler(cfg), v_star=1e9, cap=1e9, seed=1, oracle=oracle)
@@ -112,7 +112,7 @@ def test_refusal_split_and_attributability():
     reference = chain_corpus([6.0, 2.0, 1.0], n_traces=400)
     oracle = oracle_table(reference)
     A = CorpusArrays(corpus, oracle)
-    cfg = BudgetConfig(table="oracle", initial_budget=1, b_min=1, b_max=1, n_need=1000, initial_plan_p=0.0,
+    cfg = BudgetConfig(outlier_trigger="duration", table="oracle", initial_budget=1, b_min=1, b_max=1, n_need=1000, initial_plan_p=0.0,
                        plan_fill=0.0, ordinary_floor=0.0)
     res = replay(corpus, BudgetSampler(cfg), v_star=1e9, cap=1e9, seed=1, oracle=oracle)
     m = compute(corpus, A, res)
@@ -146,7 +146,7 @@ def test_true_loss_is_split_by_the_dropped_childs_refusal_reason():
     A = CorpusArrays(corpus, oracle)
     # c is pinned to lose: p_rule const, n_need 1 -> after the first c per period p = 1/n, most c are coin-dropped;
     # b (ends after c) finds the budget free and is kept
-    cfg = BudgetConfig(table="oracle", initial_budget=1, b_min=1, b_max=1, n_need=1, p_rule="const",
+    cfg = BudgetConfig(outlier_trigger="duration", table="oracle", initial_budget=1, b_min=1, b_max=1, n_need=1, p_rule="const",
                        initial_plan_p=0.0, plan_fill=0.0, ordinary_floor=0.0)
     res = replay(corpus, BudgetSampler(cfg), v_star=1e9, cap=1e9, seed=1, oracle=oracle)
     m = compute(corpus, A, res)

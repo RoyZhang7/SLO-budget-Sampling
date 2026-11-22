@@ -36,7 +36,7 @@ func createDefaultConfig() component.Config {
 		SLOMs:        map[string]float64{"compose_post": 23.4},
 		DefaultRoute: "compose_post",
 		CountKinds:   "all",
-		OwnTime:      "inclusive",
+		OwnTime:      "stamped", // Stage 2d: the agents' exact own time (server_hold), not the quantile estimate
 		RefillInput:  "demand",
 		StatsLog:     true,
 	}

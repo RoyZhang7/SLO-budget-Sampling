@@ -1,0 +1,29 @@
+# Shadow collector on node-0 (a plain process, not in Kubernetes): receives the tees' 100 %
+# copy of the SDK spans and writes them as OTLP JSON lines to the run directory.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:14317
+        max_recv_msg_size_mib: 64
+exporters:
+  file:
+    path: __PATH__
+    format: json
+    flush_interval: 1s
+service:
+  telemetry:
+    logs:
+      level: WARN
+    metrics:
+      level: basic
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 127.0.0.1
+                port: 18888
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [file]

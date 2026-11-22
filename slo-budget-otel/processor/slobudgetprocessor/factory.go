@@ -41,8 +41,11 @@ func createDefaultConfig() component.Config {
 		NoticePort:   7777,
 		ClientSpans:  "plan",
 		RequestTTL:   10 * time.Second,
+		ServerHold:   200 * time.Millisecond,
 		StatsLog:     true,
 		BudgetSource: "propagated",
+		// keep_parent ablation only (sampler.keep_parent is off by default)
+		KeepParentAnchor: true,
 	}
 }
 

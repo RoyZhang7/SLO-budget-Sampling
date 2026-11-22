@@ -308,6 +308,7 @@ type Calibrator struct {
 	UseOwn     bool
 	Version    int
 	PriorTable map[[2]string]float64 // (route, service) -> T before the first calibration
+	PriorB     map[[2]string]float64 // (route, service) -> own-time share of the prior split (cold_prior equal)
 	Calibrated map[[2]string]bool    // (route, service) calibrated at least once
 	PriorHits  int
 }
@@ -320,7 +321,8 @@ func NewCalibrator(g *CallGraph, routesSLO map[string]float64, q float64, minCla
 	}
 	c := &Calibrator{Graph: g, RoutesSLO: routesSLO, Q: q, MinClassSamples: minClassSamples, Window: window, UseClass: useClass, UseOwn: true,
 		cur: map[TableKey]*samples{}, Table: map[TableKey]float64{}, B: map[TableKey]float64{}, L: map[TableKey]float64{},
-		O: map[TableKey]float64{}, Freeze: map[string]bool{}, PriorTable: map[[2]string]float64{}, Calibrated: map[[2]string]bool{}}
+		O: map[TableKey]float64{}, Freeze: map[string]bool{}, PriorTable: map[[2]string]float64{}, PriorB: map[[2]string]float64{},
+		Calibrated: map[[2]string]bool{}}
 	switch prior {
 	case "none", "file":
 	case "equal":
@@ -328,8 +330,16 @@ func NewCalibrator(g *CallGraph, routesSLO map[string]float64, q float64, minCla
 			if _, ok := g.Root[route]; !ok {
 				continue
 			}
-			for svc, T := range EqualSharePrior(slo, g, route) {
-				c.PriorTable[[2]string{route, svc}] = T
+			one := newOrderedMap()
+			for _, s := range g.Services(route) {
+				one.set(s, 1.0)
+			}
+			Tp, bp := SplitBudgets(slo, one, g, route, one, nil, nil) // equal_share_prior and its shares
+			for _, svc := range Tp.keys {
+				c.PriorTable[[2]string{route, svc}] = Tp.vals[svc]
+			}
+			for _, svc := range bp.keys {
+				c.PriorB[[2]string{route, svc}] = bp.vals[svc]
 			}
 		}
 	default:
@@ -541,8 +551,16 @@ func (c *Calibrator) LookupB(route, cls, service string) (float64, bool) {
 	if v, ok := c.B[TableKey{route, cls, service}]; ok {
 		return v, true
 	}
-	v, ok := c.B[TableKey{route, "*", service}]
-	return v, ok
+	if v, ok := c.B[TableKey{route, "*", service}]; ok {
+		return v, true
+	}
+	if len(c.PriorB) > 0 && !c.Calibrated[[2]string{route, service}] {
+		if v, ok := c.PriorB[[2]string{route, service}]; ok { // cold start: the prior's share
+			c.PriorHits++
+			return v, true
+		}
+	}
+	return 0, false
 }
 
 // HasTable reports whether a calibrated table exists (bool(self.cal.table)).

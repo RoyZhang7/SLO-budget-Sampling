@@ -3,7 +3,13 @@
 Ground truth comes from the complete corpus plus the oracle T table (the
 calibration procedure run on complete data from the healthy reference).
 
-  outlier (truth)   duration > T_oracle(route, class, service) or status not OK
+  outlier (truth)   duration > T_oracle(route, class, service) or status not OK      ("duration" truth)
+                    own time > b_oracle(route, class, service) or status not OK        ("own" truth, Stage 2d)
+                    b_oracle = the oracle split's own-time share (stage budget) of the service.
+                    The headline columns use the arm's trigger's truth (compute(truth=...): "own"
+                    for the Stage 2d decider, "duration" for the full-duration rule and the
+                    baselines); every truth-dependent column is also written as <name>_own and
+                    <name>_dur.  Under the own truth attributability holds by construction.
 
 Headline metrics (all over periods >= 1, i.e. after the cold-start period):
   outlier_share     kept non-root spans that are truth outliers / kept non-root spans
@@ -30,6 +36,20 @@ Collector cost (bounded spend holds for every arm): buffer_peak_spans /
   its candidates until period end; budget and head arms: 0), decision_latency_*
   = root end minus the trace's first span start for tail-decided traces,
   evicted_traces = traces the tail buffer timed out
+Stage 2d additions:
+  faulty_cov        of the spans whose own time carries the injected fault (the fault's target
+                    services, requests arriving after the target's onset), the share kept (any
+                    reason); faulty_truth_own / _dur = the share of them that are truth outliers
+                    (the rest sits below the threshold and is only plan-sampled); per period while
+                    the fault is fully on: faulty_pp (faulty spans), faulty_kept_pp (kept, any
+                    reason), faulty_outlier_pp (kept as outliers: outlier, escalate, credit,
+                    reserve keeps; past N_need a flagged span is kept with p = N_need / n x g(miss),
+                    so it grows with the log of the fault's volume, not linearly), _svc = per
+                    faulty service, to compare with N_need
+  orphans_per_kept_outlier   kept non-root spans whose parent was not kept, in the traces that hold
+                    a kept truth outlier, over the kept truth outliers; outlier_orphan_share = the
+                    kept truth outliers that are orphans themselves
+  mean_per_request  mean span units kept per request (next to max / p99)
 Secondary:
   recall_culprit    kept truth outliers of the culprit service in the fault window
   evidence_s        first kept truth outlier of the culprit service after the
@@ -109,12 +129,22 @@ class CorpusArrays:
         self.own = np.fromiter((s.own for s in spans), dtype=float, count=n)
         status = np.fromiter((s.status_ok for s in spans), dtype=bool, count=n)
         self.truth = (~np.isnan(T) & (self.duration > T)) | ~status
+        self.truth_own = (~np.isnan(B) & (self.own > B)) | ~status          # Stage 2d: own time over its share
+        self.parent = np.fromiter((max(s.parent_idx, 0) for s in spans), dtype=np.int64, count=n)
         slo = np.array([corpus.routes_slo.get(s.route, np.inf) for s in spans])
         self.root_violates = self.is_root & (self.duration > slo)
         viol_code = np.zeros(max(1, self.n_traces), dtype=bool)
         viol_code[self.trace_code[self.root_violates]] = True
         self.in_viol_request = viol_code[self.trace_code]
         self.mean_depth = np.array([self.depth[self.svc == i].mean() for i in range(len(self.services))])
+        # spans whose own time carries the injected fault: target service, request arrival in [onset, end)
+        self.faulty = np.zeros(n, dtype=bool)
+        fault = corpus.fault
+        if fault is not None and getattr(fault, "onsets", None):
+            rstart = np.where(self.root_idx >= 0, self.start[np.maximum(self.root_idx, 0)], self.start)
+            for svc, (on, end) in fault.onsets.items():
+                if svc in svc_code:
+                    self.faulty |= (self.svc == svc_code[svc]) & (rstart >= on) & (rstart < end)
         counts = np.bincount(self.svc, minlength=len(self.services))
         self.share = counts / max(1, counts.sum())
         self.root_service = corpus.spans[corpus.roots[0]].service if corpus.roots else None
@@ -147,76 +177,30 @@ def _group(reason: str) -> str:
     return REASON_GROUP.get(reason, "arm")      # "arm": a baseline's own rule (head coin, rate coin, reservoir)
 
 
-def compute(corpus: Corpus, arrays: CorpusArrays, res: RunResult, within: float = 0.05) -> dict:
-    A = arrays
-    n = res.n_spans
-    kept = res.kept_mask                       # duration reached the collector (full spans + root records)
-    full = res.full_mask                       # full spans only
-    p = res.p_array()
-    bad = np.isnan(p) | (p <= 0)
-    w = np.where(bad, 1.0, 1.0 / np.where(bad, 1.0, p))
-    nonroot = ~A.is_root
-    fault = corpus.fault
-    t_fault = fault.start if fault else math.nan
-    window = (A.end >= t_fault) if fault else np.ones(n, dtype=bool)
-    warm = A.period >= 1                        # after the cold-start period
-    reasons = np.array(res.kept_reason) if len(res.kept_reason) else np.array([], dtype=str)
-    is_rec = reasons == "root_record"
-    cost = res.kept_cost
-    holes = np.zeros(n, dtype=np.int64)
-    holes[res.kept_idx] = res.kept_holes
-
-    out: dict = {"arm": res.arm, "scenario": corpus.name, "spans": n, "v_star": res.v_star, "cap": res.cap,
-                 "elapsed_s": round(res.elapsed_s, 2)}
-
-    # volume ------------------------------------------------------------------
-    pers = res.periods[1:] if len(res.periods) > 1 else res.periods
-    if len(pers) > 1 and pers[-1].spans < 0.5 * np.mean([x.spans for x in pers[:-1]]):
-        pers = pers[:-1]                  # trailing partial period
-    cp = np.array([x.cost_post for x in pers], dtype=float)
-    cpre = np.array([x.cost_pre for x in pers], dtype=float)
-    out["kept_per_period"] = float(cp.mean()) if len(cp) else math.nan
-    out["vol_ratio"] = _safe_div(cp.mean(), res.v_star) if len(cp) else math.nan
-    out["min_vol_ratio"] = _safe_div(cp[1:].min(), res.v_star) if len(cp) > 1 else math.nan
-    dropped: dict = {}
-    for x in pers:
-        for k, v in x.dropped.items():
-            dropped[k] = dropped.get(k, 0) + v
-    dtot = sum(dropped.values())
-    out["dropped_by_reason"] = " ".join(f"{k}:{v / dtot:.0%}" for k, v in sorted(dropped.items())) if dtot else ""
-    out["bytes_per_period"] = float(np.mean([x.bytes_post for x in pers])) if pers else math.nan
-    out["over_cap_periods"] = int((cpre > res.cap + 1e-9).sum()) if len(cpre) else 0
-    out["max_pre_ratio"] = _safe_div(cpre.max(), res.v_star) if len(cpre) else math.nan
-    out["kept_total"] = int(full.sum())
-    out["records_total"] = int(is_rec.sum())
-    kw = warm[res.kept_idx]                              # kept items in warm periods
-    tot_cost = float(cost[kw].sum())
-    root_items = A.is_root[res.kept_idx]
-    out["root_share"] = _safe_div(cost[kw & root_items].sum(), tot_cost)
-    out["record_share"] = _safe_div(cost[kw & is_rec].sum(), tot_cost)
-    n_roots_warm = int((A.is_root & warm).sum())
-    out["roots_full_frac"] = _safe_div((full & A.is_root & warm).sum(), n_roots_warm)
-    out["roots_any_frac"] = _safe_div((kept & A.is_root & warm).sum(), n_roots_warm)
-
-    # bounded spend ----------------------------------------------------------------
-    per_req = np.bincount(A.trace_code[res.kept_idx][kw], weights=cost[kw], minlength=A.n_traces)
-    out["max_per_request"] = float(per_req.max()) if len(per_req) else math.nan
-    out["p99_per_request"] = float(np.quantile(per_req, 0.99)) if len(per_req) else math.nan
-    hp = A.host[res.kept_idx] * A.n_periods + res.kept_period
-    per_hp = np.bincount(hp[kw], weights=cost[kw], minlength=len(A.hosts) * A.n_periods)
-    out["max_per_host_period"] = float(per_hp.max()) if len(per_hp) else math.nan
-    out["max_host_ratio"] = _safe_div(out["max_per_host_period"], res.v_star)
+def _truth_block(corpus: Corpus, A: CorpusArrays, res: RunResult, truth: str, c: dict) -> dict:
+    """Every metric that depends on what counts as a true outlier, under one truth:
+    "duration" (duration > T_oracle) or "own" (own time > the oracle's own-time share b)."""
+    n, kept, full, w, nonroot, window, warm = c["n"], c["kept"], c["full"], c["w"], c["nonroot"], c["window"], c["warm"]
+    reasons, holes, dr, fault, t_fault = c["reasons"], c["holes"], c["dr"], c["fault"], c["t_fault"]
+    if truth == "own":
+        TR = A.truth_own
+        excess = A.own - np.where(np.isnan(A.B), 0.0, A.B)
+    else:
+        TR = A.truth
+        excess = A.duration - np.where(np.isnan(A.T), 0.0, A.T)
+    out: dict = {}
+    kw = warm[res.kept_idx]
 
     # outlier share, precision, recall -----------------------------------------------
-    truth_nr = A.truth & nonroot
+    truth_nr = TR & nonroot
     out["truth_outliers"] = int(truth_nr.sum())
     out["recall"] = _safe_div((truth_nr & full).sum(), truth_nr.sum())
     tw = truth_nr & window
     out["recall_window"] = _safe_div((tw & full).sum(), tw.sum())
     kept_nr = full & nonroot & warm
-    out["outlier_share"] = _safe_div((kept_nr & A.truth).sum(), kept_nr.sum())
+    out["outlier_share"] = _safe_div((kept_nr & TR).sum(), kept_nr.sum())
     kept_nr_w = kept_nr & window
-    out["outlier_share_window"] = _safe_div((kept_nr_w & A.truth).sum(), kept_nr_w.sum())
+    out["outlier_share_window"] = _safe_div((kept_nr_w & TR).sum(), kept_nr_w.sum())
     # event recall: (service, period) cells in the window with >= 15 truth
     # outliers (an incident) in which at least 3 truth outliers were kept
     sp_cell = A.svc * A.n_periods + A.period
@@ -229,9 +213,9 @@ def compute(corpus: Corpus, arrays: CorpusArrays, res: RunResult, within: float 
     out["outlier_keeps"] = int(is_out_reason.sum())
     if is_out_reason.any():
         idx = res.kept_idx[is_out_reason]
-        out["outlier_precision"] = float(A.truth[idx].mean())
+        out["outlier_precision"] = float(TR[idx].mean())
         idx_w = idx[window[idx]]
-        out["outlier_precision_window"] = float(A.truth[idx_w].mean()) if len(idx_w) else math.nan
+        out["outlier_precision_window"] = float(TR[idx_w].mean()) if len(idx_w) else math.nan
     else:
         out["outlier_precision"] = math.nan
         out["outlier_precision_window"] = math.nan
@@ -256,12 +240,22 @@ def compute(corpus: Corpus, arrays: CorpusArrays, res: RunResult, within: float 
         out["outlier_no_root"] = float(1.0 - root_any.mean())
         out["ctx_sufficient"] = float((root_any & (holes[ko] == 0)).mean())
         out["ctx_no_holes"] = float((holes[ko] == 0).mean())
+        # orphans: kept non-root spans whose parent was not kept, in the traces that
+        # hold a kept truth outlier, per kept outlier; and the share of kept outliers
+        # that are orphans themselves
+        tr_with = np.zeros(max(1, A.n_traces), dtype=bool)
+        tr_with[A.trace_code[ko]] = True
+        knr = np.flatnonzero(full & nonroot)
+        orphan = np.zeros(n, dtype=bool)
+        orphan[knr] = ~full[A.parent[knr]]
+        out["orphans_per_kept_outlier"] = _safe_div((orphan & tr_with[A.trace_code]).sum(), len(ko))
+        out["outlier_orphan_share"] = float(orphan[ko].mean())
     else:
-        for k in ("ctx_root_kept", "ctx_root_full", "outlier_no_root", "ctx_sufficient", "ctx_no_holes"):
+        for k in ("ctx_root_kept", "ctx_root_full", "outlier_no_root", "ctx_sufficient", "ctx_no_holes",
+                  "orphans_per_kept_outlier", "outlier_orphan_share"):
             out[k] = math.nan
 
     # refusal accounting: why truth outliers (non-root, warm) were not kept ----------------
-    dr = res.drop_reason if len(res.drop_reason) == n else [""] * n
     lost = np.flatnonzero(truth_nr & ~full & warm)
     out["lost_outliers"] = int(len(lost))
     groups: dict[str, int] = {}
@@ -275,9 +269,9 @@ def compute(corpus: Corpus, arrays: CorpusArrays, res: RunResult, within: float 
     # cold-start period: what the decider did before the first table -------------------------
     p0 = A.period == 0
     kept_nr0 = full & nonroot & p0
-    out["outlier_share_p0"] = _safe_div((kept_nr0 & A.truth).sum(), kept_nr0.sum())
+    out["outlier_share_p0"] = _safe_div((kept_nr0 & TR).sum(), kept_nr0.sum())
     k0 = np.isin(reasons, ["outlier", "escalate"]) & (res.kept_period == 0)
-    out["outlier_precision_p0"] = float(A.truth[res.kept_idx[k0]].mean()) if k0.any() else math.nan
+    out["outlier_precision_p0"] = float(TR[res.kept_idx[k0]].mean()) if k0.any() else math.nan
     tr0 = truth_nr & p0
     out["truth_outliers_p0"] = int(tr0.sum())
     out["recall_p0"] = _safe_div((tr0 & full).sum(), tr0.sum())
@@ -289,31 +283,31 @@ def compute(corpus: Corpus, arrays: CorpusArrays, res: RunResult, within: float 
         g0[g] = g0.get(g, 0) + 1
     out["ref_not_flagged_p0"] = _safe_div(g0.get("not_flagged", 0), len(lost0))
     out["refusal_split_p0"] = " ".join(f"{g}:{v / len(lost0):.0%}" for g, v in sorted(g0.items(), key=lambda kv: -kv[1])) if len(lost0) else ""
-    out["prior_periods"] = int(sum(1 for d in res.diagnostics if d.get("prior_hits", 0) > 0))
 
     # attributability: can a kept outlier's excess be placed? ------------------------------
     #   (a) its own time exceeds its own-time share (the oracle stage budget)
     #   (b) a kept child is itself a truth outlier (the excess is passed down)
     #   (c) every dropped child was ordinary in ground truth
     # otherwise the excess sat in a dropped child that was an outlier: a true loss,
-    # split by that child's refusal reason (the dropped outlier child with the largest excess)
+    # split by that child's refusal reason (the dropped outlier child with the largest excess).
+    # Under the own truth (a) holds for every kept outlier by construction.
     n_a = n_b = n_c = 0
     loss_groups: dict[str, int] = {}
     for i in ko:
         sp = corpus.spans[i]
         a = bool(not np.isnan(A.B[i]) and A.own[i] > A.B[i])
         kids = sp.children
-        b = any(full[c] and A.truth[c] for c in kids)
-        dropped_out = [c for c in kids if not full[c] and A.truth[c]]
-        c = len(dropped_out) == 0
+        b = any(full[c] and TR[c] for c in kids)
+        dropped_out = [c for c in kids if not full[c] and TR[c]]
+        cc = len(dropped_out) == 0
         if a:
             n_a += 1
         elif b:
             n_b += 1
-        elif c:
+        elif cc:
             n_c += 1
         else:
-            worst = max(dropped_out, key=lambda k: (A.duration[k] - (A.T[k] if not np.isnan(A.T[k]) else 0.0)))
+            worst = max(dropped_out, key=lambda k: excess[k])
             g = _group(dr[worst])
             loss_groups[g] = loss_groups.get(g, 0) + 1
     nk = len(ko)
@@ -329,7 +323,7 @@ def compute(corpus: Corpus, arrays: CorpusArrays, res: RunResult, within: float 
 
     # fault shape on complete data: truth outlier rate per service in the window ------------------
     n_svc = len(A.services)
-    tr_cnt = np.bincount(A.svc[A.truth & window], minlength=n_svc).astype(float)
+    tr_cnt = np.bincount(A.svc[TR & window], minlength=n_svc).astype(float)
     vol_w = np.bincount(A.svc[window], minlength=n_svc).astype(float)
     t_rate = np.divide(tr_cnt, vol_w, out=np.zeros(n_svc), where=vol_w > 0)
     t_med = float(np.median(t_rate)) if n_svc else math.nan
@@ -373,7 +367,7 @@ def compute(corpus: Corpus, arrays: CorpusArrays, res: RunResult, within: float 
         # per service over the service's span count (counts are always known),
         # the deepest service within 50% of the highest rate is named unless
         # 60% of the services are that high (systemic)
-        km = full & tw & A.truth
+        km = full & tw & TR
         cnt = np.bincount(A.svc[km], weights=w[km], minlength=len(A.services))
         vol = np.bincount(A.svc[window], minlength=len(A.services)).astype(float)
         rate = np.divide(cnt, vol, out=np.zeros_like(cnt), where=vol > 0)
@@ -387,7 +381,6 @@ def compute(corpus: Corpus, arrays: CorpusArrays, res: RunResult, within: float 
                 # confirmable: its kept outlier spans whose children were all kept (or leaves)
                 em = km & (A.svc == svc_code[est])
                 confirm = float((holes[em] == 0).mean()) if em.any() else math.nan
-        out["culprit_truth"] = culprit if culprit else "none"
         out["culprit_est"] = est if est else "none"
         out["identified"] = bool(est == culprit)
         out["culprit_confirmable"] = confirm
@@ -396,10 +389,122 @@ def compute(corpus: Corpus, arrays: CorpusArrays, res: RunResult, within: float 
     else:
         for k in ("evidence_any_s", "recall_culprit", "evidence_s", "evidence_flagged_s", "culprit_confirmable"):
             out[k] = math.nan
-        out["culprit_truth"] = out["culprit_est"] = "none"
+        out["culprit_est"] = "none"
         out["identified"] = True
         out["spend_top"] = ""
+    return out
 
+
+TRUTH_SUFFIX = {"duration": "_dur", "own": "_own"}
+
+
+def compute(corpus: Corpus, arrays: CorpusArrays, res: RunResult, within: float = 0.05, truth: str = "duration") -> dict:
+    """All metrics of one run.  The headline columns are computed under `truth`
+    (the arm's trigger: "own" for the Stage 2d decider, "duration" for the
+    full-duration rule and the baselines); every truth-dependent metric is also
+    written under both truths with the suffixes _own and _dur."""
+    if truth not in TRUTH_SUFFIX:
+        raise ValueError(f"unknown truth {truth}")
+    A = arrays
+    n = res.n_spans
+    kept = res.kept_mask                       # duration reached the collector (full spans + root records)
+    full = res.full_mask                       # full spans only
+    p = res.p_array()
+    bad = np.isnan(p) | (p <= 0)
+    w = np.where(bad, 1.0, 1.0 / np.where(bad, 1.0, p))
+    nonroot = ~A.is_root
+    fault = corpus.fault
+    t_fault = fault.start if fault else math.nan
+    window = (A.end >= t_fault) if fault else np.ones(n, dtype=bool)
+    warm = A.period >= 1                        # after the cold-start period
+    reasons = np.array(res.kept_reason) if len(res.kept_reason) else np.array([], dtype=str)
+    is_rec = reasons == "root_record"
+    cost = res.kept_cost
+    holes = np.zeros(n, dtype=np.int64)
+    holes[res.kept_idx] = res.kept_holes
+
+    out: dict = {"arm": res.arm, "scenario": corpus.name, "spans": n, "v_star": res.v_star, "cap": res.cap,
+                 "elapsed_s": round(res.elapsed_s, 2), "truth": truth}
+
+    # volume ------------------------------------------------------------------
+    pers = res.periods[1:] if len(res.periods) > 1 else res.periods
+    if len(pers) > 1 and pers[-1].spans < 0.5 * np.mean([x.spans for x in pers[:-1]]):
+        pers = pers[:-1]                  # trailing partial period
+    cp = np.array([x.cost_post for x in pers], dtype=float)
+    cpre = np.array([x.cost_pre for x in pers], dtype=float)
+    out["kept_per_period"] = float(cp.mean()) if len(cp) else math.nan
+    out["vol_ratio"] = _safe_div(cp.mean(), res.v_star) if len(cp) else math.nan
+    out["min_vol_ratio"] = _safe_div(cp[1:].min(), res.v_star) if len(cp) > 1 else math.nan
+    dropped: dict = {}
+    for x in pers:
+        for k, v in x.dropped.items():
+            dropped[k] = dropped.get(k, 0) + v
+    dtot = sum(dropped.values())
+    out["dropped_by_reason"] = " ".join(f"{k}:{v / dtot:.0%}" for k, v in sorted(dropped.items())) if dtot else ""
+    out["bytes_per_period"] = float(np.mean([x.bytes_post for x in pers])) if pers else math.nan
+    out["over_cap_periods"] = int((cpre > res.cap + 1e-9).sum()) if len(cpre) else 0
+    out["max_pre_ratio"] = _safe_div(cpre.max(), res.v_star) if len(cpre) else math.nan
+    out["kept_total"] = int(full.sum())
+    out["records_total"] = int(is_rec.sum())
+    kw = warm[res.kept_idx]                              # kept items in warm periods
+    tot_cost = float(cost[kw].sum())
+    root_items = A.is_root[res.kept_idx]
+    out["root_share"] = _safe_div(cost[kw & root_items].sum(), tot_cost)
+    out["record_share"] = _safe_div(cost[kw & is_rec].sum(), tot_cost)
+    n_roots_warm = int((A.is_root & warm).sum())
+    out["roots_full_frac"] = _safe_div((full & A.is_root & warm).sum(), n_roots_warm)
+    out["roots_any_frac"] = _safe_div((kept & A.is_root & warm).sum(), n_roots_warm)
+
+    # bounded spend ----------------------------------------------------------------
+    per_req = np.bincount(A.trace_code[res.kept_idx][kw], weights=cost[kw], minlength=A.n_traces)
+    out["max_per_request"] = float(per_req.max()) if len(per_req) else math.nan
+    out["p99_per_request"] = float(np.quantile(per_req, 0.99)) if len(per_req) else math.nan
+    out["mean_per_request"] = float(per_req.mean()) if len(per_req) else math.nan
+    hp = A.host[res.kept_idx] * A.n_periods + res.kept_period
+    per_hp = np.bincount(hp[kw], weights=cost[kw], minlength=len(A.hosts) * A.n_periods)
+    out["max_per_host_period"] = float(per_hp.max()) if len(per_hp) else math.nan
+    out["max_host_ratio"] = _safe_div(out["max_per_host_period"], res.v_star)
+
+    # truth-dependent metrics: the headline under `truth`, both truths suffixed ----------------
+    dr = res.drop_reason if len(res.drop_reason) == n else [""] * n
+    shared = {"n": n, "kept": kept, "full": full, "w": w, "nonroot": nonroot, "window": window, "warm": warm,
+              "reasons": reasons, "holes": holes, "dr": dr, "fault": fault, "t_fault": t_fault}
+    blocks = {t: _truth_block(corpus, A, res, t, shared) for t in TRUTH_SUFFIX}
+    out.update(blocks[truth])
+    for t, suf in TRUTH_SUFFIX.items():
+        out.update({k + suf: v for k, v in blocks[t].items()})
+    out["culprit_truth"] = (fault.culprit or "none") if fault else "none"
+    out["prior_periods"] = int(sum(1 for d in res.diagnostics if d.get("prior_hits", 0) > 0))
+
+    # faulty-span coverage: of the spans whose own time carries the injected fault, the share
+    # kept, and per period (it plateaus near N_need: past N_need an outlier is kept with
+    # p = N_need / n x (1 + miss), so the keeps per period stop growing with the fault's volume)
+    fm = A.faulty & warm
+    out["faulty_spans"] = int(fm.sum())
+    out["faulty_cov"] = _safe_div((fm & full).sum(), fm.sum())
+    out["faulty_truth_own"] = _safe_div((fm & A.truth_own).sum(), fm.sum())
+    out["faulty_truth_dur"] = _safe_div((fm & A.truth).sum(), fm.sum())
+    if fm.any():
+        cnt = np.bincount(A.period[fm], minlength=A.n_periods)
+        kc = np.bincount(A.period[fm & full], minlength=A.n_periods)
+        as_outlier = res.kept_idx[np.isin(reasons, ["outlier", "escalate", "credit", "reserve"])] if len(reasons) else np.zeros(0, dtype=np.int64)
+        ol = np.zeros(n, dtype=bool)
+        ol[as_outlier] = True
+        oc = np.bincount(A.period[fm & ol & full], minlength=A.n_periods)
+        on = cnt >= 0.5 * float(np.median(cnt[cnt > 0]))          # periods with the fault fully on
+        n_fs = max(1, len({s for s, (a, b) in (fault.onsets if fault else {}).items()}))
+        out["faulty_pp"] = float(cnt[on].mean())
+        out["faulty_kept_pp"] = float(kc[on].mean())
+        out["faulty_outlier_pp"] = float(oc[on].mean())
+        out["faulty_kept_pp_svc"] = float(kc[on].mean()) / n_fs
+        out["faulty_outlier_pp_svc"] = float(oc[on].mean()) / n_fs
+        out["faulty_services"] = n_fs
+    else:
+        for k in ("faulty_pp", "faulty_kept_pp", "faulty_outlier_pp", "faulty_kept_pp_svc", "faulty_outlier_pp_svc"):
+            out[k] = math.nan
+        out["faulty_services"] = 0
+
+    kept_nr = full & nonroot & warm
     # reweighted P95 error per (service, route, period) cell ------------------------------
     errs, errs_w, errs_low, errs_high = [], [], [], []
     median_share = float(np.median(A.share))

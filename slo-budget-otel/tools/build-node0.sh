@@ -18,10 +18,12 @@ HERE=$(pwd)
 mkdir -p build
 echo "== go test"
 go test -count=1 ./... 2>&1 | tail -8
-echo "== benchmark (ns/span)"
-go test -run XXX -bench . -benchmem ./processor/slobudgetprocessor/ 2>&1 | grep -E "Benchmark|ok" | tee build/bench.txt
-echo "== rate-paced (1k, 10k spans/s)"
-SLOBUDGET_BENCH=1 go test -count=1 -run TestRatePaced -v ./processor/slobudgetprocessor/ 2>&1 | grep -E "^RATE" | tee -a build/bench.txt
+if [ "${SKIP_BENCH:-0}" != 1 ]; then   # SKIP_BENCH=1 while cluster runs are in progress (node-0 drives wrk2)
+    echo "== benchmark (ns/span)"
+    go test -run XXX -bench . -benchmem ./processor/slobudgetprocessor/ 2>&1 | grep -E "Benchmark|ok" | tee build/bench.txt
+    echo "== rate-paced (1k, 10k spans/s)"
+    SLOBUDGET_BENCH=1 go test -count=1 -run TestRatePaced -v ./processor/slobudgetprocessor/ 2>&1 | grep -E "^RATE" | tee -a build/bench.txt   # RATE-HOLD: server_hold footprint
+fi
 echo "== ocb"
 sed -e "s#__SLOBUDGET_OTEL_DIR__#$HERE#g" -e "s#__COLLECTOR_SRC__#$COLLECTOR_SRC#g" builder/manifest.yaml > build/manifest.yaml
 "$COLLECTOR_SRC/.tools/builder" --config build/manifest.yaml

@@ -15,8 +15,17 @@ import (
 // any agent that keeps a span to the agent that holds the trace's root.  With
 // slo.h (root host) in baggage the notice is unicast; without it (the DSB-SN
 // deployment) it is sent to every peer.
+//
+// Force-notice (keep_parent ablation): a 25-byte datagram (16-byte trace id +
+// 8-byte span id + type byte 2) broadcast to every peer when an agent keeps an
+// outlier: whichever agent sees that span id (the outlier's parent, or its `_br`
+// checkpoint anchor) keeps it at p = 1.
 
-const noticeLen = 17
+const (
+	noticeLen      = 17
+	forceNoticeLen = 25
+	forceType      = 2
+)
 
 type noticer struct {
 	log     *zap.Logger
@@ -35,10 +44,15 @@ type noticer struct {
 	peerAddr map[string]*net.UDPAddr // host -> notice address, published by the central from the agents' stats
 	unicast  int
 	selfA    string
+
+	// force-notices (keep_parent ablation)
+	onForce              func(tid [16]byte, sid [8]byte)
+	forceSent, forceRecv int
 }
 
-func newNoticer(log *zap.Logger, listen string, peers []string, port int, onFlag func([16]byte)) (*noticer, error) {
-	n := &noticer{log: log, peers: peers, port: port, flagged: map[[16]byte]time.Time{}, onFlag: onFlag}
+func newNoticer(log *zap.Logger, listen string, peers []string, port int, onFlag func([16]byte),
+	onForce func([16]byte, [8]byte)) (*noticer, error) {
+	n := &noticer{log: log, peers: peers, port: port, flagged: map[[16]byte]time.Time{}, onFlag: onFlag, onForce: onForce}
 	if listen != "" {
 		addr, err := net.ResolveUDPAddr("udp", listen)
 		if err != nil {
@@ -67,6 +81,19 @@ func (n *noticer) start(ctx context.Context) {
 				default:
 					continue
 				}
+			}
+			if k == forceNoticeLen && buf[forceNoticeLen-1] == forceType {
+				var tid [16]byte
+				var sid [8]byte
+				copy(tid[:], buf[:16])
+				copy(sid[:], buf[16:24])
+				n.mu.Lock()
+				n.forceRecv++
+				n.mu.Unlock()
+				if n.onForce != nil {
+					n.onForce(tid, sid)
+				}
+				continue
 			}
 			if k < noticeLen {
 				continue
@@ -132,6 +159,24 @@ func (n *noticer) send(tid [16]byte, rootHost string) {
 		if _, err := n.conn.WriteToUDP(msg[:], a); err == nil {
 			n.mu.Lock()
 			n.sent++
+			n.mu.Unlock()
+		}
+	}
+}
+
+// sendForce broadcasts a force-notice for span sid of trace tid to every peer.
+func (n *noticer) sendForce(tid [16]byte, sid [8]byte) {
+	if n.conn == nil {
+		return
+	}
+	var msg [forceNoticeLen]byte
+	copy(msg[:16], tid[:])
+	copy(msg[16:24], sid[:])
+	msg[forceNoticeLen-1] = forceType
+	for _, a := range n.targets("") {
+		if _, err := n.conn.WriteToUDP(msg[:], a); err == nil {
+			n.mu.Lock()
+			n.forceSent++
 			n.mu.Unlock()
 		}
 	}

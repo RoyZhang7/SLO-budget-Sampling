@@ -10,9 +10,9 @@ import (
 // plan weights, escalation off, class key on, on-demand roots, frozen
 // calibration on the rate trigger, relative N_need, credit off), but the knobs
 // the simulator swept are kept so that a replay can be configured like any
-// Python run.  Mechanisms that are off in Stage 2 (escalation, keep_parent,
-// credit / reserve, the record root policy) are not ported and are rejected
-// by Validate.
+// Python run.  Mechanisms that are off in Stage 2 (escalation, credit /
+// reserve, the record root policy) are not ported and are rejected by
+// Validate; keep_parent (the Stage 3 ablation) is ported and off by default.
 type Config struct {
 	NNeed                float64 `json:"n_need" mapstructure:"n_need"`
 	NNeedMode            string  `json:"n_need_mode" mapstructure:"n_need_mode"`
@@ -51,6 +51,19 @@ type Config struct {
 	// OutlierMargin m: a span is an outlier only when its duration exceeds (1 + m) T_i (or its
 	// status is an error); spans between T_i and (1 + m) T_i are ordinary.  Stage 2c default 0.1.
 	OutlierMargin float64 `json:"outlier_margin" mapstructure:"outlier_margin"`
+	// OutlierTrigger (Stage 2d): "own" = a span is an outlier when its own time (duration minus
+	// the union of its CLIENT children) exceeds (1 + own_margin) x its own-time share b (the stage
+	// budget of the square-root split, before the shares are summed into inclusive budgets),
+	// "duration" = the Stage 2c rule (duration over (1 + outlier_margin) x T).
+	OutlierTrigger string  `json:"outlier_trigger" mapstructure:"outlier_trigger"`
+	OwnMargin      float64 `json:"own_margin" mapstructure:"own_margin"`
+	// PlanCoin / NNeedDecay: simulator exp16 switches; only the defaults (span, 0) are ported.
+	PlanCoin   string  `json:"plan_coin" mapstructure:"plan_coin"`
+	NNeedDecay float64 `json:"n_need_decay" mapstructure:"n_need_decay"`
+	// FreezeRelease k: a service frozen by the rate trigger is released at its k-th consecutive
+	// period below the trigger, so a fault whose detection rate dips for a period stays frozen
+	// (Stage 3 default 3; 1 is the Stage 2c rule, released at the first).
+	FreezeRelease int `json:"freeze_release" mapstructure:"freeze_release"`
 }
 
 // DefaultConfig is BudgetConfig() with the Python defaults.
@@ -59,9 +72,10 @@ func DefaultConfig() Config {
 		NNeed: 15.0, NNeedMode: "fixed", NNeedFrac: 0.2, NMin: 3, PRule: "linear", Alpha: 0.5, CalibQ: 0.95,
 		CalibWindow: 2, MinClassSamples: 20, UseClass: true, Plan: "uniform", PlanFill: 0.5, Escalation: "none",
 		BudgetScope: "shared", CalibSource: "kept", FreezeTrigger: "rate", FreezeRateMult: 2.0, FreezeRateFloor: 0.01,
-		FreezeEwma: 0.3, ColdPrior: "none", RootPolicy: "pin", RootFlagOn: "outlier", RecordCost: 0.1,
+		FreezeEwma: 0.3, FreezeRelease: 3, ColdPrior: "none", RootPolicy: "pin", RootFlagOn: "outlier", RecordCost: 0.1,
 		OutlierCredit: "none", InitialBudget: 3.0, InitialPlanP: 0.15, PoolFactor: 1.0, BMin: 0.05, BMax: 64.0,
 		RateEwma: 0.5, OrdinaryFloor: 0.05, OutlierMargin: 0.1,
+		OutlierTrigger: "own", OwnMargin: 0.1, PlanCoin: "span", NNeedDecay: 0,
 	}
 }
 
@@ -91,6 +105,18 @@ func (c *Config) Validate() error {
 	if c.OutlierMargin < 0 {
 		return fmt.Errorf("outlier_margin must be >= 0")
 	}
+	if c.OutlierTrigger != "own" && c.OutlierTrigger != "duration" {
+		return fmt.Errorf("unknown outlier_trigger %q; choose own or duration", c.OutlierTrigger)
+	}
+	if c.OwnMargin < 0 {
+		return fmt.Errorf("own_margin must be >= 0")
+	}
+	if c.PlanCoin != "span" {
+		return fmt.Errorf("plan_coin %q is not ported to Go (only span)", c.PlanCoin)
+	}
+	if c.NNeedDecay != 0 {
+		return fmt.Errorf("n_need_decay %g is not ported to Go (only 0)", c.NNeedDecay)
+	}
 	switch c.CalibSource {
 	case "kept", "plan", "frozen", "oracle":
 	default:
@@ -115,6 +141,9 @@ func (c *Config) Validate() error {
 	if c.FreezeTrigger != "rate" && c.FreezeTrigger != "count" {
 		return fmt.Errorf("unknown freeze_trigger %q", c.FreezeTrigger)
 	}
+	if c.FreezeRelease < 1 {
+		return fmt.Errorf("freeze_release must be >= 1")
+	}
 	switch c.ColdPrior {
 	case "none", "equal", "file":
 	default:
@@ -122,9 +151,6 @@ func (c *Config) Validate() error {
 	}
 	if c.Escalation != "none" {
 		return fmt.Errorf("escalation %q is not ported to Go (Stage 2 setting: off)", c.Escalation)
-	}
-	if c.KeepParent {
-		return fmt.Errorf("keep_parent is not ported to Go")
 	}
 	if c.BudgetScope != "shared" && c.BudgetScope != "local" {
 		return fmt.Errorf("unknown budget_scope %q", c.BudgetScope)

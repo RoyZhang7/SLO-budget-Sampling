@@ -298,7 +298,7 @@ func (c *central) closePeriod() {
 	c.update = c.s.Export(c.version, per+1, c.cap)
 	c.update.Peers = maps.Clone(c.peers)
 	sum := periodSummary{Period: per, Received: c.received, Admitted: c.admitted, CapDropped: c.capDrops, Spans: totalSpans,
-		B: c.s.B, NNeed: c.s.NNeed, VStar: c.vStar, Frozen: c.update.Frozen, Reports: len(reports), Table: map[string]float64{},
+		B: c.s.B, NNeed: slobudget.WireFloat(c.s.NNeed), VStar: c.vStar, Frozen: c.update.Frozen, Reports: len(reports), Table: map[string]float64{},
 		Demand: demand}
 	for _, r := range reports {
 		sum.Requests += r.Requests
@@ -335,7 +335,13 @@ func (c *central) handleConfig(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	_ = json.NewEncoder(w).Encode(u)
+	body, err := json.Marshal(u)
+	if err != nil { // the agents would stay on their last update without a word
+		c.log.Error("central update is not JSON-encodable", zap.Error(err))
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	_, _ = w.Write(body)
 }
 
 func (c *central) handleStats(w http.ResponseWriter, r *http.Request) {
@@ -369,9 +375,13 @@ func (c *central) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"graph": c.graph.export(), "history": c.history, "peers": c.peers}
 	c.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", " ")
-	_ = enc.Encode(out)
+	body, err := json.MarshalIndent(out, "", " ")
+	if err != nil {
+		c.log.Error("central status is not JSON-encodable", zap.Error(err))
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	_, _ = w.Write(body)
 }
 
 // Addr is the bound address of the config channel (after Start).

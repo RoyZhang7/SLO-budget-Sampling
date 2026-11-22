@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"math"
 	"net/http"
 	"testing"
 	"time"
@@ -144,5 +146,64 @@ func TestCentralCapIsAHardBackstop(t *testing.T) {
 	}
 	if sink.SpanCount() != 8 || c.capDrops != 12 {
 		t.Fatalf("admitted %d dropped %d", sink.SpanCount(), c.capDrops)
+	}
+}
+
+// The threshold ablation runs with N_need = +Inf, which encoding/json rejects: the update and
+// the status must still encode (N_need as 1e300, the replay dumps' inf), and an agent must read
+// the update back as +Inf.
+func TestCentralUnboundedUpdateIsEncodable(t *testing.T) {
+	cfg := createDefaultConfig().(*Config)
+	cfg.Listen = "127.0.0.1:0"
+	cfg.VStar = 400
+	cfg.StatsLog = false
+	cfg.Services = 4
+	cfg.Sampler.Unbounded = true
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	c, err := newCentral(processortest.NewNopSettings(typeStr), cfg, new(consumertest.TracesSink))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Start(context.Background(), componenttest.NewNopHost()); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Shutdown(context.Background()) }()
+	base := time.Now()
+	for i := 0; i < 20; i++ {
+		if err := c.ConsumeTraces(context.Background(), request(byte(i), base, false)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.closePeriod()
+	resp, err := http.Get("http://" + c.Addr() + "/slobudget/config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("config: HTTP %d", resp.StatusCode)
+	}
+	var u slobudget.CentralUpdate
+	if err := json.NewDecoder(resp.Body).Decode(&u); err != nil {
+		t.Fatal(err)
+	}
+	if u.Version != 1 || u.NNeed != slobudget.WireInf {
+		t.Fatalf("update version %d n_need %v", u.Version, u.NNeed)
+	}
+	var agent slobudget.Sampler
+	agent.ApplyCentral(&slobudget.CentralUpdate{Version: u.Version, NNeed: u.NNeed}, "node-1")
+	if !math.IsInf(agent.NNeed, 1) {
+		t.Fatalf("agent N_need %v, want +Inf", agent.NNeed)
+	}
+	st, err := http.Get("http://" + c.Addr() + "/slobudget/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Body.Close()
+	body, _ := io.ReadAll(st.Body)
+	if st.StatusCode != http.StatusOK || !json.Valid(body) {
+		t.Fatalf("status: HTTP %d, %d bytes", st.StatusCode, len(body))
 	}
 }

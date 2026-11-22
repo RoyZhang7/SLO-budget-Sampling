@@ -18,6 +18,8 @@ import (
 	"go.opentelemetry.io/collector/consumer/consumertest"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+
+	"github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/slobudget"
 	"go.opentelemetry.io/collector/processor/processortest"
 )
 
@@ -122,6 +124,13 @@ func benchAgent(tb testing.TB, sink consumer.Traces) *agent {
 	if err := a.Start(context.Background(), componenttest.NewNopHost()); err != nil {
 		tb.Fatal(err)
 	}
+	// Stage 2d: the deployed agent (own-time trigger, server_hold 200 ms).  The synthetic batches
+	// hold SERVER spans only, so own time = duration and the own-time shares equal the T above.
+	a.mu.Lock()
+	for svc, T := range benchTable()["compose_post"] {
+		a.s.Cal.B[slobudget.TableKey{Route: "compose_post", Class: "*", Service: svc}] = T
+	}
+	a.mu.Unlock()
 	return a
 }
 
@@ -201,6 +210,7 @@ func TestRatePaced(t *testing.T) {
 		}
 		for _, tg := range targets {
 			lat := make([]float64, 0, 1200)
+			heldPeak, bytesPeak, holdMean := 0, 0, 0.0
 			tcpu := time.Duration(0)
 			cpu0 := processCPU()
 			tick := time.NewTicker(10 * time.Millisecond)
@@ -220,6 +230,14 @@ func TestRatePaced(t *testing.T) {
 				tcpu += threadCPU() - c0
 				spans += n
 				i++
+				if tg.name == "slobudget" { // server_hold footprint: peak spans and bytes held at once
+					a.mu.Lock()
+					heldPeak, bytesPeak = max(heldPeak, a.stats.srvHeldPeak), max(bytesPeak, a.stats.srvBytesPeak)
+					if a.stats.srvHeld > 0 {
+						holdMean = float64(a.stats.srvHoldNs) / float64(a.stats.srvHeld) / 1e6
+					}
+					a.mu.Unlock()
+				}
 			}
 			tick.Stop()
 			cpu := processCPU() - cpu0
@@ -231,6 +249,10 @@ func TestRatePaced(t *testing.T) {
 			}
 			fmt.Printf("RATE %s %d %d %d %.2f %.2f %.2f %.1f %.1f %.1f\n", tg.name, rate, len(lat), size,
 				tcpu.Seconds()*1e6/float64(spans), cpu.Seconds()*1e6/float64(spans), wall/float64(spans), q(0.5), q(0.99), lat[len(lat)-1])
+			if tg.name == "slobudget" {
+				fmt.Println("RATE-HOLD", tg.name, rate, "held_peak_spans", heldPeak, "held_peak_bytes", bytesPeak,
+					"hold_ms_mean", fmt.Sprintf("%.1f", holdMean), "server_hold", a.cfg.ServerHold)
+			}
 			tg.stop()
 		}
 	}

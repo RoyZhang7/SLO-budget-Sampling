@@ -43,6 +43,11 @@ type Config struct {
 	TTableFile string `mapstructure:"ttable_file"`
 	// RequestTTL bounds the per-trace state (budget, children seen).
 	RequestTTL time.Duration `mapstructure:"request_ttl"`
+	// ServerHold (Stage 2d) holds every non-root server span this long before deciding it, so
+	// that its CLIENT children (exported in the SDK's low-priority chunk of the same 100 ms
+	// flush, i.e. usually right after the server span) are in: own time = duration minus the
+	// union of the client children seen at release.  0 decides on arrival (Stage 2 behaviour).
+	ServerHold time.Duration `mapstructure:"server_hold"`
 	// StatsLog logs the period stats line.
 	StatsLog bool `mapstructure:"stats_log"`
 	// BudgetSource: "propagated" takes the request's budget from the SDK's slo.budget
@@ -52,6 +57,10 @@ type Config struct {
 	// SDKListen is the HTTP address the SDK's budget issuer polls (GET /slobudget/sdk ->
 	// {version, b, host}); empty disables it.
 	SDKListen string `mapstructure:"sdk_listen"`
+	// KeepParentAnchor (keep_parent ablation, sampler.keep_parent): a kept outlier forces
+	// its parent span (the caller's client span) and, with this on, also its `_br`
+	// checkpoint anchor (the caller's server span, its parent in the simulator's model).
+	KeepParentAnchor bool `mapstructure:"keep_parent_anchor"`
 }
 
 func (c *Config) Validate() error {
@@ -61,6 +70,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Period <= 0 {
 		return errors.New("period must be positive")
+	}
+	if c.ServerHold < 0 {
+		return errors.New("server_hold must be >= 0")
 	}
 	if c.RootHold < 0 {
 		return errors.New("root_hold must be >= 0")

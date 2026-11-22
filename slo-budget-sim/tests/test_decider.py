@@ -11,7 +11,7 @@ from tests.conftest import chain_corpus
 
 
 def _sampler(corpus, **kw):
-    cfg = BudgetConfig(table="oracle", **kw)
+    cfg = BudgetConfig(outlier_trigger="duration", table="oracle", **kw)
     s = BudgetSampler(cfg)
     s.start_run(RunContext(corpus, v_star=1e9, cap=1e9, oracle=oracle_table(corpus), seed=1))
     return s
@@ -94,7 +94,7 @@ def test_local_budget_scope_is_per_host():
 def test_root_is_always_kept_and_holes_are_counted():
     # chain a -> b -> c, budget 0 for every request: only roots survive, each with one hole
     corpus = chain_corpus([6.0, 2.0, 1.0], n_traces=20)
-    s = BudgetSampler(BudgetConfig(table="oracle", initial_budget=1, initial_plan_p=1.0, b_min=1))
+    s = BudgetSampler(BudgetConfig(outlier_trigger="duration", table="oracle", initial_budget=1, initial_plan_p=1.0, b_min=1))
     res = replay(corpus, s, v_star=1e9, cap=1e9, seed=3, oracle=oracle_table(corpus))
     kept = {int(i): r for i, r in zip(res.kept_idx, res.kept_reason)}
     roots_kept = [i for i in corpus.roots if i in kept]
@@ -111,7 +111,7 @@ def test_root_is_always_kept_and_holes_are_counted():
 
 def test_cold_start_is_plan_sampling_only():
     corpus = chain_corpus([6.0, 2.0, 1.0], n_traces=10)
-    s = BudgetSampler(BudgetConfig(table="calibrated", initial_plan_p=0.0, initial_budget=10))
+    s = BudgetSampler(BudgetConfig(outlier_trigger="duration", table="calibrated", initial_plan_p=0.0, initial_budget=10))
     s.start_run(RunContext(corpus, 1e9, 1e9, None, 1))
     req = _req(s, corpus.spans[0])
     keep, p, why = s.on_end(Span(1, 1, 1, 0, "c", "h1", 0.0, 0.5, True, 2, "r", "r|any", 1), req, 0.0)
@@ -120,7 +120,7 @@ def test_cold_start_is_plan_sampling_only():
 
 def test_collector_cap_is_a_hard_backstop():
     corpus = chain_corpus([6.0, 2.0, 1.0], n_traces=200, period=10.0)
-    s = BudgetSampler(BudgetConfig(table="oracle", initial_plan_p=1.0, initial_budget=10, unbounded=True))
+    s = BudgetSampler(BudgetConfig(outlier_trigger="duration", table="oracle", initial_plan_p=1.0, initial_budget=10, unbounded=True))
     res = replay(corpus, s, v_star=50, cap=60, seed=1, oracle=oracle_table(corpus))
     assert res.periods[0].kept_post == 60
     assert res.periods[0].kept_pre == 600

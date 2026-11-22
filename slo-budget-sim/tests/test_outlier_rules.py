@@ -13,7 +13,7 @@ from tests.conftest import chain_corpus
 
 
 def _sampler(corpus, **kw):
-    cfg = BudgetConfig(initial_budget=1000, pool_factor=1e9, **kw)
+    cfg = BudgetConfig(outlier_trigger="duration", initial_budget=1000, pool_factor=1e9, **kw)
     s = BudgetSampler(cfg)
     s.start_run(RunContext(corpus, v_star=1e9, cap=1e9, oracle=oracle_table(corpus), seed=1))
     return s
@@ -39,13 +39,13 @@ def _c_span(k, dur, ok=True):
 
 
 def test_defaults_are_the_margin_rule_and_the_row_hash_tracks_it():
-    cfg = BudgetConfig()
+    cfg = BudgetConfig(outlier_trigger="duration", )
     assert cfg.outlier_margin == 0.1 and cfg.n_need_healthy is False      # Stage 2c: m = 0.1 is the default
     assert _config_hash_impl("chosen-v2", {}) == _config_hash_impl("chosen-v2", {"outlier_margin": 0.1, "n_need_healthy": False})
     assert _config_hash_impl("chosen-v2", {}) != _config_hash_impl("chosen-v2", {"outlier_margin": 0.0})
     assert _config_hash_impl("chosen-v2", {}) != _config_hash_impl("chosen-v2", {"n_need_healthy": True})
     with pytest.raises(ValueError):
-        BudgetConfig(outlier_margin=-0.1)
+        BudgetConfig(outlier_trigger="duration", outlier_margin=-0.1)
 
 
 def test_margin_plan_samples_the_band_between_T_and_one_plus_m_T():

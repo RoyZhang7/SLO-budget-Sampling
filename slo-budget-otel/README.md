@@ -96,6 +96,14 @@ inflated and the freeze sustained itself).  Collector-side reconstruction is out
 of the default build (`-tags slobudget_recon`); reconstruction is offline,
 `tools/recon`.
 
+Stage 3 changes (both implementations, differential test 21 of 21 identical): a
+service the rate trigger froze is released only at its 3rd consecutive period
+below the trigger (`freeze_release`; the 1st and 2nd are still held, 1 is the
+Stage 2c rule), so a fault whose detection rate dips for one period stays
+frozen.  The central sends N_need = +Inf (the threshold ablation) as 1e300 on
+the JSON config channel, as the replay dumps do, and the agents map it back;
+before, encoding/json refused the update and the agents never got one.
+
 Stage 2b additions.  `sdk/blueprint/` holds the DSB-SN form of the budget
 issuer: `slobudget_processor.go` is a second SDK span processor in the
 Blueprint fork's `runtime/plugins/otelcol` (registered by `trace.go` beside the
@@ -183,6 +191,19 @@ on node-0 as the deploy user; nothing needs root.
 5. Analysis: `tools/cluster_metrics.py`, `tools/recon_report.py`,
    `tools/stage2b_tables.py`, `tools/jaeger_orphans.py` on the run directory;
    raw exports stay on node-0.
+6. The Stage 3 campaign: `tools/campaign/queue.sh` under nohup works through
+   `$STAGE3/queue.txt` (`make_queue.py`), one `run_one.sh <arm> <scenario>
+   <volume> <seed>` per job and `postprocess.sh` (export, `tools/eval`, the gap
+   per call edge of faulted runs, `sanity.py`) in the background; `touch
+   $STAGE3/STOP` pauses it between runs.  Faults (`faults.env`,
+   `tools/hog/fault.sh`): saturated, cascade and cold_start burn CPU inside the
+   target container under a CPU limit on that container (`burn`: `docker update
+   --cpu-quota/--cpu-period`, then the spinner), so the fault stays in the
+   target; noisy_neighbour and late_everywhere run the unconfined spinner, which
+   slows every service on the node.  Burner sizes come from `tools/hog/calibrate.sh`
+   with `burn` phases and `tools/hog/calib_own.py` (the target's own-time P95
+   against its own-time share b).  meta.json records the image digests each run's
+   pods ran.
 
 What a fresh CloudLab instantiation would miss without step 2 and 3: the app
 images' issuer (the agent then self-issues budgets, the fallback) and our

@@ -10,7 +10,7 @@ from tests.conftest import chain_corpus
 
 
 def _sampler(corpus, **kw):
-    cfg = BudgetConfig(initial_budget=1000, pool_factor=1e9, **kw)
+    cfg = BudgetConfig(outlier_trigger="duration", initial_budget=1000, pool_factor=1e9, **kw)
     s = BudgetSampler(cfg)
     s.start_run(RunContext(corpus, v_star=1e9, cap=1e9, oracle=oracle_table(corpus), seed=1))
     return s
@@ -108,13 +108,13 @@ def test_oracle_source_has_zero_drift_and_kept_source_reports_drift():
 
 
 def test_table_alias_maps_to_calib_source():
-    assert BudgetConfig(table="oracle").calib_source == "oracle"
-    assert BudgetConfig(table="calibrated").calib_source == "kept"
-    assert BudgetConfig(calib_source="frozen").table == "calibrated"
+    assert BudgetConfig(outlier_trigger="duration", table="oracle").calib_source == "oracle"
+    assert BudgetConfig(outlier_trigger="duration", table="calibrated").calib_source == "kept"
+    assert BudgetConfig(outlier_trigger="duration", calib_source="frozen").table == "calibrated"
     with pytest.raises(ValueError):
-        BudgetConfig(calib_source="nope")
+        BudgetConfig(outlier_trigger="duration", calib_source="nope")
     with pytest.raises(ValueError):
-        BudgetConfig(root_policy="nope")
+        BudgetConfig(outlier_trigger="duration", root_policy="nope")
 
 
 def _fault_period(s, corpus, n_out=40, dur=0.009):
@@ -129,7 +129,7 @@ def _fault_period(s, corpus, n_out=40, dur=0.009):
 
 def test_rate_trigger_freezes_at_twice_the_healthy_rate_and_purges_the_window():
     corpus = chain_corpus([6.0, 2.0, 1.0], n_traces=20)
-    s = _sampler(corpus, calib_source="frozen", freeze_trigger="rate", initial_plan_p=1.0)
+    s = _sampler(corpus, calib_source="frozen", freeze_trigger="rate", initial_plan_p=1.0, freeze_release=1)   # Stage 2c release
     _warm(s, corpus)                      # period 0: builds the first table, no baseline yet
     assert s._frozen == set() and s._healthy_rate == {}
     _warm(s, corpus)                      # period 1: healthy rates (0 outliers) become the baseline
@@ -146,6 +146,31 @@ def test_rate_trigger_freezes_at_twice_the_healthy_rate_and_purges_the_window():
     assert s.cal.lookup("r", "r|any", "c") == pytest.approx(0.003, rel=0.05)
 
 
+def test_rate_trigger_releases_at_the_third_consecutive_period_below_it():
+    corpus = chain_corpus([6.0, 2.0, 1.0], n_traces=20)
+    s = _sampler(corpus, calib_source="frozen", freeze_trigger="rate", initial_plan_p=1.0)    # freeze_release 3
+    _warm(s, corpus)
+    _warm(s, corpus)                      # healthy baseline 0
+    T_before = s.cal.lookup("r", "r|any", "c")
+    _fault_period(s, corpus)
+    assert s._frozen == {"c"}
+    _fault_period(s, corpus, n_out=2)     # below the trigger (n_min): held, the baseline is not updated
+    assert s._frozen == {"c"} and s._quiet["c"] == 1 and s._healthy_rate["c"] == 0.0
+    _warm(s, corpus)                      # second period below it: still held
+    assert s._frozen == {"c"}
+    assert s.cal.lookup("r", "r|any", "c") == pytest.approx(T_before, rel=0.05)
+    _fault_period(s, corpus)              # the trigger fires again: the count restarts
+    assert s._frozen == {"c"} and s._quiet["c"] == 0
+    _warm(s, corpus)
+    _warm(s, corpus)
+    assert s._frozen == {"c"}
+    _warm(s, corpus)                      # third consecutive period below it: released, clean samples enter
+    assert s._frozen == set() and "c" not in s._quiet
+    assert s.cal.lookup("r", "r|any", "c") == pytest.approx(0.003, rel=0.05)
+    with pytest.raises(ValueError):
+        BudgetConfig(outlier_trigger="duration", freeze_release=0)
+
+
 def test_rate_trigger_stays_quiet_in_steady_state_and_ignores_small_counts():
     corpus = chain_corpus([6.0, 2.0, 1.0], n_traces=20)
     s = _sampler(corpus, calib_source="frozen", freeze_trigger="rate", initial_plan_p=1.0)
@@ -159,11 +184,11 @@ def test_rate_trigger_stays_quiet_in_steady_state_and_ignores_small_counts():
 
 def test_relative_n_need_scales_with_the_volume_target():
     corpus = chain_corpus([6.0, 2.0, 1.0], n_traces=20)          # 3 services
-    s = BudgetSampler(BudgetConfig(table="oracle", n_need_mode="relative", n_need_frac=0.2, n_min=3))
+    s = BudgetSampler(BudgetConfig(outlier_trigger="duration", table="oracle", n_need_mode="relative", n_need_frac=0.2, n_min=3))
     s.start_run(RunContext(corpus, v_star=300.0, cap=1e9, oracle=oracle_table(corpus), seed=1))
     assert s.n_need == 20.0                                       # floor(0.2 * 300 / 3)
     s.start_run(RunContext(corpus, v_star=10.0, cap=1e9, oracle=oracle_table(corpus), seed=1))
     assert s.n_need == 3.0                                        # N_min
-    s2 = BudgetSampler(BudgetConfig(table="oracle", n_need_mode="relative", unbounded=True))
+    s2 = BudgetSampler(BudgetConfig(outlier_trigger="duration", table="oracle", n_need_mode="relative", unbounded=True))
     s2.start_run(RunContext(corpus, v_star=300.0, cap=1e9, oracle=oracle_table(corpus), seed=1))
     assert s2.n_need == math.inf

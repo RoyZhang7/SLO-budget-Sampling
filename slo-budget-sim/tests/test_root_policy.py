@@ -13,7 +13,7 @@ from tests.conftest import chain_corpus
 
 def _run(corpus, seed=3, v_star=1e9, cap=1e9, **kw):
     """The oracle comes from a clean chain (6, 2, 1 ms): T = (12, 6, 3 ms)."""
-    cfg = BudgetConfig(table="oracle", initial_budget=10, b_min=10, b_max=10, **kw)
+    cfg = BudgetConfig(outlier_trigger="duration", table="oracle", initial_budget=10, b_min=10, b_max=10, **kw)
     reference = chain_corpus([6.0, 2.0, 1.0], n_traces=20)
     return replay(corpus, BudgetSampler(cfg), v_star=v_star, cap=cap, seed=seed, oracle=oracle_table(reference))
 
@@ -109,7 +109,7 @@ def test_plan_policy_treats_the_root_as_an_ordinary_span():
 
 def test_plan_policy_root_pays_from_the_budget():
     corpus = chain_corpus([6.0, 2.0, 1.0], n_traces=10)
-    cfg = BudgetConfig(table="oracle", root_policy="plan", initial_plan_p=1.0, initial_budget=1, b_min=1, b_max=1)
+    cfg = BudgetConfig(outlier_trigger="duration", table="oracle", root_policy="plan", initial_plan_p=1.0, initial_budget=1, b_min=1, b_max=1)
     s = BudgetSampler(cfg)
     s.start_run(RunContext(corpus, 1e9, 1e9, oracle_table(corpus), 1))
     root = corpus.spans[0]

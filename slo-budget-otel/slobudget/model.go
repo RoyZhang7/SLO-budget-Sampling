@@ -28,6 +28,8 @@ type Span struct {
 	NBytes    int
 	Transit   float64
 	Own       float64 // own (self) time when known, else 0
+
+	ParentSpanID uint64 // the parent's span id (0 for a root): keep_parent forces it
 }
 
 // CallGraph is the service-level call structure per route.

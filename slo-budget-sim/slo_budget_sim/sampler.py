@@ -29,16 +29,35 @@ Pluggable parts (BudgetConfig):
                              just ended is `freeze_rate_mult` x its healthy rate keeps
                              its previous calibration (L, O); its samples from frozen
                              periods never enter the window (`freeze_trigger=count`
-                             is the pass-2 rule: over N_need)
+                             is the pass-2 rule: over N_need).  A service frozen by
+                             the rate trigger is released only at its
+                             `freeze_release`-th consecutive period below the trigger
+                             (Stage 3: 3; 1 is the Stage 2c rule, released at the first)
                   oracle     the ground-truth table (ceiling)
   n_need_mode     fixed      N_need = n_need
                   relative   N_need = max(n_min, floor(n_need_frac x V* / services))
   cold_prior      none       no T_i before a service's first calibrated period: plan sampling only
                   equal      the equal-share square-root split of the SLO stands in for T_i until
                              the service has been calibrated once (ttable.equal_share_prior)
-  outlier_margin  m          a span is an outlier only when its duration exceeds (1 + m) T_i (or
-                             its status is not OK); spans between T_i and (1 + m) T_i are ordinary
-                             (plan-sampled).  0 = the plain rule.  Pass 5 candidate rule (exp14)
+  outlier_trigger own        Stage 2d (default): a span is an outlier when its OWN time (duration
+                             minus the union of its client children's intervals; asynchronous
+                             producer children are not subtracted) exceeds (1 + own_margin) x its
+                             own-time share b_i, or its status is not OK.  b_i is the stage budget
+                             of the same square-root split, taken before the shares are summed back
+                             into inclusive budgets (ttable.split_budgets, Calibrator.lookup_b).
+                             Callers above a slow callee stay ordinary and show as holes.
+                  duration   the full-duration rule: duration > (1 + outlier_margin) x T_i
+  own_margin      m          the margin of the own-time trigger, default 0.1 (the exp15 sweep)
+  outlier_margin  m          the margin of the duration trigger: a span is an outlier only when its
+                             duration exceeds (1 + m) T_i (or its status is not OK); spans between
+                             T_i and (1 + m) T_i are ordinary (plan-sampled).  0 = the plain rule.
+                             Pass 5 rule (exp14), the Stage 2c default 0.1
+  plan_coin       span       one plan coin per ordinary span (default)
+                  trace      trace-consistent: an ordinary span is kept only if the trace's random
+                             value (drawn once at the root, carried in baggage) is under the plan
+                             rate, so a sampled request keeps its ordinary spans together (exp16)
+  n_need_decay    d          0 (default): the N_need counters reset every period; d > 0: they are
+                             multiplied by d at the period end instead (exp16)
   n_need_healthy  False/True a span over T_i is still an outlier for keeping, but the N_need
                              counter and the frozen trigger count only the misses beyond the
                              service's healthy over-T rate (the EWMA kept while not frozen):
@@ -68,6 +87,8 @@ from .model import Corpus, Span
 from .ttable import PRIORS, Calibrator
 
 ROOT_POLICIES = ("pin", "on_demand", "record", "plan")
+OUTLIER_TRIGGERS = ("own", "duration")
+PLAN_COINS = ("span", "trace")
 CALIB_SOURCES = ("kept", "plan", "frozen", "oracle")
 CREDIT_POLICIES = ("none", "credit", "reserve")
 
@@ -84,7 +105,7 @@ class RunContext:
 class RequestState:
     """Per-request state that rides in baggage (plus a few bookkeeping fields)."""
     __slots__ = ("trace_id", "route", "cls", "budget", "budget0", "budget_by_host",
-                 "deadline", "head_keep", "head_p", "flag", "credit_used")
+                 "deadline", "head_keep", "head_p", "flag", "credit_used", "plan_u")
 
     def __init__(self, trace_id: int, route: str, cls: str):
         self.trace_id = trace_id
@@ -98,6 +119,7 @@ class RequestState:
         self.head_p = 1.0
         self.flag = False            # response-path flag: a span of this request was kept
         self.credit_used = 0         # credit / reserve spans this request has used
+        self.plan_u = 0.0            # the trace's plan value (plan_coin = trace), drawn at the root
 
 
 class Sampler:
@@ -167,8 +189,13 @@ class BudgetConfig:
     freeze_rate_mult: float = 2.0   # freeze when the period's outlier rate >= mult x the service's healthy rate
     freeze_rate_floor: float = 0.01 # the healthy rate is taken as at least this
     freeze_ewma: float = 0.3        # smoothing of the healthy outlier rate (updated while not frozen)
+    freeze_release: int = 3         # rate trigger: released at the k-th consecutive period below it (1: Stage 2c)
     cold_prior: str = "none"        # none | equal  (T_i before the first calibrated period, see module docstring)
-    outlier_margin: float = 0.1     # outlier only when duration > (1 + m) T_i (see module docstring); Stage 2c default
+    outlier_margin: float = 0.1     # duration trigger: outlier only when duration > (1 + m) T_i; Stage 2c default
+    outlier_trigger: str = "own"    # own | duration  (Stage 2d: own time against the own-time share; see module docstring)
+    own_margin: float = 0.1         # own trigger: outlier only when own > (1 + m) b_i (exp15)
+    plan_coin: str = "span"         # span | trace  (trace-consistent plan coin, exp16)
+    n_need_decay: float = 0.0       # 0: N_need counters reset every period; d > 0: multiplied by d instead (exp16)
     n_need_healthy: bool = False    # N_need and the frozen trigger count misses beyond the healthy over-T rate
     root_policy: str = "pin"        # pin | on_demand | record | plan  (see module docstring)
     root_flag_on: str = "outlier"   # outlier: outlier/escalate/parent keeps raise the flag; any: plan keeps too
@@ -201,10 +228,20 @@ class BudgetConfig:
             raise ValueError(f"unknown n_need_mode {self.n_need_mode}")
         if self.freeze_trigger not in ("rate", "count"):
             raise ValueError(f"unknown freeze_trigger {self.freeze_trigger}")
+        if self.freeze_release < 1:
+            raise ValueError("freeze_release must be >= 1")
         if self.cold_prior not in PRIORS:
             raise ValueError(f"unknown cold_prior {self.cold_prior}; choose from {PRIORS}")
         if self.outlier_margin < 0.0:
             raise ValueError("outlier_margin must be >= 0")
+        if self.outlier_trigger not in OUTLIER_TRIGGERS:
+            raise ValueError(f"unknown outlier_trigger {self.outlier_trigger}; choose from {OUTLIER_TRIGGERS}")
+        if self.own_margin < 0.0:
+            raise ValueError("own_margin must be >= 0")
+        if self.plan_coin not in PLAN_COINS:
+            raise ValueError(f"unknown plan_coin {self.plan_coin}; choose from {PLAN_COINS}")
+        if not 0.0 <= self.n_need_decay < 1.0:
+            raise ValueError("n_need_decay must be in [0, 1)")
 
 
 def _growth(rule: str):
@@ -272,6 +309,7 @@ class BudgetSampler(Sampler):
         self._forced: set[int] = set()
         self._frozen: set[str] = set()
         self._healthy_rate: dict[str, float] = {}
+        self._quiet: dict[str, int] = {}             # frozen services: consecutive periods below the trigger
         self._reset_counters()
         self._exhausted_reason = ""
 
@@ -315,6 +353,8 @@ class BudgetSampler(Sampler):
             if self.rng.random() < self.B - b:
                 b += 1
             req.budget = req.budget0 = max(1, b)
+        if self.cfg.plan_coin == "trace":
+            req.plan_u = self.rng.random()          # drawn only for the trace coin: the default stream is unchanged
         if self.cfg.budget_scope == "local":
             req.budget_by_host = {}
         if self.cfg.escalation == "deadline":
@@ -353,6 +393,12 @@ class BudgetSampler(Sampler):
 
     def _lookup(self, span: Span) -> float | None:
         return self._lookup_key(span.route, span.req_class, span.service)
+
+    def _lookup_b(self, span: Span) -> float | None:
+        """The own-time share (stage budget) of the span's service, same fallback as T."""
+        if not self.calibrated:
+            return self.ctx.oracle.lookup_b(span.route, span.req_class, span.service)
+        return self.cal.lookup_b(span.route, span.req_class, span.service)
 
     def _observe(self, span: Span, p: float, reason: str) -> None:
         """Feed the calibrator according to the configured source.  `p` is the
@@ -463,14 +509,24 @@ class BudgetSampler(Sampler):
         if cfg.keep_parent and span.idx in self._forced:
             self._forced.discard(span.idx)
             return self._spend(span, req, 1.0, "parent")
-        T = self._lookup(span)
-        if T is None:                       # cold start: plan sampling only
-            outlier, miss = False, 0.0
+        if cfg.outlier_trigger == "own":
+            b = self._lookup_b(span)
+            if b is None:                   # cold start: plan sampling only
+                outlier, miss = False, 0.0
+            else:
+                miss = (span.own - b) / b
+                outlier = miss > cfg.own_margin or not span.status_ok         # own time over its share
+                if miss < 0.0:
+                    miss = 0.0
         else:
-            miss = (span.duration - T) / T
-            outlier = miss > cfg.outlier_margin or not span.status_ok      # margin 0: the plain over-T rule
-            if miss < 0.0:
-                miss = 0.0
+            T = self._lookup(span)
+            if T is None:                   # cold start: plan sampling only
+                outlier, miss = False, 0.0
+            else:
+                miss = (span.duration - T) / T
+                outlier = miss > cfg.outlier_margin or not span.status_ok      # margin 0: the plain over-T rule
+                if miss < 0.0:
+                    miss = 0.0
         if outlier:
             self._ndet[svc] = self._ndet.get(svc, 0) + 1
             if self._exhausted(span, req):
@@ -490,7 +546,10 @@ class BudgetSampler(Sampler):
                 self._forced.add(span.parent_idx)
             return keep, p, reason
         p = self._plan_p.get(svc, cfg.initial_plan_p) * self._plan_scale.get(span.host, 1.0)
-        if p <= 0.0 or (p < 1.0 and self.rng.random() >= p):
+        if cfg.plan_coin == "trace":
+            if p <= 0.0 or req.plan_u >= p:     # the trace's value: a sampled request keeps its ordinary spans together
+                return False, p, "plan_coin"
+        elif p <= 0.0 or (p < 1.0 and self.rng.random() >= p):
             return False, p, "plan_coin"
         return self._spend(span, req, p, "plan")
 
@@ -506,8 +565,10 @@ class BudgetSampler(Sampler):
     def _freeze_set(self) -> set[str]:
         """Services whose calibration is held for the next table.  `rate`: the
         period's outlier rate is >= freeze_rate_mult x the service's healthy
-        rate (an EWMA updated only while not frozen, once a table exists);
-        `count`: the pass-2 rule, more than N_need outliers in the period."""
+        rate (an EWMA updated only while not frozen, once a table exists), and
+        a service it froze stays frozen until its `freeze_release`-th
+        consecutive period below the trigger; `count`: the pass-2 rule, more
+        than N_need outliers in the period."""
         cfg = self.cfg
         out: set[str] = set()
         has_table = bool(self.cal.table)
@@ -524,7 +585,12 @@ class BudgetSampler(Sampler):
             excess = rate - base if (cfg.n_need_healthy and base is not None) else rate     # n_need_healthy: beyond the healthy rate
             if base is not None and n_out >= cfg.n_min and excess >= cfg.freeze_rate_mult * max(base, cfg.freeze_rate_floor):
                 out.add(svc)
+                self._quiet[svc] = 0
+            elif svc in self._frozen and self._quiet.get(svc, 0) + 1 < cfg.freeze_release:
+                self._quiet[svc] = self._quiet.get(svc, 0) + 1     # below the trigger, not yet released
+                out.add(svc)
             else:
+                self._quiet.pop(svc, None)
                 self._healthy_rate[svc] = rate if base is None else (1 - cfg.freeze_ewma) * base + cfg.freeze_ewma * rate
         return out
 
@@ -586,7 +652,12 @@ class BudgetSampler(Sampler):
                            "plan_scale_min": min(self._plan_scale.values()) if self._plan_scale else 1.0,
                            "T_ratio": self._t_ratio(), "frozen": sorted(self._frozen), "prior_hits": prior_hits})
         self.cal.prior_hits = 0
-        self._reset_counters()
+        if cfg.n_need_decay > 0.0:
+            carry = {svc: n * cfg.n_need_decay for svc, n in self._nseen.items()}
+            self._reset_counters()
+            self._nseen = {svc: n for svc, n in carry.items() if n > 1e-9}     # counts decay instead of resetting
+        else:
+            self._reset_counters()
 
     def _repayment(self, debt: dict[str, int]) -> dict[str, float]:
         """Plan-rate factor per host for the next period that removes the

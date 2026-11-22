@@ -14,7 +14,7 @@ from tests.conftest import chain_corpus
 def _sampler(corpus, pool=10, v_star=None, **kw):
     """Oracle table, budget 1 per request, host pool `pool` (v_star chosen so that
     pool = v_star x share with a single host)."""
-    cfg = BudgetConfig(table="oracle", initial_budget=1, b_min=1, b_max=1, initial_plan_p=0.0,
+    cfg = BudgetConfig(outlier_trigger="duration", table="oracle", initial_budget=1, b_min=1, b_max=1, initial_plan_p=0.0,
                        plan_fill=0.0, ordinary_floor=0.0, **kw)
     s = BudgetSampler(cfg)
     s.start_run(RunContext(corpus, v_star=float(pool if v_star is None else v_star), cap=1e9,
@@ -149,7 +149,7 @@ def test_replay_records_a_refusal_reason_per_dropped_span():
         corpus.spans[r + 1].duration = 0.0085
         corpus.spans[r].duration = 0.0119
     reference = chain_corpus([6.0, 2.0, 1.0], n_traces=20)
-    cfg = BudgetConfig(table="oracle", initial_budget=1, b_min=1, b_max=1, initial_plan_p=0.0,
+    cfg = BudgetConfig(outlier_trigger="duration", table="oracle", initial_budget=1, b_min=1, b_max=1, initial_plan_p=0.0,
                        plan_fill=0.0, ordinary_floor=0.0, n_need=1000)
     res = replay(corpus, BudgetSampler(cfg), v_star=1e9, cap=1e9, seed=1, oracle=oracle_table(reference))
     reasons = {}
