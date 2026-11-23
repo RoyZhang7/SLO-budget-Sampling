@@ -19,7 +19,8 @@ import os
 import re
 import statistics as st
 
-CONFIGS = {"A": "tracing off", "B": "SDK head sampling 12 %", "C": "record everything, our agent at 12 %"}
+CONFIGS = {"A": "tracing off", "B": "SDK head sampling 12 %", "C": "record everything, our agent at 12 %",
+           "D": "C with the Path Bridge off"}
 
 
 def wrk(path: str) -> dict:

@@ -28,7 +28,7 @@ ABLATIONS = ("chosen", "threshold", "keep-parent")
 
 # (column header, summary key, format, scale)
 COLUMNS = [
-    ("vol/V*", "vol_ratio", "{:.2f}", 1.0),
+    ("volume / target", "vol_ratio", "{:.2f}", 1.0),
     ("KB/period", "bytes_per_period", "{:.0f}", 1e-3),
     ("periods>cap", "over_cap_periods", "{:.1f}", 1.0),
     ("max/request", "max_per_request", "{:.1f}", 1.0),
@@ -205,7 +205,7 @@ def main() -> int:
     if a.json:
         print(json.dumps({"volume": a.volume, "competitors": comp, "ablations": abl, "fault": flt, "recon": rec}, indent=1))
         return 0
-    v = f"V* = {a.volume:.0%}"
+    v = f"collection volume target {a.volume:.0%}"
     print(markdown(comp, COLUMNS, f"Competitors, {v}"))
     print(markdown(abl, COLUMNS, f"Ablations, {v}"))
     print(markdown(flt, FAULT_COLUMNS, f"Fault window under each truth, {v}"))

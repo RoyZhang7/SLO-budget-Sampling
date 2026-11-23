@@ -1,4 +1,4 @@
-// Command recon reconstructs the shed structure of the traces in a Jaeger JSON export
+// Command recon reconstructs the missing structure of the traces with holes in a Jaeger JSON export
 // (what tools/jaeger_export.py writes: {"data": [traces]}) and writes an export of the same
 // shape with placeholder ancestors added, plus a coverage report.  See README.md.
 //

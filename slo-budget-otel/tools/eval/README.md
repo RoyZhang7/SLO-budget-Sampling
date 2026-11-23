@@ -124,6 +124,13 @@ collector's data during a calibration phase, exported with jaeger_export.py), op
 restricted to calls whose CLIENT span starts in [T0, T1).  The Markdown ends with a table of
 the p95 changes against the first input.
 
+### Gap CSV
+
+`gaps_csv.py <runs dir> [--out gaps.csv]` puts the gap per edge of every run with a `gaps.json`
+(every faulted run) into one long CSV: run, scenario, arm, seed, window (before / during the
+fault), edge, host pair and the gap, client and server percentiles.  The gap stays in this CSV and
+the per-run JSON; the summaries leave it out.
+
 ## Stage 2d trigger comparison
 
 `compare2d.py <runs dir> [--gaps] [--md out.md]` tabulates the 2d series (runs
@@ -168,3 +175,20 @@ trace counts of the normal and fault sets.  Variants: `shadow` (100 %, the full 
 shadow), `true_ref` (`true` with the shadow's pre-fault spans as the normal set).
 `rca_tables.py <runs dir> [--volume V] [--md out.md]` tabulates Acc@1 / Acc@3 / MRR.  It needs
 pandas, tqdm and python-dateutil (node-0: `~/rca-venv`).
+
+## Plots and fault variation (analysis only)
+
+`plot_periods.py series <run_dir>` (node-0) writes a run's per-period history to `periods.json`;
+`plot_periods.py plot <periods.json> -o out.png [--services]` draws the time series (requests, spans
+admitted against the collection volume target and the 1.25x cap, cap drops, B, the outlier keeps per
+service and the frozen intervals), with a CSV next to the PNG.
+
+`fault_variation.py --out DIR RUN_ID...` (node-0, behind a wrk gate: it parses each run's shadow) and
+`fault_variation_tables.py DIR [--md out.md] [--csv out.csv]` (local, needs scipy) work per burner run
+(saturated, cascade, cold_start): the share of requests over the SLO before the fault and during it
+(roots by start time, SLO from `meta.json`), the pre-fault p50 / p95 / p99 of the request (the root
+span, server side; wrk2 keeps no time series, so its percentiles are whole-run), the culprit's own-time
+p95 against its own-time share b, the start time and the pod placement.  The tables give what tracks
+the share during the fault (Spearman over the runs, also with the scenario means removed, and the
+share by the culprit's node), the SLO next to the healthy p95 and p99, and every arm against head
+before a fault (pairs of the same scenario and seed).

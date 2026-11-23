@@ -13,9 +13,10 @@ kept_outlier but for a keep that straddles a period boundary.
 
 `plot` (matplotlib) draws one panel per measure on a shared time axis, one 5-s step per period
 (those at least half inside the load): requests per second (roots seen by the agents), spans
-admitted against V* and the 1.25 V* cap, cap drops and the per-request budget B; with --services
-also the outlier keeps per service and the periods each service's threshold was frozen.  The fault
-or burst window is shaded.  Every plotted value goes to a CSV next to the PNG (same name, .csv).
+admitted against the collection volume target and the 1.25x cap, cap drops and the per-request
+budget B; with --services also the outlier keeps per service and the periods each service's
+threshold was frozen.  The fault or burst window is shaded.  Every plotted value goes to a CSV
+next to the PNG (same name, .csv).
 """
 from __future__ import annotations
 
@@ -55,7 +56,7 @@ def call_order(graph: dict | None) -> list[str]:
 
 
 def run_info(rd: str, status: dict) -> dict:
-    """t0, t1, period, V*, cap and the fault or burst window (absolute times) of a run."""
+    """t0, t1, period, the collection volume target (v_star), cap and the fault or burst window (absolute times) of a run."""
     meta = _load(os.path.join(rd, "meta.json"))
     if meta:                                       # Stage 3 (tools/campaign/run_one.sh)
         f, b, w = meta.get("fault"), meta.get("burst"), None
@@ -206,12 +207,12 @@ def plot(path: str, out: str, with_services: bool, title: str | None) -> int:
     ax.set_ylim(0, max(1.0, rps.max()) * 1.18)
 
     ax = ax_of["adm"]
-    style(ax, "spans", "Spans admitted per period, against V* and the 1.25 V* cap")
+    style(ax, "spans", "Spans admitted per period, against the collection volume target and the 1.25x cap")
     adm = stairs(ax, "admitted")
     vs, cap = float(d["v_star"]), float(d["cap"])
     ax.axhline(vs, color=INK2, linewidth=0.9, zorder=1)
     ax.axhline(cap, color=INK, linewidth=0.9, zorder=1)
-    margin_label(ax, vs, f"V* {_thousands(vs)}")
+    margin_label(ax, vs, f"target {_thousands(vs)}")
     margin_label(ax, cap, f"cap {_thousands(cap)}", INK)
     ax.set_ylim(0, max(cap, adm.max()) * 1.15)
     ax.yaxis.set_major_formatter(FuncFormatter(_thousands))
@@ -279,7 +280,7 @@ def plot(path: str, out: str, with_services: bool, title: str | None) -> int:
     last.xaxis.set_major_locator(MultipleLocator(60))
     last.set_xlabel("seconds since the load started (one step per 5-s period)", color=INK2, fontsize=8.5)
     fig.suptitle(title or d["run"], x=0.12, y=1 - 0.15 / H, ha="left", va="top", fontsize=11.5, fontweight="semibold", color=INK)
-    fig.text(0.12, 1 - 0.45 / H, f"{d['run']}: V* {_thousands(vs)} spans per period, cap 1.25 V* = "
+    fig.text(0.12, 1 - 0.45 / H, f"{d['run']}: collection volume target {_thousands(vs)} spans per period, cap 1.25x = "
              f"{_thousands(cap)}, {d.get('rps') or '?'} req/s offered, {P:.0f}-s periods", ha="left", va="top",
              fontsize=8.5, color=INK2)
     fig.savefig(out, dpi=200, facecolor=SURFACE)

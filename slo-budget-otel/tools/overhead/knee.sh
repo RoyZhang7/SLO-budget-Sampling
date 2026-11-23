@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The knee of the latency curve for the overhead experiment (node-0, after the campaign): config C
-# (record everything into our agent at 12 %, the heaviest of the three), one reseed, a 30-s
+# (record everything into our agent at 12 %), one reseed, a 30-s
 # warm-up, then RATES back to back, 2 minutes each.  The higher rate of the experiment is the
 # highest rate whose p99 stays within KNEE_X (2) x the p99 at the first rate (100 req/s) and
 # whose achieved rate is within 1 % of the target; it is printed last ("knee rate: N").
@@ -29,7 +29,7 @@ restore() {
 [ "$(kubectl get ds otelcol-pb-es-ctr -o jsonpath='{.spec.template.spec.containers[0].image}')" = "$STOCK_COLLECTOR_IMAGE" ] \
     || { log "the stock collector is not in place"; exit 1; }
 WORKLOADS=$(kubectl get deploy,ds -o name | grep -- '-service-pb-es-ctr' | grep -v tracepressure)
-for w in $WORKLOADS; do kubectl set env "$w" OTEL_SAMPLE_RATIO- SLO_BUDGET_PORT- >> "$RD/run.log" 2>&1; done
+for w in $WORKLOADS; do kubectl set env "$w" OTEL_SAMPLE_RATIO- SLO_BUDGET_PORT- BRIDGE_KIND=pb >> "$RD/run.log" 2>&1; done
 for w in $WORKLOADS; do kubectl rollout status "$w" --timeout=300s >> "$RD/run.log" 2>&1; done
 bash "$MOD/tools/reseed.sh" > "$RD/reseed.log" 2>&1 || { log "reseed failed"; exit 1; }
 python3 "$MOD/tools/campaign/render.py" --arm chosen --volume 0.12 --seed 1 --image "$IMG" --no-tee > "$RD/manifests.yaml"

@@ -102,7 +102,7 @@ def tables(runs: list[dict], volume: float | None) -> str:
                                                            for m in METHODS for sfx in sfxs)
                       + " | normal set spans/trace | fault set spans/trace |")
             truth = "node-level truth (a service only on the culprit's node)" if sc == "noisy_neighbour" else "single culprit"
-            lines += [f"### {sc.replace('_', '-')}, V* = {vol:.0%}, {truth}", "",
+            lines += [f"### {sc.replace('_', '-')}, collection volume target {vol:.0%}, {truth}", "",
                       "Acc@1 / Acc@3 / MRR over every scored run, a crash counting as a miss; when runs crashed, the "
                       "ranked-only numbers follow in parentheses.", "", header, "|---" * (5 + 2 * len(sfxs)) + "|"]
             sh = [r["variants"].get("shadow") for r in rs if r["variants"].get("shadow")]
@@ -126,7 +126,7 @@ def tables(runs: list[dict], volume: float | None) -> str:
         # crashes per arm at this volume (every scored scenario together)
         rs = [r for r in runs if abs(_vol(r) - vol) < 1e-6]
         cols = [(m, v) for m in METHODS for v in ("shadow",) + ARM_VARIANTS]
-        lines += [f"### Crashes (an operation with no pre-fault span), V* = {vol:.0%}", "",
+        lines += [f"### Crashes (an operation with no pre-fault span), collection volume target {vol:.0%}", "",
                   "Crashed runs / scored runs, every scored scenario together; `other` counts any other error.", "",
                   "| arm | " + " | ".join(f"{NAMES[m]} {'full data' if v == 'shadow' else v}" for m, v in cols) + " |",
                   "|---" * (len(cols) + 1) + "|"]

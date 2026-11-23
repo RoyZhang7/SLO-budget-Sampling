@@ -55,7 +55,8 @@ built upwards until it reaches a kept span or the root:
   cases where parent and grandparent were both kept, anchor == grandparent, and
   it never equals the parent.  The root's `_br` is all zeros (depth 0, no
   anchor, empty bloom).  The bloom holds the ancestors strictly between the
-  anchor and the span (one client span) and is not used here.
+  anchor and the span (one client span) and is not used here (see the comparison
+  with the bridges repo below).
 - `_d` (binary) = `uvarint(depth)`, 1 byte on every one of the 188 924 client
   spans (odd depths 1 / 3 / 5), never on a server span.
 - Decoder: `recon.DecodeBridge(br, d)`; the Python equivalent is
@@ -78,7 +79,7 @@ placeholders between the orphan and its nearest real ancestor or the root in
 the full reconstruction.  `traces_one_tree_after_known_ids_only` reconstructs
 without synthesised ids.
 
-### The three Stage 2b exports (10 min, 100 req/s, V* = 12 %)
+### The three Stage 2b exports (10 min, 100 req/s, collection volume target 12 %)
 
 | export | kept spans | orphans | placeable by known ids | hole = 1 | hole by known ids (kept:1 / root:1 / root:2 / open:1 / open:2) | full hole 1 / 2 / 3 / 4 / 5 / 6 | placeholders (per real span, synthetic-id share) | one tree before / known ids only / with synthesis |
 |---|---|---|---|---|---|---|---|---|
@@ -96,3 +97,75 @@ and the ratio drops to 1.09.  The collector-side run of the same arm
 (`cluster-20261120-224354-ondemand-recon2`, a different 10 minutes) wrote
 255 698 placeholders for 164 627 real spans, 1.56 per real span, against the
 offline 1.59 here.
+
+## Compared with the bridges repo's reconstructor (checkpoint distance 2)
+
+Read: docc-lab/bridges `e5bf8bd`, package `recon` (`ReconstructPB0`, the maximal-evidence Path
+Bridge reconstructor, and `NewPCRBConfig(2, 8, 1e-4)` with the repo's defaults, `Prehashed`), and the
+deployed SDK's encoder (`pb_processor.go`).  Both take the same wire: uvarint depth, 8-byte anchor,
+3-byte bloom (20 bits, 14 probes, span ids unhashed).
+
+| field | the bridges repo | `tools/recon` |
+|---|---|---|
+| anchor | names the checkpoint above; a fragment attaches to the surviving span with that id, at the window's top (here the grandparent), else to nothing | the same: a server span attaches to its anchor when it was kept (class `kept`, hole 1) |
+| depth | window bounds, candidate levels, gap = depth difference - 1 | the gap, and the root class (depth 1 and 2) |
+| bloom | candidate and chain test; a fragment without its own payload borrows evidence | not read |
+
+The bloom cannot change a placement at distance 2: it holds the one ancestor between the anchor and
+the span, which is the span's own parent, known exactly from its parent id, and no candidate level
+lies between them.  Checked on 21 runs' exports with the runs' 100 % shadows as truth (1.17 million
+server spans without their parent): the bloom contained the parent every time (0 misses), the anchor
+was the true grandparent every time, and the bridges reconstructor attached exactly the spans that
+`tools/recon` calls `kept`, each at its true nearest kept ancestor with the true gap (0 wrong, 0
+different).  The filter's own false-positive rate is 5 to 9 % (designed 0.01 %); it does not matter at
+distance 2 because nothing is left to test.
+
+Coverage on those exports (12 % volume target, 60 000 traces each; "broken link" = a kept span whose
+parent was not kept):
+
+| arm and scenario | broken links (share of kept) | rejoined to a kept span by bridge data | joined at the root slot by its known id | rest |
+|---|---|---|---|---|
+| chosen, steady / saturated / other scenarios | 83 to 85 % | 5.5 to 6.0 % | 8.0 to 8.6 % | 85 to 86 % |
+| canopy, steady / saturated | 90 % | 3.9 to 4.0 % | 5.0 to 5.1 % | 91 % |
+| reservoir, steady / saturated | 13 / 19 % | 0.7 / 13.0 % | 2.0 / 3.2 % | 97 / 84 % |
+| keep-parent, steady / saturated | 83 to 85 % | 5.9 to 6.0 % | 8.0 to 8.5 % | 86 % |
+| head | complete traces (about 0 broken links) | | | |
+
+The bridges repo's reconstruction uses the same evidence, so this is also the ceiling of the Path
+Bridge at distance 2 on these kept sets.  What stops the rest on the chosen arm: for 67 to 73 % of
+the broken links no kept span sits anywhere above (four of five traces lose their root); 12 to 14 %
+are client spans, which carry only their depth (their parent server span's record is gone); 10 to
+14 % are server spans whose anchor (the checkpoint two levels up) was itself dropped.  The anchor of
+a server span is kept about 12 % of the time, the sampling rate, and nothing at distance 2 points
+further up.
+
+### Hole lengths, and what would place a hole of 3 (simulated, checkpoint distance as a parameter)
+
+"Hole" = missing spans between a kept span and its nearest kept ancestor.  On the chosen arm (60 000
+traces, 12 %) 68 % of the broken links have no kept ancestor at all (nothing to attach to); of the
+others holes of 1 / 2 / 3 / 4 / 5 spans are 11.2 / 10.1 / 6.1 / 2.5 / 1.9 % of all broken links
+(saturated seed 1).  The "holes of 3 are the most common" of the Stage 2c report counts the hole up to
+the trace start when nothing above is kept (`hole_hist_full`); there most holes of 3 are depth-3
+client spans with nothing kept above, which no bridge can attach to a kept span.
+
+The simulation replays the bridges repo's own payload rules over the true spans of eight runs (the real
+kept sets, the deployed payload and hash, `ReconstructPB0` as shipped) and checks every placement
+against the shadow.  Shares of holes of 3 with a kept ancestor that are placed (saturated, chosen,
+seed 1; runs vary by 2 to 6 points, 0.6 % on reservoir at distance 4):
+
+| payload and reader | bytes per kept span | hole of 3 placed | attachable links placed | wrong |
+|---|---|---|---|---|
+| distance 2, as deployed | 6.9 | 0 % | 19 % | 0 |
+| distance 3 | 10.1 | 0 % | 21 % | 4 of 9 175 |
+| distance 4 | 8.8 | 58 % (depth-4 servers only) | 24 % | 0 of 10 203 |
+| distance 6 | 9.1 | 51 % | 27 % | 63 of 11 799 |
+| payload on every span, distance 4, a reader that needs no kept window root | 17.0 | 58 % | 64 % | 0 of 27 516 |
+| the same, distance 6 | 21.0 | 99 % | 99 % | 689 of 43 261 |
+| the same, distance 7 | 24.0 | 100 % | 100 % | 254 of 43 078 |
+
+The last three rows are not an existing bridge: the SDK builds the payload for every span and strips it
+at export (checkpoints and leaf servers keep it), and the shipped readers require the window's root
+record.  The call-graph slot (depth, service, operation, kind) is unique in every trace of these runs
+(0 of 60 000 traces with a repeated slot in seven runs, 0 of 72 000 in the bursty one), so the full
+reconstruction (placeholder rules above) places all of these from the call graph alone; a bridge matters
+for applications with repeated calls.

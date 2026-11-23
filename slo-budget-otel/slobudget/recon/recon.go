@@ -1,4 +1,4 @@
-// Package recon reconstructs the shed structure of a trace: for every kept span whose parent
+// Package recon reconstructs the missing structure of a trace with holes: for every kept span whose parent
 // was dropped it inserts placeholder ancestors up to the nearest kept ancestor or the root,
 // from the span's own parent id, the Path Bridge's `_br` checkpoint anchor and depth, and
 // the call graph.  It is pdata-free and shared by the offline tool (tools/recon) and the
