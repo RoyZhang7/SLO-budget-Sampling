@@ -103,7 +103,7 @@ scrape start
 
 # 3. load, fault, burst ----------------------------------------------------------------------
 DELTA=$(python3 -c "import random; print(round(random.Random(1000 + $SEED).uniform(0, 30), 1))")
-FAULT_TARGET=""; FAULT_AT=0; BURST_AT=0; CULPRIT=null
+FAULT_TARGET=""; FAULT_AT=0; BURST_AT=0; CULPRIT=None   # a Python literal: pasted into the meta heredoc below
 case "$SCENARIO" in
     steady) ;;
     saturated) FAULT_TARGET=socialgraph; FAULT_AT=240; CULPRIT='"socialgraph"'; FAULT_MODE=burn ;;

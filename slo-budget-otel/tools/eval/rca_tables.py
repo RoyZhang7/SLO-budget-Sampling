@@ -6,10 +6,10 @@
 Per scenario and volume: first the full data (the 100 % shadow, every run of the scenario pooled),
 then per arm and variant (recon, true, true_ref) Acc@1, Acc@3 and MRR of TraceRCA and MicroRank,
 and the spans per trace of the arm's normal set (recon and true share the kept spans; true_ref's
-normal set is the shadow's).  Headline: RCAEval's own scoring (an operation counts for the
-service that emitted the span); for saturated, cascade and cold_start, next to it the version
-where a client operation counts for the service it calls (noisy_neighbour: RCAEval's scoring
-only).  In each cell the headline counts a run where the method crashed (an operation
+normal set is the shadow's).  saturated, cascade and cold_start show two scorings side by side,
+neither of them the headline: RCAEval's own (an operation counts for the service that emitted
+the span) and callee credit (a client operation counts for the service it calls);
+noisy_neighbour shows RCAEval's scoring only.  In each cell the headline counts a run where the method crashed (an operation
 with no pre-fault span: KeyError on the normal statistics; no ranking) as a miss; when a run
 crashed, the ranked-only numbers follow in parentheses, and the last table counts the crashes per
 arm and volume.  noisy_neighbour is scored against the node-level truth, the other scenarios
@@ -98,7 +98,7 @@ def tables(runs: list[dict], volume: float | None) -> str:
             if not rs:
                 continue
             sfxs = ("",) if sc == "noisy_neighbour" else ("", "_callee")
-            header = ("| arm | variant | runs | " + " | ".join(f"{NAMES[m]}{', client counts for callee' if sfx else ' (RCAEval scoring)'}"
+            header = ("| arm | variant | runs | " + " | ".join(f"{NAMES[m]}, {'callee credit' if sfx else 'RCAEval scoring'}"
                                                            for m in METHODS for sfx in sfxs)
                       + " | normal set spans/trace | fault set spans/trace |")
             truth = "node-level truth (a service only on the culprit's node)" if sc == "noisy_neighbour" else "single culprit"
