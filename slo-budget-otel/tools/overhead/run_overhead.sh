@@ -7,8 +7,8 @@
 #   B  SDK head sampling at 12 %: OTEL_SAMPLE_RATIO=0.12 (ParentBased(TraceIDRatioBased) at the
 #      root, whole traces kept or dropped) into the stock collector -> Jaeger
 #   C  record everything (ratio unset: AlwaysSample) into our agent at a collection volume target
-#      of 12 % (the chosen arm of the campaign without the tee and the shadow) -> the central on
-#      node-0 -> Jaeger
+#      of 12 % of the spans at <rate>, the share B keeps (the chosen arm of the campaign without the
+#      tee and the shadow; 1 380 spans per 5 s at 100 req/s) -> the central on node-0 -> Jaeger
 #   D  C with the Path Bridge off (BRIDGE_KIND=v: the SDK's vanilla processor, the same plain
 #      OTLP export, no breadcrumbs), same image: a span carries no _br / _d
 #
@@ -73,7 +73,7 @@ log "$(tail -1 "$RD/reseed.log")"
 
 # 2. C / D: our agent (no tee, no shadow) and the central -----------------------------------------
 if [ "$CFG" = C ] || [ "$CFG" = D ]; then
-    python3 "$MOD/tools/campaign/render.py" --arm chosen --volume 0.12 --seed "$REP" --image "$IMG" --no-tee \
+    python3 "$MOD/tools/campaign/render.py" --arm chosen --volume 0.12 --rate "$RATE" --seed "$REP" --image "$IMG" --no-tee \
         > "$RD/manifests.yaml" || fail "render"
     kubectl apply -f "$RD/manifests.yaml" >> "$RD/run.log" 2>&1 || fail "apply"
     kubectl rollout status deploy/slobudget-central --timeout=180s >> "$RD/run.log" 2>&1 || fail "central did not come up"
@@ -134,6 +134,7 @@ try:
 except (OSError, ValueError):
     src = {}
 meta = {"config": "$CFG", "rate": $RATE, "rep": $REP, "dur_s": $DUR, "t0": $T0, "t1": $T1, "app_env": "$APP_ENV".split(),
+        "volume_target_spans_per_period": round(0.12 * 11500 * ($RATE / 100)) if "$CFG" in ("C", "D") else None,
         "placement": dict(x.split("=", 1) for x in "$PLACEMENT".split() if "=" in x),
         "images": {"collector": "$IMG" if "$CFG" in ("C", "D") else "$STOCK_COLLECTOR_IMAGE", "agent_containers": "$AGENT_IMAGES".split(),
                    "app_digest": "$APP_IMAGEID".rpartition("@")[2] or None,

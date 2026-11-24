@@ -33,7 +33,13 @@ def _graph(corpus: Corpus) -> dict:
         children.setdefault(route, {})[svc] = list(kids)
     for (route, svc), par in g.parallel.items():
         parallel.setdefault(route, {})[svc] = bool(par)
-    return {"root": dict(g.root), "children": children, "parallel": parallel}
+    out = {"root": dict(g.root), "children": children, "parallel": parallel}
+    if g.stages:
+        stages: dict[str, dict[str, list[list[str]]]] = {}
+        for (route, svc), st in g.stages.items():
+            stages.setdefault(route, {})[svc] = [list(group) for group in st]
+        out["stages"] = stages
+    return out
 
 
 def _oracle_table(oracle: Calibrator) -> dict:
@@ -80,10 +86,27 @@ def decisions_dump(res: RunResult, n_need: float) -> dict:
     return {"keep": keep, "p": p, "reason": reason, "n_need": INF_AS if math.isinf(n_need) else n_need, "periods": periods}
 
 
+def set_stages(corpus: Corpus, stages: dict[str, dict[str, list[list[str]]]]) -> None:
+    """Give a corpus's graph sequential stages (route -> service -> callees by stage); every callee must be one of the
+    service's callees."""
+    for route, by_svc in stages.items():
+        for svc, st in by_svc.items():
+            kids = set(corpus.graph.children.get((route, svc), []))
+            named = [c for group in st for c in group]
+            if not kids or len(named) != len(set(named)) or not set(named) <= kids:
+                raise ValueError(f"stages of ({route}, {svc}) do not match its callees {sorted(kids)}: {st}")
+            corpus.graph.stages[(route, svc)] = [list(group) for group in st]
+
+
 def dump_replay(scenario: str, seed: int, volume_frac: float, out_dir: Path, arm: str = "chosen-v2",
-                overrides: dict | None = None, cap_factor: float = 1.25) -> tuple[Path, Path]:
-    """Build the scenario, replay the arm exactly as the experiments do and write both files."""
+                overrides: dict | None = None, cap_factor: float = 1.25,
+                stages: dict[str, dict[str, list[list[str]]]] | None = None) -> tuple[Path, Path]:
+    """Build the scenario, replay the arm exactly as the experiments do and write both files.  `stages` gives the
+    corpus's and its reference's call graph sequential stages."""
     corpus, reference = build_scenario(scenario, seed)
+    if stages:
+        for c in (corpus, reference):
+            set_stages(c, stages)
     oracle = oracle_table(reference, q=0.95, use_class=True)
     v_star = volume_frac * len(corpus.spans) * corpus.period / max(corpus.period, corpus.t_end - corpus.t0)
     cap = cap_factor * v_star
@@ -91,7 +114,7 @@ def dump_replay(scenario: str, seed: int, volume_frac: float, out_dir: Path, arm
     rng_seed = 1000 + seed
     res = replay(corpus, sampler, v_star, cap, seed=rng_seed, oracle=oracle)
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"{scenario}-s{seed}-v{volume_frac:g}"
+    stem = f"{scenario}-s{seed}-v{volume_frac:g}" + ("-stages" if stages else "")
     ev, de = out_dir / f"{stem}.events.json", out_dir / f"{stem}.decisions.json"
     with open(ev, "w", encoding="utf-8") as f:
         json.dump(events_dump(corpus, sampler.cfg, v_star, cap, rng_seed, arm, scenario, seed, oracle), f)

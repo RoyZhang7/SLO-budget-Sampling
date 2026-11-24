@@ -1,7 +1,10 @@
 package main
 
 import (
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -97,4 +100,79 @@ func TestRunTiny(t *testing.T) {
 		t.Fatalf("known-ids output: placeholders %d synthetic %d", rep2.Placeholders, rep2.SyntheticIDs)
 	}
 	_ = sortedKeys(rep.HoleHistFull)
+}
+
+// Trace 1: a kept root, a composepost server (depth 2, its client parent missing, anchor = root), a text server (depth 4, its
+// client parent missing, anchor = the composepost server) and a client span under the composepost server: all reach the root.
+// Trace 2 (no root): a text server whose anchor is missing (open), a client span of that text server (parent kept, still
+// open above) and a depth-1 client span (placed at the root slot).
+func TestCoverageByReason(t *testing.T) {
+	enc := func(depth byte, anchor uint64) string {
+		b := append([]byte{depth}, make([]byte, 11)...)
+		binary.BigEndian.PutUint64(b[1:9], anchor)
+		return base64.StdEncoding.EncodeToString(b)
+	}
+	span := func(tid string, id, parent uint64, kind, svc, br, d, reason string) map[string]any {
+		refs := []any{}
+		if parent != 0 {
+			refs = append(refs, map[string]any{"refType": "CHILD_OF", "traceID": tid, "spanID": fmt.Sprintf("%016x", parent)})
+		}
+		tags := []any{tag("span.kind", "string", kind), tag("slobudget.reason", "string", reason)}
+		if br != "" {
+			tags = append(tags, tag("_br", "binary", br))
+		}
+		if d != "" {
+			tags = append(tags, tag("_d", "binary", d))
+		}
+		return map[string]any{"traceID": tid, "spanID": fmt.Sprintf("%016x", id), "operationName": svc + "Server_X", "references": refs,
+			"startTime": 1000, "duration": 100, "tags": tags, "processID": "p_" + svc}
+	}
+	d1 := func(n byte) string { return base64.StdEncoding.EncodeToString([]byte{n}) }
+	procs := map[string]any{}
+	for _, svc := range []string{"wrk2api", "composepost", "text"} {
+		procs["p_"+svc] = map[string]any{"serviceName": "unknown_service:" + svc + "_service_pb_es_proc", "tags": []any{}}
+	}
+	t1, t2 := fmt.Sprintf("%032x", 1), fmt.Sprintf("%032x", 2)
+	traces := []any{
+		map[string]any{"traceID": t1, "processes": procs, "spans": []any{
+			span(t1, 0x10, 0, "server", "wrk2api", enc(0, 0), "", "root"),
+			span(t1, 0x12, 0x11, "server", "composepost", enc(2, 0x10), "", "outlier"),
+			span(t1, 0x22, 0x21, "server", "text", enc(4, 0x12), "", "outlier"),
+			span(t1, 0x31, 0x12, "client", "composepost", "", d1(3), "plan"),
+		}},
+		map[string]any{"traceID": t2, "processes": procs, "spans": []any{
+			span(t2, 0x52, 0x51, "server", "text", enc(4, 0x99), "", "outlier"),
+			span(t2, 0x61, 0x52, "client", "text", "", d1(5), "plan"),
+			span(t2, 0x71, 0x70, "client", "wrk2api", "", d1(1), "plan"),
+		}},
+	}
+	raw, err := json.Marshal(map[string]any{"data": traces})
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := filepath.Join(t.TempDir(), "in.json")
+	if err := os.WriteFile(in, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	g, err := recon.LoadCallGraph("../../deploy/callgraph.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, err := run(in, "", g, options{defaultRoute: "compose_post", serviceFormat: "%s", synthesize: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]reasonCoverage{
+		"root/server":    {Spans: 1, TraceRootKept: 1, ReachesRoot: 1},
+		"outlier/server": {Spans: 3, TraceRootKept: 2, Orphans: 3, PlacedToKept: 2, Open: 1, ReachesRoot: 2},
+		"plan/client":    {Spans: 3, TraceRootKept: 1, ParentKept: 2, Orphans: 1, PlacedToRoot: 1, ReachesRoot: 2},
+	}
+	if len(rep.ByReason) != len(want) {
+		t.Fatalf("reasons %v", rep.ByReason)
+	}
+	for k, w := range want {
+		if got := rep.ByReason[k]; got == nil || *got != w {
+			t.Errorf("%s: %+v, want %+v", k, got, w)
+		}
+	}
 }

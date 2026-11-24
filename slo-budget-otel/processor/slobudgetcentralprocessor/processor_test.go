@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
+	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -205,5 +209,34 @@ func TestCentralUnboundedUpdateIsEncodable(t *testing.T) {
 	body, _ := io.ReadAll(st.Body)
 	if st.StatusCode != http.StatusOK || !json.Valid(body) {
 		t.Fatalf("status: HTTP %d, %d bytes", st.StatusCode, len(body))
+	}
+}
+
+func TestLoadCallGraphWithStages(t *testing.T) {
+	plain, err := LoadCallGraph("../../deploy/callgraph.json")
+	if err != nil || len(plain.Stages) != 0 {
+		t.Fatalf("deploy/callgraph.json: %v, stages %v", err, plain.Stages)
+	}
+	g, err := LoadCallGraph("../../deploy/callgraph.stages.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{{"media", "text", "uniqueid", "user"}, {"hometimeline", "poststorage", "usertimeline"}}
+	if !reflect.DeepEqual(g.Stages["compose_post"]["composepost"], want) {
+		t.Fatalf("composepost stages %v", g.Stages["compose_post"]["composepost"])
+	}
+	if !reflect.DeepEqual(g.Root, plain.Root) || !reflect.DeepEqual(g.Children, plain.Children) || !reflect.DeepEqual(g.Parallel, plain.Parallel) {
+		t.Fatal("the staged file differs from deploy/callgraph.json in more than the stages")
+	}
+	dir := t.TempDir()
+	for i, stages := range []string{`[["b"], ["x"]]`, `[["b"], ["b", "c"]]`} { // not a callee; named twice
+		f := filepath.Join(dir, fmt.Sprintf("bad%d.json", i))
+		body := `{"root": {"r": "a"}, "children": {"r": {"a": ["b", "c"]}}, "parallel": {"r": {}}, "stages": {"r": {"a": ` + stages + `}}}`
+		if err := os.WriteFile(f, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadCallGraph(f); err == nil {
+			t.Errorf("stages %s should be rejected", stages)
+		}
 	}
 }

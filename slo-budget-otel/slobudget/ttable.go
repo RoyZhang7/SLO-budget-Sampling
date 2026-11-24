@@ -81,20 +81,17 @@ func ownFromInclusive(L *orderedMap, g *CallGraph, route string) *orderedMap {
 		}
 		cover := 0.0
 		if len(kids) > 0 {
-			if g.parallel(route, s) {
-				cover = L.vals[kids[0]]
-				for _, c := range kids[1:] {
-					if L.vals[c] > cover {
-						cover = L.vals[c]
+			var longest []float64 // of every stage
+			for _, group := range g.groups(route, s, kids) {
+				m := L.vals[group[0]]
+				for _, c := range group[1:] {
+					if L.vals[c] > m {
+						m = L.vals[c]
 					}
 				}
-			} else {
-				vals := make([]float64, len(kids))
-				for i, c := range kids {
-					vals[i] = L.vals[c]
-				}
-				cover = PySum(vals)
+				longest = append(longest, m)
 			}
+			cover = PySum(longest)
 		}
 		own.set(s, math.Max(EpsOwn, Ls-cover))
 	}
@@ -129,7 +126,8 @@ func SplitBudgets(slo float64, L *orderedMap, g *CallGraph, route string, O *ord
 		}
 		return out
 	}
-	// contributing set: every callee of a sequential node, only the longest callee of a parallel node
+	// contributing set: the longest callee of every stage (every callee of a sequential node,
+	// only the longest callee of a parallel node)
 	contrib := map[string]bool{}
 	stack := []string{root}
 	for len(stack) > 0 {
@@ -143,16 +141,14 @@ func SplitBudgets(slo float64, L *orderedMap, g *CallGraph, route string, O *ord
 		if len(ks) == 0 {
 			continue
 		}
-		if g.parallel(route, s) {
-			best := ks[0]
-			for _, c := range ks[1:] {
+		for _, group := range g.groups(route, s, ks) {
+			best := group[0]
+			for _, c := range group[1:] {
 				if L.vals[c] > L.vals[best] {
 					best = c
 				}
 			}
 			stack = append(stack, best)
-		} else {
-			stack = append(stack, ks...)
 		}
 	}
 	contribSorted := make([]string, 0, len(contrib))
@@ -198,18 +194,16 @@ func SplitBudgets(slo float64, L *orderedMap, g *CallGraph, route string, O *ord
 			var v float64
 			if len(ks) == 0 {
 				v = k * b.vals[s]
-			} else if g.parallel(route, s) {
-				m := t(ks[0])
-				for _, c := range ks[1:] {
-					if x := t(c); x > m {
-						m = x
+			} else { // the stages run one after the other, the callees of a stage together
+				var parts []float64
+				for _, group := range g.groups(route, s, ks) {
+					m := t(group[0])
+					for _, c := range group[1:] {
+						if x := t(c); x > m {
+							m = x
+						}
 					}
-				}
-				v = k*b.vals[s] + m
-			} else {
-				parts := make([]float64, len(ks))
-				for i, c := range ks {
-					parts[i] = t(c)
+					parts = append(parts, m)
 				}
 				v = k*b.vals[s] + PySum(parts)
 			}
@@ -382,6 +376,11 @@ func (c *Calibrator) Observe(sp *Span, p float64) {
 	}
 	s.w = append(s.w, w)
 }
+
+// DiscardPeriod is Calibrator.discard_period: drop the open period's samples without a
+// rebuild.  For a decider whose table comes from elsewhere (an agent under a central), which
+// never closes a period of its own.
+func (c *Calibrator) DiscardPeriod() { c.cur = map[TableKey]*samples{} }
 
 // EndPeriod is Calibrator.end_period: close the period, purge the frozen
 // services' samples of this period, rebuild from the window.  frozen == nil

@@ -37,6 +37,49 @@ type CallGraph struct {
 	Root     map[string]string              // route -> root service
 	Children map[string]map[string][]string // route -> service -> callees (sorted)
 	Parallel map[string]map[string]bool     // route -> service -> callees run concurrently
+	// Stages gives, per route and service, the callees as sequential stages: the callees of one
+	// stage run concurrently, a stage starts when the one before it has finished.  A service
+	// without stages follows the Parallel flag (one stage with every callee, or one per callee).
+	Stages map[string]map[string][][]string
+}
+
+// groups returns the callees kids of a service (in the order given) as its sequential stages;
+// a callee no stage names is a stage of its own, after the others (CallGraph.groups in Python).
+func (g *CallGraph) groups(route, svc string, kids []string) [][]string {
+	st, ok := g.Stages[route][svc]
+	if !ok {
+		if len(kids) > 0 && g.parallel(route, svc) {
+			return [][]string{kids}
+		}
+		out := make([][]string, len(kids))
+		for i, c := range kids {
+			out[i] = []string{c}
+		}
+		return out
+	}
+	named := map[string]bool{}
+	var out [][]string
+	for _, group := range st {
+		in := map[string]bool{}
+		for _, c := range group {
+			named[c], in[c] = true, true
+		}
+		var gr []string
+		for _, c := range kids {
+			if in[c] {
+				gr = append(gr, c)
+			}
+		}
+		if len(gr) > 0 {
+			out = append(out, gr)
+		}
+	}
+	for _, c := range kids {
+		if !named[c] {
+			out = append(out, []string{c})
+		}
+	}
+	return out
 }
 
 func (g *CallGraph) kids(route, svc string) []string {

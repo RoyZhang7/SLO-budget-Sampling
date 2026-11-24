@@ -12,6 +12,7 @@ $PY tools/eval/eval_run.py /storage/royno7/stage3/runs/<run_id> [--sim ~/slo-bud
 $PY tools/eval/tables.py /storage/royno7/stage3/runs --volume 0.12 [--scenarios steady saturated] [--seeds 1 2 3] [--json]
 $PY -m pytest -q tools/eval/tests                         # fixture arithmetic
 $PY tools/eval/make_fake_run.py <100 % Jaeger export> OUT [--frac 0.12] [--fault-service socialgraph]   # dev only
+$PY tools/eval/derive_stages.py RUN_DIR... [--merge deploy/callgraph.json --out deploy/callgraph.stages.json]   # sequential stages from the shadows
 ```
 
 `~/bin/recon` is `go build -o ~/bin/recon ./tools/recon`; it runs on the export
@@ -130,6 +131,18 @@ the p95 changes against the first input.
 (every faulted run) into one long CSV: run, scenario, arm, seed, window (before / during the
 fault), edge, host pair and the gap, client and server percentiles.  The gap stays in this CSV and
 the per-run JSON; the summaries leave it out.
+
+## Sequential stages of the call graph
+
+`derive_stages.py RUN_DIR... [--theta 0.99] [--json report.json] [--merge FILE --out FILE]` reads the healthy window of
+the runs' shadows and writes, per service, which callees run together and which group starts after which has finished:
+two callees are sequential when the first one's client span has ended before the second's starts in at least `--theta` of
+the spans that make both calls.  It reports the support (the weakest such fraction between two stages, the strongest
+inside one, the gap between the stages) and leaves out a service whose callees do not fit the pattern.  On four runs (172 780
+healthy spans of every service): composepost `[media, text, uniqueid, user]` then `[hometimeline, poststorage,
+usertimeline]` in 100 % of the spans (inside a stage one callee is done before another starts in at most 0.11 % of them);
+text `[urlshorten, usermention]` together; hometimeline and wrk2api call one service.  The oracle (`--callgraph`) reads
+the `stages` key.
 
 ## Stage 2d trigger comparison
 

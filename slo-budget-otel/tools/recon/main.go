@@ -62,6 +62,20 @@ type report struct {
 	TracesWithRealRoot      int            `json:"traces_with_real_root"`
 	Bridge                  bridgeStats    `json:"bridge_fields"`
 	SynthesizedIDsInOutput  bool           `json:"output_synthesizes_ids"`
+	// ByReason: keep reason / kind ("outlier/server") -> coverage, of kept spans with a slobudget.reason
+	ByReason map[string]*reasonCoverage `json:"by_reason,omitempty"`
+}
+
+// reasonCoverage is what the reconstruction does with the kept spans of one keep reason and kind.
+type reasonCoverage struct {
+	Spans         int `json:"spans"`
+	TraceRootKept int `json:"trace_root_kept"` // the root span of their trace is kept
+	ParentKept    int `json:"parent_kept"`
+	Orphans       int `json:"orphans"`                   // their parent is missing
+	PlacedToKept  int `json:"placed_to_kept_ancestor"`   // of the orphans, by known ids
+	PlacedToRoot  int `json:"placed_to_root_slot"`       // of the orphans, by known ids
+	Open          int `json:"open_by_known_ids"`         // of the orphans
+	ReachesRoot   int `json:"reaches_root_by_known_ids"` // kept parents and known ids lead up to the root or its slot
 }
 
 // bridgeStats describes what `_br` / `_d` carry in the export.
@@ -79,6 +93,7 @@ type traceAcc struct {
 	spans    []recon.Span
 	route    string
 	kept     map[recon.SpanID]recon.Span
+	reason   map[recon.SpanID]string // slobudget.reason
 	synthIn  int
 }
 
@@ -138,7 +153,7 @@ func run(inPath, outPath string, g *recon.CallGraph, opt options) (*report, erro
 	}
 	rep := &report{HoleHistKnownIDs: map[string]int{}, HoleHistFull: map[string]int{}, OrphansByKind: map[string]int{}, PlaceableByKind: map[string]int{},
 		Bridge: bridgeStats{ByKind: map[string]map[string]int{}, BRLengths: map[string]int{}, DLengths: map[string]int{}, DepthByKind: map[string]map[string]int{},
-			BRDepthParity: map[string]int{}, AnchorChecks: map[string]int{}}, SynthesizedIDsInOutput: opt.synthesize}
+			BRDepthParity: map[string]int{}, AnchorChecks: map[string]int{}}, SynthesizedIDsInOutput: opt.synthesize, ByReason: map[string]*reasonCoverage{}}
 	resNames := map[string]string{} // short -> resource service.name seen anywhere
 	for _, tr := range traces {
 		for _, p := range asMap(tr["processes"]) {
@@ -174,6 +189,7 @@ func run(inPath, outPath string, g *recon.CallGraph, opt options) (*report, erro
 		if recon.OneTree(acc.spans, known.Placeholders) {
 			rep.OneTreeAfterKnownIDs++
 		}
+		coverReasons(rep, acc, full.Orphans, known.Placeholders)
 		for _, o := range full.Orphans {
 			rep.Orphans++
 			rep.OrphansByKind[o.Kind]++
@@ -258,12 +274,88 @@ func run(inPath, outPath string, g *recon.CallGraph, opt options) (*report, erro
 	return rep, nil
 }
 
+// coverReasons adds one trace's kept spans to the coverage by keep reason.
+func coverReasons(rep *report, acc traceAcc, orphans []recon.Placement, known []recon.Placeholder) {
+	if len(acc.reason) == 0 {
+		return
+	}
+	class := map[recon.SpanID]string{}
+	for _, o := range orphans {
+		class[o.Span] = o.Class
+	}
+	up := map[recon.SpanID]recon.SpanID{}
+	top := map[recon.SpanID]bool{} // the root span or its slot
+	rootKept := false
+	for _, s := range acc.spans {
+		if s.Parent.IsZero() {
+			rootKept, top[s.ID] = true, true
+		} else {
+			up[s.ID] = s.Parent
+		}
+	}
+	for _, p := range known {
+		if p.Depth == 0 {
+			top[p.ID] = true
+		} else if !p.Parent.IsZero() {
+			up[p.ID] = p.Parent
+		}
+	}
+	reaches := func(id recon.SpanID) bool {
+		for hops := 0; hops < 64; hops++ {
+			if top[id] {
+				return true
+			}
+			next, ok := up[id]
+			if !ok {
+				return false
+			}
+			id = next
+		}
+		return false
+	}
+	for _, s := range acc.spans {
+		reason := acc.reason[s.ID]
+		if reason == "" {
+			continue
+		}
+		c := rep.ByReason[reason+"/"+s.Kind]
+		if c == nil {
+			c = &reasonCoverage{}
+			rep.ByReason[reason+"/"+s.Kind] = c
+		}
+		c.Spans++
+		if rootKept {
+			c.TraceRootKept++
+		}
+		if reaches(s.ID) {
+			c.ReachesRoot++
+		}
+		if s.Parent.IsZero() {
+			continue
+		}
+		cl, orphan := class[s.ID]
+		if !orphan {
+			c.ParentKept++
+			continue
+		}
+		c.Orphans++
+		switch cl {
+		case "kept":
+			c.PlacedToKept++
+		case "root":
+			c.PlacedToRoot++
+		default:
+			c.Open++
+		}
+	}
+}
+
 func ratio(a, b int) float64 { return float64(int(10000*float64(a)/float64(b)+0.5)) / 10000 }
 
 // parseTrace converts one Jaeger trace into the reconstruction's spans and feeds the bridge
 // statistics.
 func parseTrace(tr map[string]any, defaultRoute string, rep *report) traceAcc {
-	acc := traceAcc{route: defaultRoute, kept: map[recon.SpanID]recon.Span{}}
+	acc := traceAcc{route: defaultRoute, kept: map[recon.SpanID]recon.Span{}, reason: map[recon.SpanID]string{}}
 	procs := asMap(tr["processes"])
 	spans, _ := tr["spans"].([]any)
 	type raw struct {
@@ -313,6 +405,8 @@ func parseTrace(tr map[string]any, defaultRoute string, rep *report) traceAcc {
 				if v := asString(tm["value"]); v != "" {
 					acc.route = v
 				}
+			case "slobudget.reason":
+				acc.reason[s.ID] = asString(tm["value"])
 			}
 		}
 		if s.Synthetic {

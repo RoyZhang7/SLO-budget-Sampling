@@ -23,7 +23,8 @@ def import_sim(sim_path: str):
 
 
 def load_callgraph(path: str, CallGraph):
-    """deploy/callgraph.json: {"root": {route: svc}, "children": {route: {svc: [kids]}}, "parallel": {route: {svc: bool}}}."""
+    """deploy/callgraph.json: {"root": {route: svc}, "children": {route: {svc: [kids]}}, "parallel": {route: {svc: bool}}},
+    optionally "stages": {route: {svc: [[callees of the first stage], ...]}} (read into CallGraph.stages)."""
     with open(path, encoding="utf-8") as f:
         g = json.load(f)
     children, parallel = {}, {}
@@ -35,7 +36,13 @@ def load_callgraph(path: str, CallGraph):
             parallel[(route, svc)] = bool(flag)
     for (route, svc) in children:
         parallel.setdefault((route, svc), False)
-    return CallGraph(dict(g.get("root") or {}), children, parallel)
+    cg = CallGraph(dict(g.get("root") or {}), children, parallel)
+    stages = {(route, svc): [list(group) for group in st] for route, by_svc in (g.get("stages") or {}).items() for svc, st in by_svc.items()}
+    if stages:
+        if not hasattr(cg, "stages"):           # an older simulator would split on the parallel flags and say nothing
+            raise ValueError(f"{path} has sequential stages, this simulator's CallGraph does not know them")
+        cg.stages = stages
+    return cg
 
 
 class _Obs:

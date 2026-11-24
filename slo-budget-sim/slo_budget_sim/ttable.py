@@ -9,11 +9,15 @@ own (self) time of each service along the route's call structure:
              client spans.  When O is unavailable it is derived from the
              inclusive quantiles L (L_i minus the callees' L), which is noisier.
     b_i    = SLO * sqrt(O_i) / W              W = sum of sqrt(O) over the contributing
-                                              set (the root's critical structure; under
-                                              a parallel fan-out only the callee with the
+                                              set (the root's critical structure; of the
+                                              callees of one stage only the one with the
                                               largest inclusive L contributes)
-    T_i    = b_i + sum/max of callees' T      inclusive budget; T_root = SLO after
-                                              normalisation
+    T_i    = b_i + sum over the stages of     inclusive budget; T_root = SLO after
+             the largest callee's T           normalisation
+
+A service's callees form sequential stages (CallGraph.stages); within a stage they run
+concurrently.  Without stages the parallel flag decides: one stage with every callee, or one
+stage per callee.
 
 A span is an outlier when its inclusive duration exceeds T_i (or its status is
 not OK).  Tables are keyed by (route, class, service); a class with fewer than
@@ -55,12 +59,7 @@ def own_from_inclusive(L: dict[str, float], graph: CallGraph, route: str) -> dic
     own = {}
     for s, Ls in L.items():
         kids = [c for c in graph.children.get((route, s), []) if c in L and c != s]
-        if not kids:
-            cover = 0.0
-        elif graph.parallel.get((route, s), False):
-            cover = max(L[c] for c in kids)
-        else:
-            cover = sum(L[c] for c in kids)
+        cover = sum(max(L[c] for c in group) for group in graph.groups(route, s, kids)) if kids else 0.0
         own[s] = max(EPS_OWN, Ls - cover)
     return own
 
@@ -90,8 +89,8 @@ def split_budgets(slo: float, L: dict[str, float], graph: CallGraph, route: str,
     def kids_of(s):
         return [c for c in graph.children.get((route, s), []) if c in own and c != s]
 
-    # contributing set: follow every callee of a sequential node, only the
-    # longest callee of a parallel node
+    # contributing set: follow the longest callee of every stage (every callee of a
+    # sequential node, only the longest callee of a parallel node)
     contrib, stack = set(), [root]
     while stack:
         s = stack.pop()
@@ -99,12 +98,8 @@ def split_budgets(slo: float, L: dict[str, float], graph: CallGraph, route: str,
             continue
         contrib.add(s)
         ks = kids_of(s)
-        if not ks:
-            continue
-        if graph.parallel.get((route, s), False):
-            stack.append(max(ks, key=lambda c: L[c]))
-        else:
-            stack.extend(ks)
+        if ks:
+            stack.extend(max(group, key=lambda c: L[c]) for group in graph.groups(route, s, ks))
     W = sum(math.sqrt(own[s]) for s in sorted(contrib))      # fixed order: bit-identical across processes and the Go port
     b = {s: slo * math.sqrt(own[s]) / W for s in own}
 
@@ -127,10 +122,8 @@ def split_budgets(slo: float, L: dict[str, float], graph: CallGraph, route: str,
             ks = kids_of(s)
             if not ks:
                 v = k * b[s]
-            elif graph.parallel.get((route, s), False):
-                v = k * b[s] + max(t(c) for c in ks)
-            else:
-                v = k * b[s] + sum(t(c) for c in ks)
+            else:                      # the stages run one after the other, the callees of a stage together
+                v = k * b[s] + sum(max(t(c) for c in group) for group in graph.groups(route, s, ks))
             visiting.discard(s)
             T[s] = v
             return v
@@ -216,6 +209,12 @@ class Calibrator:
         d.append(span.duration)
         o.append(span.own if span.own > 0.0 else span.duration)
         w.append(1.0 / p if p > 0 else 1.0)
+
+    def discard_period(self) -> None:
+        """Drop the open period's samples without a rebuild.  For a decider whose table comes from
+        elsewhere (an agent under a central), which would otherwise keep a sample per kept span for
+        as long as it runs: it never closes a period of its own."""
+        self._cur = {}
 
     def end_period(self, frozen: set[str] | None = None) -> None:
         """Close the period.  Samples of `frozen` services from this period are

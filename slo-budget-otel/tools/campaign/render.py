@@ -341,6 +341,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--arm", required=True, choices=ARMS)
     ap.add_argument("--volume", type=float, required=True)
+    ap.add_argument("--rate", type=float, default=100, help="entry rate (req/s) the target is a fraction of: V* = volume x 115 x rate spans per 5 s")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--image", required=True)
     ap.add_argument("--no-tee", action="store_true")
@@ -352,7 +353,7 @@ def main() -> int:
     ap.add_argument("--shares", default='{"node-1": 0.47, "node-2": 0.30, "node-3": 0.23}')
     ap.add_argument("--print", choices=["agent", "central", "tee"], help="print one collector config only")
     a = ap.parse_args()
-    v_star = round(a.volume * SPANS_PER_PERIOD)
+    v_star = round(a.volume * SPANS_PER_PERIOD * (a.rate / 100))
     tee = not a.no_tee
     agent_port = 4319 if tee else 4317
     agent = agent_config(a.arm, a.volume, v_star, a.seed, agent_port, json.loads(a.shares))

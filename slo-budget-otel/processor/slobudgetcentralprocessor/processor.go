@@ -394,14 +394,32 @@ func LoadCallGraph(path string) (*slobudget.CallGraph, error) {
 		return nil, err
 	}
 	var g struct {
-		Root     map[string]string              `json:"root"`
-		Children map[string]map[string][]string `json:"children"`
-		Parallel map[string]map[string]bool     `json:"parallel"`
+		Root     map[string]string                `json:"root"`
+		Children map[string]map[string][]string   `json:"children"`
+		Parallel map[string]map[string]bool       `json:"parallel"`
+		Stages   map[string]map[string][][]string `json:"stages"` // callees by sequential stage; absent: the parallel flag
 	}
 	if err := json.Unmarshal(raw, &g); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	return &slobudget.CallGraph{Root: g.Root, Children: g.Children, Parallel: g.Parallel}, nil
+	for route, bySvc := range g.Stages { // a stage may only name callees of the service, each once
+		for svc, stages := range bySvc {
+			kids := map[string]bool{}
+			for _, c := range g.Children[route][svc] {
+				kids[c] = true
+			}
+			seen := map[string]bool{}
+			for _, group := range stages {
+				for _, c := range group {
+					if !kids[c] || seen[c] {
+						return nil, fmt.Errorf("%s: stages of (%s, %s) do not match its callees: %s", path, route, svc, c)
+					}
+					seen[c] = true
+				}
+			}
+		}
+	}
+	return &slobudget.CallGraph{Root: g.Root, Children: g.Children, Parallel: g.Parallel, Stages: g.Stages}, nil
 }
 
 var _ = pcommon.NewTraceIDEmpty

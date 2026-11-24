@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
-"""Sanity checks on one collected and evaluated Stage 3 run.  Prints OK or one line per
-problem; a problem halts the queue (postprocess.sh writes STOP), because the brief says to
-stop and report when a run exposes a defect.
+"""Sanity checks on one collected Stage 3 run.  Prints OK or one line per problem; a problem
+halts the queue (run_one.sh and postprocess.sh write STOP), because the brief says to stop and
+report when a run exposes a defect.
 
-  python3 tools/campaign/sanity.py <run_dir>
+  python3 tools/campaign/sanity.py --pre <run_dir>   right after the run, without the Jaeger export
+  python3 tools/campaign/sanity.py <run_dir>         after the export and the evaluation
+
+The pre-check covers what the run directory holds at once: wrk2's completed requests and non-2xx
+responses, the collectors' restarts, the fault or burst record, the agents' update versions (chosen
+family), and the admitted volume against the target, taken from the central's exporter counters
+(start and end scrapes; they match the evaluation's vol_ratio within 1 % on 171 runs of every arm).
+The full check repeats all of it with the volume from the evaluation, plus the evaluation's shadow
+size.  A crash of the pre-check itself is a note, not a problem: the full check still runs.
 """
 from __future__ import annotations
 
@@ -14,6 +22,9 @@ import sys
 from datetime import datetime, timezone
 
 SLOBUDGET_ARMS = ("chosen", "threshold", "keep-parent")
+VOLUME_SCENARIOS = ("steady", "saturated", "noisy_neighbour", "cascade", "cold_start")
+VOLUME_RANGE = (0.6, 1.3)
+SENT_SPANS = re.compile(r"^otelcol_exporter_sent_spans_total\{([^}]*)\}\s+([0-9.eE+-]+)")
 
 
 def central_checks(rd: str, meta: dict) -> list:
@@ -51,10 +62,9 @@ def central_checks(rd: str, meta: dict) -> list:
     return probs
 
 
-def main() -> int:
-    rd = sys.argv[1]
+def run_checks(rd: str, meta: dict) -> list:
+    """wrk2's result, the collectors' restarts and the fault or burst record."""
     probs = []
-    meta = json.load(open(os.path.join(rd, "meta.json")))
     wrk = open(os.path.join(rd, "wrk.log")).read() if os.path.exists(os.path.join(rd, "wrk.log")) else ""
     m = re.search(r"(\d+) requests in", wrk)
     reqs = int(m.group(1)) if m else 0
@@ -72,21 +82,94 @@ def main() -> int:
     fl = os.path.join(rd, "fault.log")
     if os.path.exists(fl) and "failed" in open(fl).read():
         probs.append("fault injection failed on some container: " + open(fl).read().strip().replace("\n", " | ")[:300])
+    return probs
+
+
+def in_range(ratio: float, meta: dict, source: str) -> list:
+    if meta["scenario"] in VOLUME_SCENARIOS and not (VOLUME_RANGE[0] <= ratio <= VOLUME_RANGE[1]):
+        return [f"admitted volume over the collection volume target out of range: {ratio:.3f} ({source})"]
+    return []
+
+
+def counter_volume(rd: str, meta: dict) -> float | None:
+    """Spans the central sent on between the start and the end scrape, over the target for the load."""
+    def sent(name: str) -> float | None:
+        total, seen = 0.0, False
+        path = os.path.join(rd, "telemetry", name)
+        if os.path.exists(path):
+            for ln in open(path, errors="replace"):
+                m = SENT_SPANS.match(ln)
+                if m and 'exporter="otlp' in m.group(1):
+                    total, seen = total + float(m.group(2)), True
+        return total if seen else None
+
+    end = sent("central-end.prom")
+    if end is None:
+        return None
+    target = meta["v_star"] * meta["dur_s"] / meta.get("period_s", 5)
+    return (end - (sent("central-start.prom") or 0.0)) / target
+
+
+def summary_checks(rd: str, meta: dict) -> list:
+    probs = []
     sp = os.path.join(rd, "summary.json")
-    if os.path.exists(sp):
-        s = json.load(open(sp))
-        vr = s.get("vol_ratio")
-        if isinstance(vr, (int, float)) and meta["scenario"] in ("steady", "saturated", "noisy_neighbour", "cascade", "cold_start") and not (0.6 <= vr <= 1.3):
-            probs.append(f"volume over V* out of range: {vr:.3f}")
-        sh = s.get("shadow_spans")
-        exp = 23 * meta["rps"] * meta["dur_s"]
-        if isinstance(sh, (int, float)) and sh < 0.9 * exp:
-            probs.append(f"shadow has {sh} spans, expected about {exp}")
+    if not os.path.exists(sp):
+        return ["no summary.json (evaluation did not run)"]
+    s = json.load(open(sp))
+    vr = s.get("vol_ratio")
+    if isinstance(vr, (int, float)):
+        probs += in_range(vr, meta, "evaluation")
+    sh = s.get("shadow_spans")
+    exp = 23 * meta["rps"] * meta["dur_s"]
+    if isinstance(sh, (int, float)) and sh < 0.9 * exp:
+        probs.append(f"shadow has {sh} spans, expected about {exp}")
+    return probs
+
+
+def load_meta(rd: str) -> dict:
+    with open(os.path.join(rd, "meta.json")) as f:
+        return json.load(f)
+
+
+def pre_check(rd: str) -> tuple[list, list]:
+    """Problems and notes from what the run directory holds before any export."""
+    try:
+        meta = load_meta(rd)
+    except (OSError, ValueError) as e:
+        return [f"meta.json is missing or unreadable ({type(e).__name__})"], []
+    probs, notes = run_checks(rd, meta), []
+    ratio = counter_volume(rd, meta)
+    if ratio is None:
+        notes.append("no exporter counters from the central: the admitted volume was not checked")
     else:
-        probs.append("no summary.json (evaluation did not run)")
+        probs += in_range(ratio, meta, "central exporter counters")
     if meta["arm"] in SLOBUDGET_ARMS:
         probs += central_checks(rd, meta)
+    return probs, notes
+
+
+def full_check(rd: str) -> list:
+    try:
+        meta = load_meta(rd)
+    except (OSError, ValueError) as e:
+        return [f"meta.json is missing or unreadable ({type(e).__name__})"]
+    probs = run_checks(rd, meta) + summary_checks(rd, meta)
+    if meta["arm"] in SLOBUDGET_ARMS:
+        probs += central_checks(rd, meta)
+    return probs
+
+
+def main() -> int:
+    if sys.argv[1:2] == ["--pre"]:
+        try:
+            probs, notes = pre_check(sys.argv[2])
+        except Exception as e:                                  # noqa: BLE001 - a defect of the check, not of the run
+            probs, notes = [], [f"the pre-check failed and was ignored: {type(e).__name__}: {e}"]
+    else:
+        probs, notes = full_check(sys.argv[1]), []
     print("OK" if not probs else "\n".join(probs))
+    for n in notes:
+        print("note: " + n)
     return 0
 
 

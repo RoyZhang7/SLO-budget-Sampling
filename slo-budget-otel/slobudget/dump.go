@@ -22,9 +22,10 @@ type EventsDump struct {
 	RNGSeed   uint64             `json:"rng_seed"`
 	RoutesSLO map[string]float64 `json:"routes_slo"`
 	Graph     struct {
-		Root     map[string]string              `json:"root"`
-		Children map[string]map[string][]string `json:"children"`
-		Parallel map[string]map[string]bool     `json:"parallel"`
+		Root     map[string]string                `json:"root"`
+		Children map[string]map[string][]string   `json:"children"`
+		Parallel map[string]map[string]bool       `json:"parallel"`
+		Stages   map[string]map[string][][]string `json:"stages"`
 	} `json:"graph"`
 	Hosts    []string           `json:"hosts"`
 	HostSkew map[string]float64 `json:"host_skew"`
@@ -80,7 +81,7 @@ func LoadEvents(path string) (*EventsDump, *Corpus, error) {
 	n := len(d.Spans.SpanID)
 	c := &Corpus{Name: d.Name, RoutesSLO: d.RoutesSLO, Hosts: d.Hosts, HostSkew: d.HostSkew, Period: d.Period, T0: d.T0,
 		Services: d.Services, Spans: make([]Span, n)}
-	c.Graph = &CallGraph{Root: d.Graph.Root, Children: d.Graph.Children, Parallel: d.Graph.Parallel}
+	c.Graph = &CallGraph{Root: d.Graph.Root, Children: d.Graph.Children, Parallel: d.Graph.Parallel, Stages: d.Graph.Stages}
 	for i := 0; i < n; i++ {
 		c.Spans[i] = Span{Idx: i, SpanID: d.Spans.SpanID[i], TraceID: d.Spans.TraceID[i], ParentIdx: d.Spans.ParentIdx[i],
 			IsRoot: d.Spans.ParentIdx[i] < 0, Service: d.Spans.Service[i], Host: d.Spans.Host[i], Start: d.Spans.Start[i],

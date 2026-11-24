@@ -151,5 +151,5 @@ func (gl *graphLearner) rebuild() {
 }
 
 func (gl *graphLearner) export() map[string]any {
-	return map[string]any{"fixed": gl.fixed, "root": gl.graph.Root, "children": gl.graph.Children, "parallel": gl.graph.Parallel}
+	return map[string]any{"fixed": gl.fixed, "root": gl.graph.Root, "children": gl.graph.Children, "parallel": gl.graph.Parallel, "stages": gl.graph.Stages}
 }

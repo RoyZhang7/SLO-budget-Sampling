@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # The knee of the latency curve for the overhead experiment (node-0, after the campaign): config C
-# (record everything into our agent at 12 %), one reseed, a 30-s
-# warm-up, then RATES back to back, 2 minutes each.  The higher rate of the experiment is the
-# highest rate whose p99 stays within KNEE_X (2) x the p99 at the first rate (100 req/s) and
-# whose achieved rate is within 1 % of the target; it is printed last ("knee rate: N").
+# (record everything into our agent at a collection volume target of 12 % of the spans at the
+# step's rate), one reseed, then per rate: fresh agents and central with that target, a 30-s
+# warm-up, 2 minutes of load.  The higher rate of the experiment is the highest rate whose p99
+# stays within KNEE_X (2) x the p99 at the first rate (100 req/s) and whose achieved rate is
+# within 1 % of the target; it is printed last ("knee rate: N").
 #   tools/overhead/knee.sh        (log and wrk logs in $STAGE3/overhead/knee/)
 set -u
 cd "$(dirname "$0")/../.."
@@ -32,15 +33,17 @@ WORKLOADS=$(kubectl get deploy,ds -o name | grep -- '-service-pb-es-ctr' | grep 
 for w in $WORKLOADS; do kubectl set env "$w" OTEL_SAMPLE_RATIO- SLO_BUDGET_PORT- BRIDGE_KIND=pb >> "$RD/run.log" 2>&1; done
 for w in $WORKLOADS; do kubectl rollout status "$w" --timeout=300s >> "$RD/run.log" 2>&1; done
 bash "$MOD/tools/reseed.sh" > "$RD/reseed.log" 2>&1 || { log "reseed failed"; exit 1; }
-python3 "$MOD/tools/campaign/render.py" --arm chosen --volume 0.12 --seed 1 --image "$IMG" --no-tee > "$RD/manifests.yaml"
-kubectl apply -f "$RD/manifests.yaml" >> "$RD/run.log" 2>&1
-kubectl rollout status deploy/slobudget-central --timeout=180s >> "$RD/run.log" 2>&1
-kubectl rollout status ds/otelcol-pb-es-ctr --timeout=300s >> "$RD/run.log" 2>&1
-sleep 15
-first=${RATES%% *}
-wrk -t2 -c10 -d30s -s "$LUA" "$URL" -R"$first" > "$RD/wrk-warmup.log" 2>&1
 for r in $RATES; do
     c=$(( r / 10 > 10 ? r / 10 : 10 ))
+    # agents and central new at every rate: the target is 12 % of the spans at this rate (an agent
+    # ignores a restarted central until its version passes the agent's, so both restart)
+    python3 "$MOD/tools/campaign/render.py" --arm chosen --volume 0.12 --rate "$r" --seed 1 --image "$IMG" --no-tee > "$RD/manifests-$r.yaml"
+    kubectl apply -f "$RD/manifests-$r.yaml" >> "$RD/run.log" 2>&1
+    kubectl rollout restart deploy/slobudget-central ds/otelcol-pb-es-ctr >> "$RD/run.log" 2>&1
+    kubectl rollout status deploy/slobudget-central --timeout=180s >> "$RD/run.log" 2>&1
+    kubectl rollout status ds/otelcol-pb-es-ctr --timeout=300s >> "$RD/run.log" 2>&1
+    sleep 15
+    wrk -t2 -c"$c" -d30s -s "$LUA" "$URL" -R"$r" > "$RD/wrk-warmup-$r.log" 2>&1
     RANDOM_SEED=1 wrk -t2 -c"$c" -d"${STEP}"s -L -s "$LUA" "$URL" -R"$r" > "$RD/wrk-$r.log" 2>&1
     log "rate $r: $(grep -E '^ *(50.000|99.000)%|Requests/sec' "$RD/wrk-$r.log" | tr -s ' ' | tr '\n' ' ')"
     sleep 15

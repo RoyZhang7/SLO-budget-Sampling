@@ -29,7 +29,7 @@ type Config struct {
 	// DefaultRoute / DefaultClass label spans that carry no slo.r / slo.c attribute.
 	DefaultRoute string `mapstructure:"default_route"`
 	DefaultClass string `mapstructure:"default_class"`
-	// CallGraphFile fixes the call structure (route -> {root, children, parallel});
+	// CallGraphFile fixes the call structure (route -> {root, children, parallel, stages});
 	// without it the graph is learned from the kept spans.
 	CallGraphFile string `mapstructure:"call_graph_file"`
 	// Services fixes the service count of the relative N_need; 0 = services seen.

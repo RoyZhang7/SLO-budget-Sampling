@@ -169,8 +169,12 @@ func (s *Sampler) Snapshot(host string, period int64) AgentStats {
 	return st
 }
 
-// ResetPeriod starts a new period on an agent: counters to zero, pools refilled.
+// ResetPeriod starts a new period on an agent: counters to zero, pools refilled, the kept
+// spans' calibration samples dropped (an agent's table comes from the central, so its own
+// calibrator never closes a period and would otherwise keep a sample per kept span for as
+// long as it runs).
 func (s *Sampler) ResetPeriod() {
+	s.Cal.DiscardPeriod()
 	s.resetCounters()
 	s.setPools()
 }

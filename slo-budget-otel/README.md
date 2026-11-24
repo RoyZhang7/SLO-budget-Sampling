@@ -69,7 +69,18 @@ boundary).  V* is a fixed `v_star`, or `v_star_frac` x the observed spans per pe
 is ignored); the hard cap `cap_factor` x V* span units per period is applied
 first come first served before the exporter, and with an adaptive V* only
 after two full periods (a pre-load trickle otherwise collapses the cap).  The call structure comes from
-`call_graph_file` or is learned from kept parent/child pairs.  `GET
+`call_graph_file` or is learned from kept parent/child pairs.  The file's
+`parallel` flag says per service that all its callees run together or one after the
+other; `stages` (`{route: {service: [[callees], ...]}}`) says which run together and
+which group follows which, and takes the flag's place (a callee no stage names comes
+last, on its own): T_i = b_i + the sum over the stages of the largest callee T, so the
+shares along every path a request takes sum to at most the SLO.  composepost has two
+stages, which the flag cannot say (one parallel group: its real paths sum to 1.6 x the
+SLO).  `deploy/callgraph.stages.json` has the stages `tools/eval/derive_stages.py`
+derived from complete traces.  It is not deployed: the campaign runs on
+`deploy/callgraph.json` and an image that ignores `stages`; to use it, rebuild and
+`render.py --callgraph deploy/callgraph.stages.json` (and give the evaluation the same
+file).  The learned graph has the flag only.  `GET
 /slobudget/status` shows the table, the period history and the graph.
 
 ## Build and run
@@ -77,6 +88,7 @@ after two full periods (a pre-load trickle otherwise collapses the cap).  The ca
 ```
 go test ./... && (cd sdk && go test ./...)                  # unit tests
 python tools/difftest.py                                    # 21 Python dumps vs the Go replay (about 1 GB of dumps)
+python tools/difftest.py --stages deploy/callgraph.stages.json   # the same with sequential stages
 tools/build-node0.sh                                        # on node-0: tests, benchmark, ocb build, image push
 tools/run_cluster.sh                                        # on node-0: deploy, 10 min wrk2 at 100 rps, CPU hog min 4-7, export, restore
 ROOT_POLICY=pin RECON=1 ARM=pin-recon tools/run_cluster.sh  # arms: root policy on_demand|pin, reconstruction on|off
@@ -194,8 +206,12 @@ on node-0 as the deploy user; nothing needs root.
 6. The Stage 3 campaign: `tools/campaign/queue.sh` under nohup works through
    `$STAGE3/queue.txt` (`make_queue.py`), one `run_one.sh <arm> <scenario>
    <volume> <seed>` per job and `postprocess.sh` (export, `tools/eval`, the gap
-   per call edge of faulted runs, `sanity.py`) in the background; `touch
-   $STAGE3/STOP` pauses it between runs.  Faults (`faults.env`,
+   per call edge of faulted runs, `sanity.py`) in the background.  `sanity.py
+   --pre` runs at the end of every run, before the export (wrk2's rate and
+   non-2xx, collector restarts, the fault record, the agents' update versions,
+   the admitted volume from the central's counters); a problem there or in the
+   full check writes `$STAGE3/STOP`, which pauses the queue between runs (`touch
+   $STAGE3/STOP` does the same by hand).  Faults (`faults.env`,
    `tools/hog/fault.sh`): saturated, cascade and cold_start burn CPU inside the
    target container under a CPU limit on that container (`burn`: `docker update
    --cpu-quota/--cpu-period`, then the spinner), so the fault stays in the

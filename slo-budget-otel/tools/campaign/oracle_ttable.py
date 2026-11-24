@@ -66,6 +66,8 @@ def main() -> int:
     graph = CallGraph({r: s for r, s in cg["root"].items()},
                       {(r, s): list(k) for r, ch in cg["children"].items() for s, k in ch.items()},
                       {(r, s): bool(v) for r, ch in cg.get("parallel", {}).items() for s, v in ch.items()})
+    for r, by_svc in (cg.get("stages") or {}).items():      # fails on a simulator whose CallGraph has no stages
+        graph.stages.update({(r, s): [list(g) for g in st] for s, st in by_svc.items()})
     spans = {}                     # span id -> (trace, parent, service, kind, start_ns, end_ns, ok, route)
     for line in lines(a.shadow):
         d = json.loads(line)

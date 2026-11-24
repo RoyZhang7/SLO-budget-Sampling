@@ -37,10 +37,26 @@ class Span:
 class CallGraph:
     """Service-level call structure per route, learned from complete traces or
     declared by the generator.  A service appearing at several positions of a
-    route is one node; children are the union of its callees."""
+    route is one node; children are the union of its callees.
+
+    `stages` gives, per (route, service), the service's callees as sequential
+    stages: callees in one stage run concurrently, a stage starts when the one
+    before it has finished.  A service without stages follows the parallel flag
+    (one stage with every callee, or one stage per callee)."""
     root: dict[str, str]                               # route -> root service
     children: dict[tuple[str, str], list[str]]         # (route, service) -> callee services
     parallel: dict[tuple[str, str], bool]              # (route, service) -> callees run concurrently
+    stages: dict[tuple[str, str], list[list[str]]] = field(default_factory=dict)     # (route, service) -> callees by stage
+
+    def groups(self, route: str, service: str, kids: list[str]) -> list[list[str]]:
+        """The callees `kids` of a service (a sublist, in the order given) as its sequential
+        stages.  A callee that no stage names is a stage of its own, after the others."""
+        st = self.stages.get((route, service))
+        if st is None:
+            return [list(kids)] if kids and self.parallel.get((route, service), False) else [[c] for c in kids]
+        named = {c for group in st for c in group}
+        out = [[c for c in kids if c in group] for group in st]
+        return [g for g in out if g] + [[c] for c in kids if c not in named]
 
     def services(self, route: str) -> list[str]:
         out, seen, stack = [], set(), [self.root[route]]

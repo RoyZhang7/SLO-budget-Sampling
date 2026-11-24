@@ -1,0 +1,12 @@
+{"root": {"compose_post": "wrk2api"},
+ "children": {"compose_post": {
+    "wrk2api": ["composepost"],
+    "composepost": ["hometimeline", "media", "poststorage", "text", "uniqueid", "user", "usertimeline"],
+    "hometimeline": ["socialgraph"], "text": ["urlshorten", "usermention"],
+    "socialgraph": [], "media": [], "poststorage": [], "uniqueid": [], "user": [], "usertimeline": [], "urlshorten": [], "usermention": []}},
+ "parallel": {"compose_post": {"composepost": true, "text": true}},
+ "stages": {"compose_post": {
+    "wrk2api": [["composepost"]],
+    "composepost": [["media", "text", "uniqueid", "user"], ["hometimeline", "poststorage", "usertimeline"]],
+    "hometimeline": [["socialgraph"]],
+    "text": [["urlshorten", "usermention"]]}}}

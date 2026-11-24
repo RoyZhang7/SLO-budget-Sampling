@@ -5,7 +5,8 @@
 # -> the arm's central + agents (fresh, empty table) -> wrk2 ComposePost 10 min at 100 req/s,
 # started on a 5-s period boundary, with the scenario's seeded fault or burst -> drain,
 # telemetry, status, logs -> stop the shadow, restore the stock DaemonSet, remove the central
-# -> postprocess in the background (export, compression, evaluation; serialized).
+# -> meta.json -> sanity.py --pre (no export; a problem writes STOP) -> postprocess in the
+# background (export, compression, evaluation, the full sanity check; serialized).
 # Writes /storage/royno7/stage3/runs/<run_id>/ (meta.json, run.log, collected / failed markers).
 # Faults (faults.env): saturated, cascade and cold_start burn CPU inside the target container
 # under a CPU limit on it (confined to the target); noisy_neighbour (the unconfined spinner on
@@ -236,6 +237,13 @@ meta = {"run_id": "$RUN_ID", "arm": "$ARM", "scenario": "$SCENARIO", "volume_fra
 json.dump(meta, open(os.path.join(rd, "meta.json"), "w"), indent=1)
 PY
 touch "$RD/collected"
+# the checks that need no Jaeger export, at once: a problem halts the queue before the next run
+# (the full check still follows the export, in postprocess.sh)
+python3 "$MOD/tools/campaign/sanity.py" --pre "$RD" > "$RD/precheck.txt" 2>&1
+if ! grep -q '^OK' "$RD/precheck.txt"; then
+    log "pre-check failed: $(head -5 "$RD/precheck.txt" | tr '\n' ' ')"
+    [ "${SANITY:-1}" = 1 ] && echo "$RUN_ID (pre-check): $(head -3 "$RD/precheck.txt" | tr '\n' ' ')" >> "$STAGE3/STOP"
+fi
 log "collected; postprocess queued"
 nohup bash "$MOD/tools/campaign/postprocess.sh" "$RD" >> "$RD/postprocess.log" 2>&1 &
 exit 0

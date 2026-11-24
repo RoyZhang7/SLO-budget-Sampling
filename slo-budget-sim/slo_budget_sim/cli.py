@@ -76,9 +76,14 @@ def cmd_replay(a) -> int:
 
 
 def cmd_dump(a) -> int:
+    stages = None
+    if a.stages:                 # a call graph file with sequential stages (its "stages" key), or that object itself
+        with open(a.stages, "r", encoding="utf-8-sig") as f:
+            obj = json.load(f)
+        stages = obj.get("stages", obj)
     for sc in a.scenario:
         for sd in a.seeds:
-            ev, de = dump_replay(sc, sd, a.volume_frac, Path(a.out), a.arm, _parse_overrides(a.set))
+            ev, de = dump_replay(sc, sd, a.volume_frac, Path(a.out), a.arm, _parse_overrides(a.set), stages=stages)
             print(f"{sc} seed {sd}: {ev.name} {ev.stat().st_size // 1024} KB, {de.name} {de.stat().st_size // 1024} KB")
     return 0
 
@@ -133,6 +138,7 @@ def main(argv=None) -> int:
     d.add_argument("--volume-frac", type=float, default=0.12)
     d.add_argument("--arm", default="chosen-v2", choices=ALL_ARMS)
     d.add_argument("--set", nargs="*", metavar="KEY=VALUE", help="BudgetConfig overrides")
+    d.add_argument("--stages", metavar="FILE", help="call graph file whose \"stages\" the corpora's graphs get (sequential stages per service)")
     d.add_argument("--out", default="dumps")
     d.set_defaults(func=cmd_dump)
 

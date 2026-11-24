@@ -7,8 +7,10 @@ Per config and rate, the mean over the repeats with the spread (min-max): wrk2's
 p50 / p99 and achieved req/s; CPU per request (ms of CPU per completed request) of the traced app
 pods (the *-service-pb-es-ctr containers, wrk2api included) and, apart, of the data stores (the
 *-db-* Mongo and *-cache-* pods); and CPU (cores, averaged over the 5-min load) of the agent DaemonSet on the
-three app nodes, the central collector (config C) and the trace backend (Jaeger, Elasticsearch).
-CPU comes from two kubelet snapshots around the load (cpu_snapshot.py).
+three app nodes, the central collector (configs C and D) and the trace backend (Jaeger, Elasticsearch).
+CPU comes from two kubelet snapshots around the load (cpu_snapshot.py).  For C and D also the spans
+the central admitted per 5-s period over the spans offered at the rate (23 per request), the check
+that they keep the 12 % of B (central.log, the cap gate's records).
 """
 from __future__ import annotations
 
@@ -65,6 +67,28 @@ def cpu_by_group(rd: str) -> tuple[dict, float]:
     return out, secs
 
 
+SPANS_PER_REQUEST = 23
+
+
+def kept_share(rd: str, m: dict) -> float:
+    """Mean admitted spans per full period inside the load (the cap gate's records) over the offered spans."""
+    p = os.path.join(rd, "central.log")
+    if not os.path.exists(p):
+        return float("nan")
+    adm = []
+    for ln in open(p, errors="replace"):
+        if "capgate period" not in ln or "{" not in ln:
+            continue
+        try:
+            g = json.loads(ln[ln.index("{"):])
+        except ValueError:
+            continue
+        per = g.get("period", -1)
+        if per * 5 >= m["t0"] + 5 and (per + 1) * 5 <= m["t1"]:
+            adm.append(float(g.get("admitted", 0)))
+    return st.mean(adm) / (SPANS_PER_REQUEST * 5 * m["rate"]) if adm else float("nan")
+
+
 def load(root: str) -> list[dict]:
     rows = []
     for mp in sorted(glob.glob(os.path.join(root, "*-r*-*", "meta.json"))):
@@ -78,7 +102,7 @@ def load(root: str) -> list[dict]:
         rows.append({"cfg": m["config"], "rate": m["rate"], "rep": m["rep"], **w,
                      "app_ms_per_req": 1000 * cpu.get("app", 0.0) / n, "stores_ms_per_req": 1000 * cpu.get("stores", 0.0) / n,
                      "agent_cores": cpu.get("agent", 0.0) / secs, "central_cores": cpu.get("central", 0.0) / secs,
-                     "backend_cores": cpu.get("backend", 0.0) / secs})
+                     "backend_cores": cpu.get("backend", 0.0) / secs, "kept_share": kept_share(rd, m)})
     return rows
 
 
@@ -99,14 +123,14 @@ def main() -> int:
     rows = load(a.root)
     cols = [("p50 ms", "p50"), ("p99 ms", "p99"), ("req/s", "rps"), ("app CPU ms/request", "app_ms_per_req"),
             ("stores CPU ms/request", "stores_ms_per_req"), ("agent cores", "agent_cores"),
-            ("central cores", "central_cores"), ("Jaeger + ES cores", "backend_cores")]
+            ("central cores", "central_cores"), ("Jaeger + ES cores", "backend_cores"), ("kept / offered spans (C, D)", "kept_share")]
     lines = ["| config | rate | repeats | " + " | ".join(c for c, _ in cols) + " |", "|---" * (3 + len(cols)) + "|"]
     for rate in sorted({r["rate"] for r in rows}):
         for cfg in CONFIGS:
             rs = [r for r in rows if r["cfg"] == cfg and r["rate"] == rate]
             if not rs:
                 continue
-            lines.append(f"| {cfg}: {CONFIGS[cfg]} | {rate} | {len(rs)} | " + " | ".join(cell([r[k] for r in rs]) for _, k in cols) + " |")
+            lines.append(f"| {cfg}: {CONFIGS[cfg]} | {rate} | {len(rs)} | " + " | ".join(cell([r[k] for r in rs], "{:.3f}" if k == "kept_share" else "{:.2f}") for _, k in cols) + " |")
     text = "\n".join(lines) + "\n"
     if a.md:
         open(a.md, "w", encoding="utf-8").write(text)

@@ -77,7 +77,10 @@ id, then the anchor of a server span.
 `placeable_by_known_ids` = kept + root.  `hole_hist_full` counts the
 placeholders between the orphan and its nearest real ancestor or the root in
 the full reconstruction.  `traces_one_tree_after_known_ids_only` reconstructs
-without synthesised ids.
+without synthesised ids.  `by_reason` has the same classes per keep reason and kind
+(`outlier/server`, `plan/client`, ...; arms that stamp `slobudget.reason`): spans, the
+root span of their trace kept, parent kept, orphans by class, and spans that reach
+the root (or its slot) over kept parents and known ids.
 
 ### The three Stage 2b exports (10 min, 100 req/s, collection volume target 12 %)
 
