@@ -2,8 +2,8 @@
 # (see README, "Runbook: the cluster").
 .PHONY: test vet build image reseed reseed-check
 
-test:            ## unit tests of the module and the W3C issuer
-	go test ./... && cd sdk && go test ./...
+test:            ## unit tests of the module, the W3C issuer and the arrival program
+	go test ./... && (cd sdk && go test ./...) && cd arrivald && go test ./...
 
 vet:
 	go vet ./...

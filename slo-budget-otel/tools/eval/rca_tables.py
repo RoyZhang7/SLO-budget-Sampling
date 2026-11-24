@@ -13,7 +13,9 @@ noisy_neighbour shows RCAEval's scoring only.  In each cell the headline counts 
 with no pre-fault span: KeyError on the normal statistics; no ranking) as a miss; when a run
 crashed, the ranked-only numbers follow in parentheses, and the last table counts the crashes per
 arm and volume.  noisy_neighbour is scored against the node-level truth, the other scenarios
-against the culprit.
+against the culprit.  A run with an INVALID file counts only as full data (its 100 % export is
+unaffected).  The burner scenarios' rows also show where the load's bursts fell in the burner's
+quota period (burst_phase.json of burst_phase.py), by seed.
 """
 from __future__ import annotations
 
@@ -36,7 +38,14 @@ def load(root: str) -> list[dict]:
         if os.path.basename(os.path.dirname(p)).startswith(("2d-", "invalid-", "smoke-")):
             continue
         with open(p, encoding="utf-8") as f:
-            out.append(json.load(f))
+            r = json.load(f)
+        r["_invalid"] = os.path.exists(os.path.join(os.path.dirname(p), "INVALID"))
+        try:
+            with open(os.path.join(os.path.dirname(p), "burst_phase.json"), encoding="utf-8") as f:
+                r["_burst"] = json.load(f)["after_refresh_ms"]
+        except (OSError, ValueError, KeyError):
+            r["_burst"] = None
+        out.append(r)
     return out
 
 
@@ -89,6 +98,12 @@ def _vol(r: dict) -> float:
     return float(r["volume_frac"])
 
 
+def bursts(runs: list[dict]) -> str:
+    """The bursts' positions after the refresh (ms), one per run in seed order."""
+    vals = [r["_burst"] for r in sorted(runs, key=lambda r: int(r.get("seed", -1)))]
+    return " / ".join(f"{v:.1f}" if v is not None else "?" for v in vals) if any(v is not None for v in vals) else "-"
+
+
 def tables(runs: list[dict], volume: float | None) -> str:
     lines = []
     vols = sorted({_vol(r) for r in runs}) if volume is None else [volume]
@@ -98,30 +113,32 @@ def tables(runs: list[dict], volume: float | None) -> str:
             if not rs:
                 continue
             sfxs = ("",) if sc == "noisy_neighbour" else ("", "_callee")
+            burner = any(r["_burst"] is not None for r in rs)
             header = ("| arm | variant | runs | " + " | ".join(f"{NAMES[m]}, {'callee credit' if sfx else 'RCAEval scoring'}"
                                                            for m in METHODS for sfx in sfxs)
-                      + " | normal set spans/trace | fault set spans/trace |")
+                      + " | normal set spans/trace | fault set spans/trace |" + (" burst after the refresh, by seed (ms) |" if burner else ""))
             truth = "node-level truth (a service only on the culprit's node)" if sc == "noisy_neighbour" else "single culprit"
             lines += [f"### {sc.replace('_', '-')}, collection volume target {vol:.0%}, {truth}", "",
                       "Acc@1 / Acc@3 / MRR over every scored run, a crash counting as a miss; when runs crashed, the "
-                      "ranked-only numbers follow in parentheses.", "", header, "|---" * (5 + 2 * len(sfxs)) + "|"]
+                      "ranked-only numbers follow in parentheses.", "", header, "|---" * (5 + 2 * len(sfxs) + burner) + "|"]
             sh = [r["variants"].get("shadow") for r in rs if r["variants"].get("shadow")]
             lines.append(f"| (every run) | full data (100 % shadow) | {len(sh)} | {cells(sh, sfxs)} | "
                          f"{_mean([v['normal_set']['spans_per_trace'] for v in sh]):.1f} | "
-                         f"{_mean([v['fault_set']['spans_per_trace'] for v in sh]):.1f} |")
+                         f"{_mean([v['fault_set']['spans_per_trace'] for v in sh]):.1f} |" + (" |" if burner else ""))
             for arm in ARMS:
-                ar = [r for r in rs if r.get("arm") == arm]
+                ar = [r for r in rs if r.get("arm") == arm and not r["_invalid"]]
                 if not ar:
                     continue
+                at = f" {bursts(ar)} |" if burner else ""
                 own = [r["variants"].get("shadow") for r in ar if r["variants"].get("shadow")]
-                lines.append(f"| {arm} | full data of its runs | {len(own)} | {cells(own, sfxs)} | | |")
+                lines.append(f"| {arm} | full data of its runs | {len(own)} | {cells(own, sfxs)} | | |" + at)
                 for var in ARM_VARIANTS:
                     vs = [r["variants"].get(var) for r in ar if r["variants"].get(var) and not r["variants"][var].get("error")]
                     if not vs:
                         continue
                     lines.append(f"| {arm} | {var} | {len(vs)} | {cells(vs, sfxs)} | "
                                  f"{_mean([v['normal_set']['spans_per_trace'] for v in vs]):.2f} | "
-                                 f"{_mean([v['fault_set']['spans_per_trace'] for v in vs]):.2f} |")
+                                 f"{_mean([v['fault_set']['spans_per_trace'] for v in vs]):.2f} |" + at)
             lines.append("")
         # crashes per arm at this volume (every scored scenario together)
         rs = [r for r in runs if abs(_vol(r) - vol) < 1e-6]
@@ -131,7 +148,7 @@ def tables(runs: list[dict], volume: float | None) -> str:
                   "| arm | " + " | ".join(f"{NAMES[m]} {'full data' if v == 'shadow' else v}" for m, v in cols) + " |",
                   "|---" * (len(cols) + 1) + "|"]
         for arm in ARMS:
-            ar = [r for r in rs if r.get("arm") == arm]
+            ar = [r for r in rs if r.get("arm") == arm and not r["_invalid"]]
             if not ar:
                 continue
             row = []

@@ -7,11 +7,14 @@ One row per arm x scenario: the mean over seeds with the seed spread as (min-max
 number of seeds; a row is flagged when a seed in --seeds is missing, or when its runs ran
 different collector images (meta.json digests; "images" column).  Rows of faulted scenarios
 list each run's measured share of requests over the SLO in the fault window ("over SLO, by seed";
-late_everywhere's spinner sets the severity only roughly).  Tables: (1) competitors
+late_everywhere's spinner sets the severity only roughly) and, for the burner scenarios, where the
+load's bursts fell in the burner's quota period ("burst after the refresh, by seed"; burst_phase.json of
+burst_phase.py), which the over-SLO share follows.  Tables: (1) competitors
 (chosen, head, tail, reservoir, canopy, hindsight / vaif when their runs exist), (2)
 ablations (chosen, threshold, keep-parent), (3) the fault window under each truth (Stage 3:
 single culprit, own time, the culprit's node, duration), (4) reconstruction coverage.  The
-Stage 2d series (run ids 2d-*, tools/eval/compare2d.py), invalid-* and smoke-* runs are left out.
+Stage 2d series (run ids 2d-*, tools/eval/compare2d.py), invalid-* and smoke-* runs and runs with an
+INVALID file are left out.
 """
 from __future__ import annotations
 
@@ -72,11 +75,16 @@ def load(root: str) -> list[dict]:
     out = []
     for p in sorted(glob.glob(os.path.join(root, "*", "summary.json"))):
         name = os.path.basename(os.path.dirname(p))
-        if name.startswith(("2d-", "invalid-", "smoke-")):
+        if name.startswith(("2d-", "invalid-", "smoke-")) or os.path.exists(os.path.join(os.path.dirname(p), "INVALID")):
             continue
         with open(p, encoding="utf-8") as f:
             s = json.load(f)
         s["_dir"] = os.path.dirname(p)
+        try:
+            with open(os.path.join(s["_dir"], "burst_phase.json"), encoding="utf-8") as f:
+                s["burst_after_refresh_ms"] = json.load(f)["after_refresh_ms"]
+        except (OSError, ValueError, KeyError):
+            pass
         try:
             with open(os.path.join(s["_dir"], "meta.json"), encoding="utf-8") as f:
                 im = json.load(f).get("images") or {}
@@ -146,7 +154,8 @@ def build(summaries, volume, scenarios, seeds, arms, columns):
             got = sorted(int(s.get("seed", -1)) for s in rs)
             row = {"arm": arm, "scenario": sc, "seeds": got, "missing": sorted(set(seeds) - set(got)) if seeds else [],
                    "images": sorted({s.get("_image", "?") for s in rs}),
-                   "over_slo_runs": [s.get("over_slo_frac_window") for s in sorted(rs, key=lambda x: int(x.get("seed", -1)))]}
+                   "over_slo_runs": [s.get("over_slo_frac_window") for s in sorted(rs, key=lambda x: int(x.get("seed", -1)))],
+                   "burst_runs": [s.get("burst_after_refresh_ms") for s in sorted(rs, key=lambda x: int(x.get("seed", -1)))]}
             for _, key, _, _ in columns:
                 if key == "identified":
                     vals = [s.get("identified") for s in rs if s.get("identified") is not None]
@@ -163,8 +172,9 @@ def markdown(rows, columns, title, extra=None) -> str:
     if not rows:
         return f"### {title}\n\n(no runs)\n"
     per_run = any(_num(v) is not None for r in rows for v in r.get("over_slo_runs") or [])
+    burst = any(_num(v) is not None for r in rows for v in r.get("burst_runs") or [])
     hdr = (["arm", "scenario", "seeds"] + [c[0] for c in columns] + ([extra[0]] if extra else [])
-           + (["over SLO, by seed"] if per_run else []) + ["images"])
+           + (["over SLO, by seed"] if per_run else []) + (["burst after the refresh, by seed (ms)"] if burst else []) + ["images"])
     lines = [f"### {title}", "", "| " + " | ".join(hdr) + " |", "|" + "---|" * len(hdr)]
     for r in rows:
         seeds = str(len(r["seeds"])) + (f" (missing {','.join(map(str, r['missing']))})" if r["missing"] else "")
@@ -180,6 +190,9 @@ def markdown(rows, columns, title, extra=None) -> str:
         if per_run:
             vals = [_num(v) for v in r.get("over_slo_runs") or []]
             cells.append(" / ".join(f"{100 * v:.1f}%" for v in vals if v is not None) or "-")
+        if burst:
+            vals = [_num(v) for v in r.get("burst_runs") or []]
+            cells.append(" / ".join(f"{v:.1f}" if v is not None else "?" for v in vals) if any(v is not None for v in vals) else "-")
         ims = r.get("images") or []
         cells.append(ims[0].split(":")[-1][:12] if len(ims) == 1 else f"MIXED ({len(ims)})")
         lines.append("| " + " | ".join(cells) + " |")

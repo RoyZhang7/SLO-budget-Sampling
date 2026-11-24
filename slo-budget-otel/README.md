@@ -18,6 +18,8 @@ slobudget/                         pure Go port of the decider, calibration, ref
   agentcentral.go                  the agent / central split: budget issue, period snapshot, central update
 processor/slobudgetprocessor/      the per-host agent (decider at span end, root hold + kept-notice, stats)
 processor/slobudgetcentralprocessor/  the central (1/p-weighted calibration, frozen trigger, refill, cap, config channel)
+arrival/                           the arrival stamp, agent side: the mapped table, the clock, the lookup (prepared, not deployed)
+arrivald/                          its eBPF program (prog/), the loader, an interpreter and the replay of captures (own module)
 sdk/budgetissuer/                  W3C-baggage budget issuer + baggage-to-attribute copier (own module)
 builder/                           ocb manifest and Dockerfile; tools/build-node0.sh builds and pushes on node-0
 deploy/                            central Deployment/Service/ConfigMaps, agent config, headless peers service,
@@ -83,10 +85,54 @@ derived from complete traces.  It is not deployed: the campaign runs on
 file).  The learned graph has the flag only.  `GET
 /slobudget/status` shows the table, the period history and the graph.
 
+## Arrival stamp (prepared, not deployed)
+
+When a request reached its pod, taken by an eBPF program at the pod's interface and looked up by the
+agent; only the overhead experiment's configuration E uses it, no decision does.
+
+- **The program** (`arrivald/prog`, tc at the ingress of `eth0` in the pod's network namespace): for TCP
+  payload to the services' port (12345) it scans for the key `"SpanID":"` and parses the 16 hexadecimal
+  digits after it, at most 8 192 positions of a packet (longer packets are counted).  The id is the
+  caller's client span, the parent of the callee's server span.  It stores (id, monotonic time) in an
+  array indexed by the id's low bits; an id that is already in its slot keeps its first time, another
+  one's slot is taken.  Counters: packets scanned, ids, packets with payload but no id, slots overwritten,
+  packets past the cap, keys whose id the packet cuts, keys without 16 digits, repeats, chunks with more
+  candidates than are kept, helper errors.
+  It returns "unspecified" and changes nothing.  Written with cilium/ebpf's assembler: no C toolchain, and
+  the tests run the very instructions the loader loads.
+- **The loader** (`arrivald`, a privileged DaemonSet): pins the table and the counters under
+  `/sys/fs/bpf/slobudget`, attaches the program to every network namespace that listens on the
+  services' port and to new ones as pods come, looks every 10 s whether it is still there, takes it off on
+  SIGTERM.  `arrivald -check` only runs the kernel's verifier; `arrivald -clean` takes off what a loader
+  that was killed left behind; `-stats` logs the kernel's own count of the program's runs and time.
+- **The agent** (`slobudget: arrival_table: <pin directory>`, off by default): maps the table read-only
+  (CAP_BPF to open it) and, when a server span reaches it, looks its parent span id up and attaches
+  `slobudget.arrival_ns`, the arrival in the span's clock (the monotonic time plus the node's offset
+  between the two clocks, sampled every second), with `slobudget.arrival_source` `ebpf`; on a miss the
+  span's own start, the in-process time, with `start`.  The lookup is made before any hold.  The period
+  log line `slobudget arrival` has the outcomes (`hit`, `root` no parent, `no_table`, `empty` the slot was
+  never used, `not_stored` it holds an id older than the span's start, `overwritten` a later one, `torn`,
+  `late` stored after the span's start), the mean wait, the largest step of the wall clock and what the
+  program's counters gained.  An id the program never stored (its digits split between two packets) is
+  `empty` or `not_stored`, by what its slot happens to hold: compare the sum of the two.
+- **Table size**: the lookup comes the SDK's export delay after the arrival (its 100-ms flush: 0 to about
+  0.1 s plus the request), so an id is lost when its slot is taken in that time.  131 072 slots (2 MiB,
+  `arrivald -slots`, `render.py --arrival-slots`) keep that under 0.1 % at 300 req/s.
+- **Tests**: `go test ./arrival ./processor/slobudgetprocessor`; in `arrivald` the program runs on an
+  interpreter that stops at what the kernel's verifier would (reads before writes, accesses outside a
+  map value), over constructed packets and (`replay CAPDIR TRUTHDIR`) over captures: every counter's
+  change, every id and its time after every packet, against a ground truth made by TCP reassembly without
+  the program, and the outcome and time of every lookup at the moment the span reached the collector.
+  `ARRIVAL_KERNEL=1 go test ./prog` (root) is the kernel's verifier and the kernel against the
+  interpreter (BPF_PROG_TEST_RUN, nothing attached), and the agent's mapping of the pinned maps; it has
+  not been run.
+- **Manifests**: `render.py --arrival /sys/fs/bpf/slobudget` adds the agent's setting, CAP_BPF and the bpf
+  filesystem to the agents, and arrivald's DaemonSet; the image needs `/arrivald` (`builder/Dockerfile`).
+
 ## Build and run
 
 ```
-go test ./... && (cd sdk && go test ./...)                  # unit tests
+go test ./... && (cd sdk && go test ./...) && (cd arrivald && go test ./...)   # unit tests
 python tools/difftest.py                                    # 21 Python dumps vs the Go replay (about 1 GB of dumps)
 python tools/difftest.py --stages deploy/callgraph.stages.json   # the same with sequential stages
 tools/build-node0.sh                                        # on node-0: tests, benchmark, ocb build, image push

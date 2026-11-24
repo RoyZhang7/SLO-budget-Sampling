@@ -9,7 +9,8 @@ start)) and during it ([fault start, fault end)), by the root's START time; the 
 latency p50 / p95 / p99 (the root span's duration, server side); wrk2's own whole-run percentiles
 (wrk2 keeps no time series, so its pre-fault percentiles do not exist); the culprit service's
 own-time p95 before and during the fault and its own-time threshold b (the oracle's own-time share of
-the run's healthy window); the run's start time; and the pod placement.
+the run's healthy window); where the load's bursts fell in the burner's quota period (burst_phase.json of
+burst_phase.py); the run's start time; and the pod placement.
 """
 from __future__ import annotations
 
@@ -91,6 +92,7 @@ def one(run_dir: str, sim: str, callgraph: str) -> dict:
         out["culprit_coresident"] = sorted(s for s, n in pl.items() if n == cn and s != out["culprit"])
         out["culprit_nodes"] = pln.get(out["culprit"])
     out["placement"] = pl
+    out["burst_after_refresh_ms"] = (runinfo.load_json(os.path.join(run_dir, "burst_phase.json")) or {}).get("after_refresh_ms")
     fs = float(f["start"]) if f else None
     fe = float(f["end"]) if f else None
     out["fault_start_s"] = (fs - t0) if fs else None

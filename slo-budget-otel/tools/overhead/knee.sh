@@ -2,9 +2,13 @@
 # The knee of the latency curve for the overhead experiment (node-0, after the campaign): config C
 # (record everything into our agent at a collection volume target of 12 % of the spans at the
 # step's rate), one reseed, then per rate: fresh agents and central with that target, a 30-s
-# warm-up, 2 minutes of load.  The higher rate of the experiment is the highest rate whose p99
-# stays within KNEE_X (2) x the p99 at the first rate (100 req/s) and whose achieved rate is
-# within 1 % of the target; it is printed last ("knee rate: N").
+# warm-up, 2 minutes of load.  The load is wrk2 with exponential gaps (-D exp; its fixed pace sends
+# the connections' requests as one burst) on one connection per req/s: wrk2 does not wait for the
+# response before the next request of a connection, and the server takes a connection's requests
+# one at a time, so on 10 connections one request in seven would wait behind another.  The higher
+# rate of the experiment is the highest rate whose p99 stays within KNEE_X (2) x the p99 at the
+# first rate (100 req/s) and whose achieved rate is within 1 % of the target (and three standard
+# deviations of the Poisson count); it is printed last ("knee rate: N").
 #   tools/overhead/knee.sh        (log and wrk logs in $STAGE3/overhead/knee/)
 set -u
 cd "$(dirname "$0")/../.."
@@ -29,12 +33,12 @@ restore() {
 }
 [ "$(kubectl get ds otelcol-pb-es-ctr -o jsonpath='{.spec.template.spec.containers[0].image}')" = "$STOCK_COLLECTOR_IMAGE" ] \
     || { log "the stock collector is not in place"; exit 1; }
+[ -z "$(kubectl get ds,pods -l app=slobudget-arrival --no-headers 2>/dev/null)" ] || { log "arrivald is still there (an E run)"; exit 1; }
 WORKLOADS=$(kubectl get deploy,ds -o name | grep -- '-service-pb-es-ctr' | grep -v tracepressure)
 for w in $WORKLOADS; do kubectl set env "$w" OTEL_SAMPLE_RATIO- SLO_BUDGET_PORT- BRIDGE_KIND=pb >> "$RD/run.log" 2>&1; done
 for w in $WORKLOADS; do kubectl rollout status "$w" --timeout=300s >> "$RD/run.log" 2>&1; done
 bash "$MOD/tools/reseed.sh" > "$RD/reseed.log" 2>&1 || { log "reseed failed"; exit 1; }
 for r in $RATES; do
-    c=$(( r / 10 > 10 ? r / 10 : 10 ))
     # agents and central new at every rate: the target is 12 % of the spans at this rate (an agent
     # ignores a restarted central until its version passes the agent's, so both restart)
     python3 "$MOD/tools/campaign/render.py" --arm chosen --volume 0.12 --rate "$r" --seed 1 --image "$IMG" --no-tee > "$RD/manifests-$r.yaml"
@@ -43,15 +47,15 @@ for r in $RATES; do
     kubectl rollout status deploy/slobudget-central --timeout=180s >> "$RD/run.log" 2>&1
     kubectl rollout status ds/otelcol-pb-es-ctr --timeout=300s >> "$RD/run.log" 2>&1
     sleep 15
-    wrk -t2 -c"$c" -d30s -s "$LUA" "$URL" -R"$r" > "$RD/wrk-warmup-$r.log" 2>&1
-    RANDOM_SEED=1 wrk -t2 -c"$c" -d"${STEP}"s -L -s "$LUA" "$URL" -R"$r" > "$RD/wrk-$r.log" 2>&1
+    wrk -t2 -c"$r" -D exp -d30s -s "$LUA" "$URL" -R"$r" > "$RD/wrk-warmup-$r.log" 2>&1
+    RANDOM_SEED=1 wrk -t2 -c"$r" -D exp -d"${STEP}"s -L -s "$LUA" "$URL" -R"$r" > "$RD/wrk-$r.log" 2>&1
     log "rate $r: $(grep -E '^ *(50.000|99.000)%|Requests/sec' "$RD/wrk-$r.log" | tr -s ' ' | tr '\n' ' ')"
     sleep 15
 done
 restore
-python3 - "$RD" "$RATES" "$KNEE_X" <<'PY'
-import re, sys
-rd, rates, kx = sys.argv[1], [int(x) for x in sys.argv[2].split()], float(sys.argv[3])
+python3 - "$RD" "$RATES" "$KNEE_X" "$STEP" <<'PY'
+import math, re, sys
+rd, rates, kx, step = sys.argv[1], [int(x) for x in sys.argv[2].split()], float(sys.argv[3]), float(sys.argv[4])
 def stat(r):
     t = open(f"{rd}/wrk-{r}.log", errors="replace").read()
     p = {k: float(v) * {"ms": 1, "s": 1000, "us": 0.001}[u] for k, v, u in re.findall(r"^\s*(50\.000|99\.000)%\s+([0-9.]+)(ms|s|us)", t, re.M)}
@@ -61,7 +65,7 @@ base = stat(rates[0])[1]
 knee = rates[0]
 for r in rates:
     p50, p99, got = stat(r)
-    ok = p99 is not None and p99 <= kx * base and got >= 0.99 * r
+    ok = p99 is not None and p99 <= kx * base and got >= 0.99 * r - 3 * math.sqrt(r / step)
     print(f"rate {r}: p50 {p50} ms p99 {p99} ms achieved {got} req/s {'within' if ok else 'past the knee'}")
     if not ok:
         break

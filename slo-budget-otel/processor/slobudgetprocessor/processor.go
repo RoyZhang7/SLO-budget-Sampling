@@ -21,6 +21,7 @@ import (
 	"go.opentelemetry.io/collector/processor"
 	"go.uber.org/zap"
 
+	"github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/arrival"
 	"github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/slobudget"
 )
 
@@ -37,6 +38,10 @@ const (
 	AttrDropped    = "slobudget.dropped_children"
 	AttrRootPinned = "slobudget.root_pinned"
 	AttrBR         = "_br" // path bridge: uvarint(depth) || 8-byte checkpoint anchor || bloom
+	// the arrival of a server span's request at the pod, unix ns in the span's clock, and where
+	// it comes from: "ebpf" (the arrival program) or "start" (a miss: the span's own start)
+	AttrArrival       = "slobudget.arrival_ns"
+	AttrArrivalSource = "slobudget.arrival_source"
 )
 
 type interval struct{ start, end float64 }
@@ -105,6 +110,13 @@ type agent struct {
 	released   map[pcommon.SpanID]time.Time
 	out        ptrace.Traces
 	heldBytes  int
+
+	// arrival stamps (arrival_table; nil: off): the lookups, the table's identity (it is opened
+	// again when arrivald pins it anew) and the program's counters at the last period
+	arr     *arrival.Resolver
+	arrID   string
+	arrCtr  *arrival.Counters
+	arrLast [arrival.NumCounters]uint64
 }
 
 type decidedSpan struct {
@@ -148,6 +160,9 @@ func newAgent(set processor.Settings, cfg *Config, next consumer.Traces) (*agent
 		return nil, err
 	}
 	a.s = s
+	if cfg.ArrivalTable != "" { // opened in Start
+		a.arr = &arrival.Resolver{Clock: arrival.NewClock(arrival.SampleClocks)}
+	}
 	if cfg.TTableFile != "" {
 		raw, err := os.ReadFile(cfg.TTableFile)
 		if err != nil {
@@ -183,6 +198,9 @@ func (a *agent) Start(ctx context.Context, _ component.Host) error {
 		a.sdkSrv = &http.Server{Handler: mux, ReadHeaderTimeout: 2 * time.Second}
 		go func() { _ = a.sdkSrv.Serve(ln) }()
 	}
+	if a.arr != nil {
+		a.openArrival()
+	}
 	a.period = a.periodOf(time.Now())
 	a.wg.Add(2)
 	go a.periodLoop(bg)
@@ -206,6 +224,9 @@ func (a *agent) Shutdown(context.Context) error {
 		_ = a.sdkSrv.Close()
 	}
 	a.wg.Wait()
+	if a.arr != nil {
+		a.closeArrival()
+	}
 	return nil
 }
 
@@ -290,6 +311,9 @@ func (a *agent) decide(rs ptrace.ResourceSpans, ss ptrace.ScopeSpans, span ptrac
 		}
 	}
 	parent := span.ParentSpanID()
+	if a.arr != nil && span.Kind() == ptrace.SpanKindServer {
+		a.stampArrival(span)
+	}
 	isClient := span.Kind() == ptrace.SpanKindClient
 	if isClient {
 		a.stats.clientSpans++
@@ -649,6 +673,9 @@ func (a *agent) flushLoop(ctx context.Context) {
 				}
 			}
 			n++
+			if a.arr != nil && n%40 == 0 { // every second
+				a.arr.Clock.Tick()
+			}
 			if n%4 != 0 {
 				out := a.out
 				a.out = ptrace.NewTraces()
@@ -721,10 +748,14 @@ func (a *agent) periodLoop(ctx context.Context) {
 		st.Version = a.version
 		kp := a.stats // keep_parent counters for the log line
 		a.stats = agentCounters{}
+		arrived := a.takeArrivals()
 		a.s.ResetPeriod()
 		a.lastStat = st
 		a.period++
 		a.mu.Unlock()
+		if arrived != nil {
+			a.openArrival()
+		}
 		if a.cfg.StatsLog {
 			sent, recv, uni := a.notices.counts()
 			a.log.Info("slobudget period", zap.Int64("period", st.Period), zap.Int("requests", st.Requests),
@@ -744,6 +775,9 @@ func (a *agent) periodLoop(ctx context.Context) {
 					zap.Int("forced_refused", kp.forcedRefused), zap.Int("force_late", kp.forceLate),
 					zap.Int("force_late_kept", kp.forceLateKept), zap.Int("forced_expired", kp.forcedExpired),
 					zap.Int("force_notices_sent", fs), zap.Int("force_notices_recv", fr))
+			}
+			if arrived != nil {
+				a.log.Info("slobudget arrival", append([]zap.Field{zap.Int64("period", st.Period)}, arrived...)...)
 			}
 		}
 		if a.cfg.Central != "" {

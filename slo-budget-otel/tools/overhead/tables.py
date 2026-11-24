@@ -7,14 +7,18 @@ Per config and rate, the mean over the repeats with the spread (min-max): wrk2's
 p50 / p99 and achieved req/s; CPU per request (ms of CPU per completed request) of the traced app
 pods (the *-service-pb-es-ctr containers, wrk2api included) and, apart, of the data stores (the
 *-db-* Mongo and *-cache-* pods); and CPU (cores, averaged over the 5-min load) of the agent DaemonSet on the
-three app nodes, the central collector (configs C and D) and the trace backend (Jaeger, Elasticsearch).
-CPU comes from two kubelet snapshots around the load (cpu_snapshot.py).  For C and D also the spans
-the central admitted per 5-s period over the spans offered at the rate (23 per request), the check
-that they keep the 12 % of B (central.log, the cap gate's records).
+three app nodes, arrivald (E), the central collector (configs C to E), the trace backend (Jaeger,
+Elasticsearch) and the three app nodes as a whole.  CPU comes from two kubelet snapshots around the load
+(cpu_snapshot.py); the node's figure over its own sampling times.  For C to E also the spans the central
+admitted per 5-s period over the spans offered at the rate (23 per request), the check that they keep the
+12 % of B (central.log, the cap gate's records); for E the program's own CPU from the kernel's run
+statistics (arrivald's counters; too small for the node's figure to show) and the share of the server
+spans with a parent whose arrival came from the program.
 """
 from __future__ import annotations
 
 import argparse
+import datetime
 import glob
 import json
 import os
@@ -22,7 +26,8 @@ import re
 import statistics as st
 
 CONFIGS = {"A": "tracing off", "B": "SDK head sampling 12 %", "C": "record everything, our agent at 12 %",
-           "D": "C with the Path Bridge off"}
+           "D": "C with the Path Bridge off", "E": "C with the eBPF arrival program attached"}
+APP_NODES = ("node-1", "node-2", "node-3")
 
 
 def wrk(path: str) -> dict:
@@ -45,6 +50,8 @@ def group(key: str) -> str | None:
         return "agent"
     if pod.startswith("slobudget-central"):
         return "central"
+    if pod.startswith("slobudget-arrival"):
+        return "arrivald"
     if pod.startswith(("jaeger-", "elasticsearch-")):
         return "backend"
     if "-service-pb-es-ctr" in cont and "tracepressure" not in cont:
@@ -64,6 +71,13 @@ def cpu_by_group(rd: str) -> tuple[dict, float]:
         if g is None or k not in a["containers"]:
             continue
         out[g] = out.get(g, 0.0) + (v["cpu_ns"] - a["containers"][k]["cpu_ns"]) / 1e9
+    rates = []
+    for n in APP_NODES:
+        x, y = (a.get("nodes") or {}).get(n), (b.get("nodes") or {}).get(n)
+        if x and y and x.get("t") and y.get("t") and y["t"] > x["t"]:
+            rates.append((y["cpu_ns"] - x["cpu_ns"]) / 1e9 / (y["t"] - x["t"]))
+    if len(rates) == len(APP_NODES):
+        out["node_cores"] = sum(rates)
     return out, secs
 
 
@@ -89,6 +103,38 @@ def kept_share(rd: str, m: dict) -> float:
     return st.mean(adm) / (SPANS_PER_REQUEST * 5 * m["rate"]) if adm else float("nan")
 
 
+def arrival_share(rd: str) -> float:
+    """Share of the server spans with a parent that got the program's time (E): the agents' period lines."""
+    hit = total = 0
+    for p in glob.glob(os.path.join(rd, "arrival-agent-*.log")):
+        for ln in open(p, errors="replace"):
+            if "slobudget arrival" not in ln or "{" not in ln:
+                continue
+            try:
+                g = json.loads(ln[ln.index("{"):])
+            except ValueError:
+                continue
+            hit += g.get("hit", 0)
+            total += sum(g.get(k, 0) for k in ("hit", "no_table", "empty", "not_stored", "overwritten", "torn", "late"))
+    return hit / total if total else float("nan")
+
+
+def program(rd: str, t0: float, t1: float) -> tuple[float, float]:
+    """The arrival program on the three app nodes during the load (E): cores, and ns per packet it ran on (arrivald's counter lines)."""
+    ns = runs = 0
+    for p in glob.glob(os.path.join(rd, "arrival-node-*.log")):
+        for ln in open(p, errors="replace"):
+            try:
+                d = json.loads(ln)
+                t = datetime.datetime.fromisoformat(re.sub(r"(\.\d{6})\d*", r"\1", d["time"]).replace("Z", "+00:00")).timestamp()
+            except (ValueError, KeyError, TypeError):
+                continue
+            if d.get("msg") == "counters" and "run_ns" in d and t0 + 5 <= t <= t1:
+                ns += d["run_ns"]
+                runs += d["runs"]
+    return (ns / 1e9 / (t1 - t0 - 5), ns / runs) if runs else (float("nan"), float("nan"))
+
+
 def load(root: str) -> list[dict]:
     rows = []
     for mp in sorted(glob.glob(os.path.join(root, "*-r*-*", "meta.json"))):
@@ -102,7 +148,10 @@ def load(root: str) -> list[dict]:
         rows.append({"cfg": m["config"], "rate": m["rate"], "rep": m["rep"], **w,
                      "app_ms_per_req": 1000 * cpu.get("app", 0.0) / n, "stores_ms_per_req": 1000 * cpu.get("stores", 0.0) / n,
                      "agent_cores": cpu.get("agent", 0.0) / secs, "central_cores": cpu.get("central", 0.0) / secs,
-                     "backend_cores": cpu.get("backend", 0.0) / secs, "kept_share": kept_share(rd, m)})
+                     "backend_cores": cpu.get("backend", 0.0) / secs, "arrivald_cores": cpu.get("arrivald", 0.0) / secs,
+                     "node_cores": cpu.get("node_cores", float("nan")),
+                     "kept_share": kept_share(rd, m), "arrival_share": arrival_share(rd),
+                     **dict(zip(("program_cores", "program_ns"), program(rd, m["t0"], m["t1"])))})
     return rows
 
 
@@ -123,14 +172,16 @@ def main() -> int:
     rows = load(a.root)
     cols = [("p50 ms", "p50"), ("p99 ms", "p99"), ("req/s", "rps"), ("app CPU ms/request", "app_ms_per_req"),
             ("stores CPU ms/request", "stores_ms_per_req"), ("agent cores", "agent_cores"),
-            ("central cores", "central_cores"), ("Jaeger + ES cores", "backend_cores"), ("kept / offered spans (C, D)", "kept_share")]
+            ("arrivald cores", "arrivald_cores"), ("central cores", "central_cores"), ("Jaeger + ES cores", "backend_cores"), ("app nodes, all cores", "node_cores"),
+            ("arrival program, cores (E)", "program_cores"), ("ns per packet (E)", "program_ns"),
+            ("kept / offered spans (C to E)", "kept_share"), ("arrivals from the program (E)", "arrival_share")]
     lines = ["| config | rate | repeats | " + " | ".join(c for c, _ in cols) + " |", "|---" * (3 + len(cols)) + "|"]
     for rate in sorted({r["rate"] for r in rows}):
         for cfg in CONFIGS:
             rs = [r for r in rows if r["cfg"] == cfg and r["rate"] == rate]
             if not rs:
                 continue
-            lines.append(f"| {cfg}: {CONFIGS[cfg]} | {rate} | {len(rs)} | " + " | ".join(cell([r[k] for r in rs], "{:.3f}" if k == "kept_share" else "{:.2f}") for _, k in cols) + " |")
+            lines.append(f"| {cfg}: {CONFIGS[cfg]} | {rate} | {len(rs)} | " + " | ".join(cell([r[k] for r in rs], "{:.3f}" if k == "kept_share" else "{:.4f}" if k in ("arrival_share", "program_cores") else "{:.2f}") for _, k in cols) + " |")
     text = "\n".join(lines) + "\n"
     if a.md:
         open(a.md, "w", encoding="utf-8").write(text)

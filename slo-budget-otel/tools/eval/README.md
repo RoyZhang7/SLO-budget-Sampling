@@ -12,6 +12,7 @@ $PY tools/eval/eval_run.py /storage/royno7/stage3/runs/<run_id> [--sim ~/slo-bud
 $PY tools/eval/tables.py /storage/royno7/stage3/runs --volume 0.12 [--scenarios steady saturated] [--seeds 1 2 3] [--json]
 $PY -m pytest -q tools/eval/tests                         # fixture arithmetic
 $PY tools/eval/make_fake_run.py <100 % Jaeger export> OUT [--frac 0.12] [--fault-service socialgraph]   # dev only
+$PY tools/eval/burst_phase.py RUN_DIR...                  # burner runs, before the tables: burst_phase.json, the bursts' position in the quota period
 $PY tools/eval/derive_stages.py RUN_DIR... [--merge deploy/callgraph.json --out deploy/callgraph.stages.json]   # sequential stages from the shadows
 ```
 
@@ -28,6 +29,8 @@ OTLP JSON lines, 100 %), `export.json` (the arm's Jaeger export), `gate.jsonl`
 (the central cap gate's periods; else the `capgate period` lines of
 `central.log`), `central-status.json` (chosen family), `telemetry/agent-<node>-{start,end}.prom`,
 `telemetry/central-<unix>.prom` (tail), `agent-<node>.log`, `central.log`.
+A run directory with an `INVALID` file (the reason) is left out of the tables; its 100 % export still counts
+in the ranking tables' pooled full-data row.
 
 ## How the cluster numbers map onto the simulator's
 

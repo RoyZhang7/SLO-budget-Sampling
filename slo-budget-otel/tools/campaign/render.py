@@ -5,6 +5,7 @@ with --no-tee), for one arm and volume.
 
   python3 tools/campaign/render.py --arm chosen --volume 0.12 --seed 1 --image IMG [--no-tee] > m.yaml
   python3 tools/campaign/render.py --arm tail --volume 0.12 --image IMG --print central   # one collector config
+  ... --arrival /sys/fs/bpf/slobudget      the eBPF arrival stamp: arrivald on every node, and the agents read its table
 
 Arms: chosen, threshold, keep-parent (the SLO-budget agent and central), head (stock
 probabilistic_sampler at the agents, hash of the trace id), tail (stock tail_sampling at the
@@ -25,6 +26,8 @@ import sys
 
 SPANS_PER_PERIOD = 11500          # 100 req/s x 23 spans x 5 s, the deployment's measured volume
 SLO_MS = 23.4
+SERVICE_PORT = 12345              # the services' gRPC port
+ARRIVAL_SLOTS = 1 << 17           # 2 MiB: under 0.1 % lost at 300 req/s at the SDKs' export delay (README, arrival stamp)
 SLOBUDGET_ARMS = ("chosen", "threshold", "keep-parent")
 ARMS = SLOBUDGET_ARMS + ("head", "tail", "reservoir", "canopy")
 
@@ -76,7 +79,7 @@ def sampler_overrides(arm: str) -> str:
     return "".join(ln + "\n" for ln in lines)
 
 
-def agent_config(arm: str, frac: float, v_star: float, seed: int, port: int, shares: dict) -> str:
+def agent_config(arm: str, frac: float, v_star: float, seed: int, port: int, shares: dict, arrival: str = "") -> str:
     procs, pipe, extra_recv, extra_pipe = "", [], "", ""
     if arm in SLOBUDGET_ARMS:
         sb = """slobudget:
@@ -98,6 +101,8 @@ def agent_config(arm: str, frac: float, v_star: float, seed: int, port: int, sha
         sb += f"  server_hold: {os.environ.get('SERVER_HOLD', '200ms')}\n"
         if arm == "keep-parent":
             sb += "  keep_parent_anchor: true\n"
+        if arrival:
+            sb += f"  arrival_table: {arrival}\n"
         sb += "  sampler:\n" + block(sampler_overrides(arm), 4)
         procs += sb
         pipe.append("slobudget")
@@ -326,6 +331,40 @@ service:
 """
 
 
+def arrival_daemonset(image: str, pin: str, slots: int) -> str:
+    """arrivald on every app node: loads the arrival program and keeps it at the service pods' interfaces."""
+    return f"""apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: slobudget-arrival
+  labels: {{app: slobudget-arrival}}
+spec:
+  selector:
+    matchLabels: {{app: slobudget-arrival}}
+  template:
+    metadata:
+      labels: {{app: slobudget-arrival}}
+    spec:
+      hostPID: true
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: arrivald
+          image: {image}
+          imagePullPolicy: IfNotPresent
+          command: ["/arrivald"]
+          args: ["-port", "{SERVICE_PORT}", "-slots", "{slots}", "-pin", "{pin}", "-stats"]
+          securityContext: {{privileged: true}}
+          resources:
+            limits: {{cpu: 200m, memory: 256Mi}}
+            requests: {{cpu: 50m, memory: 64Mi}}
+          volumeMounts:
+            - {{name: bpffs, mountPath: /sys/fs/bpf}}
+      volumes:
+        - name: bpffs
+          hostPath: {{path: /sys/fs/bpf, type: Directory}}
+"""
+
+
 def configmap(name: str, app: str, key: str, text: str) -> str:
     return f"""apiVersion: v1
 kind: ConfigMap
@@ -351,12 +390,16 @@ def main() -> int:
     ap.add_argument("--callgraph", default=str(pathlib.Path(__file__).resolve().parents[2] / "deploy" / "callgraph.json"))
     ap.add_argument("--ttable", help="reservoir: JSON route -> service -> seconds")
     ap.add_argument("--shares", default='{"node-1": 0.47, "node-2": 0.30, "node-3": 0.23}')
+    ap.add_argument("--arrival", default="", metavar="DIR", help="the eBPF arrival stamp: pin directory of arrivald's maps (SLO-budget arms)")
+    ap.add_argument("--arrival-slots", type=int, default=ARRIVAL_SLOTS)
     ap.add_argument("--print", choices=["agent", "central", "tee"], help="print one collector config only")
     a = ap.parse_args()
     v_star = round(a.volume * SPANS_PER_PERIOD * (a.rate / 100))
     tee = not a.no_tee
     agent_port = 4319 if tee else 4317
-    agent = agent_config(a.arm, a.volume, v_star, a.seed, agent_port, json.loads(a.shares))
+    if a.arrival and a.arm not in SLOBUDGET_ARMS:
+        raise SystemExit("--arrival: the agent of the SLO-budget arms reads the table")
+    agent = agent_config(a.arm, a.volume, v_star, a.seed, agent_port, json.loads(a.shares), a.arrival)
     central = central_config(a.arm, a.volume, v_star, a.seed, a.tail_wait, not a.no_capgate)
     if a.print:
         sys.stdout.write({"agent": agent, "central": central, "tee": tee_config(a.shadow)}[a.print])
@@ -439,6 +482,12 @@ spec:
     if a.arm == "reservoir":
         mounts += "            - {name: ttable, mountPath: /etc/slobudget}\n"
         vols += "        - name: ttable\n          configMap: {name: slobudget-ttable}\n"
+    sec = ""
+    if a.arrival:               # the agent maps the pinned table: CAP_BPF opens it, reading needs nothing more
+        mounts += "            - {name: bpffs, mountPath: /sys/fs/bpf, readOnly: true}\n"
+        vols += "        - name: bpffs\n          hostPath: {path: /sys/fs/bpf, type: Directory}\n"
+        sec = "          securityContext:\n            capabilities: {add: [BPF]}\n"
+        docs.append(arrival_daemonset(a.image, a.arrival, a.arrival_slots))
     tee_c = ""
     if tee:
         vols += "        - name: tee-config\n          configMap: {name: slobudget-tee-config}\n"
@@ -498,7 +547,7 @@ spec:
           resources:
             limits: {{cpu: "1", memory: 4Gi}}
             requests: {{cpu: "1", memory: 4Gi}}
-          volumeMounts:
+{sec}          volumeMounts:
 {mounts}      volumes:
 {vols}      hostname: otelcol-pb-es-ctr
       restartPolicy: Always

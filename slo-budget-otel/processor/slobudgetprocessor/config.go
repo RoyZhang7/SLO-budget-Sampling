@@ -61,6 +61,11 @@ type Config struct {
 	// its parent span (the caller's client span) and, with this on, also its `_br`
 	// checkpoint anchor (the caller's server span, its parent in the simulator's model).
 	KeepParentAnchor bool `mapstructure:"keep_parent_anchor"`
+	// ArrivalTable is the pin directory of the arrival program (arrivald): a server span gets
+	// the arrival of its request at the pod (slobudget.arrival_ns), looked up by its parent span
+	// id when the span reaches the agent; on a miss, its own start.  No decision uses it.
+	// Empty: off.
+	ArrivalTable string `mapstructure:"arrival_table"`
 }
 
 func (c *Config) Validate() error {

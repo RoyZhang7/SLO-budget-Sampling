@@ -60,12 +60,12 @@ def demean(rows, key, by="scenario"):
 
 
 def table_runs(rows):
-    out = ["| run | start (EST) | over SLO before | during | diff (pts) | pre-fault p50 / p95 / p99 (ms, server side) | wrk2 whole run p50 / p95 / p99 (ms) | culprit own p95 pre / during / threshold (ms) | during / threshold | culprit node |",
-           "|---|---|---|---|---|---|---|---|---|---|"]
+    out = ["| run | start (EST) | over SLO before | during | diff (pts) | burst after the refresh (ms) | pre-fault p50 / p95 / p99 (ms, server side) | wrk2 whole run p50 / p95 / p99 (ms) | culprit own p95 pre / during / threshold (ms) | during / threshold | culprit node |",
+           "|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in rows:
         w = r.get("wrk") or {}
         out.append(f"| {r['run_id']} | {r['start_est'][5:16]} | {f(100 * (r.get('share_pre') or 0), 1, ' %')} | {f(100 * (r.get('share_during') or np.nan), 1, ' %')} | "
-                   f"{f(100 * (r.get('diff_share') or np.nan), 1)} | {f(r.get('pre_p50_ms'), 1)} / {f(r.get('pre_p95_ms'), 1)} / {f(r.get('pre_p99_ms'), 1)} | "
+                   f"{f(100 * (r.get('diff_share') or np.nan), 1)} | {f(r.get('burst_after_refresh_ms'), 1)} | {f(r.get('pre_p50_ms'), 1)} / {f(r.get('pre_p95_ms'), 1)} / {f(r.get('pre_p99_ms'), 1)} | "
                    f"{f(w.get('p50'), 1)} / {f(w.get('p95'), 1)} / {f(w.get('p99'), 1)} | {f(r.get('culprit_own_p95_pre_ms'), 2)} / {f(r.get('culprit_own_p95_during_ms'), 2)} / {f(r.get('culprit_own_thr_ms'), 2)} | "
                    f"{f(r.get('culprit_own_p95_over_thr'), 2)} | {r.get('culprit_node') or '-'} |")
     return out
