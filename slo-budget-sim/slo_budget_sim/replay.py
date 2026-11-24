@@ -101,6 +101,9 @@ def replay(corpus: Corpus, sampler: Sampler, v_star: float, cap: float, seed: in
     events.sort()
 
     reqs: dict[int, RequestState] = {}
+    left: dict[int, int] = {}           # per trace: its spans that have not ended (the request is kept until the last one, as an agent does)
+    for s in spans:
+        left[s.trace_id] = left.get(s.trace_id, 0) + 1
     kept_flag = bytearray(len(spans))
     kept_idx: list[int] = []
     kept_p: list[float] = []
@@ -190,7 +193,8 @@ def replay(corpus: Corpus, sampler: Sampler, v_star: float, cap: float, seed: in
                 else:
                     st.dropped[rreason] = st.dropped.get(rreason, 0) + 1
                     drop_reason[ridx] = rreason
-            if s.parent_idx < 0:
+            left[s.trace_id] -= 1
+            if left[s.trace_id] == 0:
                 reqs.pop(s.trace_id, None)
     t_last = events[-1][0] if events else t0
     for ridx, rkeep, rp, rreason in sampler.finish():

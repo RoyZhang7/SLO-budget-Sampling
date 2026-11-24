@@ -32,11 +32,13 @@ const (
 	CountRepeats            // ids already in their slot (the first time is kept)
 	CountCrowded            // chunks with more candidates (the key's first bytes) than the program keeps
 	CountErrors             // helper failures (payload not readable)
+	CountPaged              // packets with payload outside the skb's linear part (in page fragments)
+	CountPagedIDs           // ids of which a byte, or of their key, came from there
 	NumCounters
 )
 
 // CounterNames are the names of the counters in logs and reports.
-var CounterNames = [NumCounters]string{"packets", "ids", "no_id", "overwritten", "capped", "cut", "bad_id", "repeats", "crowded", "errors"}
+var CounterNames = [NumCounters]string{"packets", "ids", "no_id", "overwritten", "capped", "cut", "bad_id", "repeats", "crowded", "errors", "paged", "paged_ids"}
 
 // Index is the slot of an id.
 func Index(id uint64, slots uint32) uint32 { return uint32(id) & (slots - 1) }

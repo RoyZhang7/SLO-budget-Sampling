@@ -3,7 +3,7 @@
 then replay them with the Go port and demand identical decisions.
 
     python tools/difftest.py [--dumps DIR] [--volume-frac 0.12] [--seeds 1 2 3] [--go /path/to/go]
-                             [--arm v2-keep-parent] [--set key=value ...] [--stages FILE]
+                             [--arm v2-keep-parent] [--set key=value ...] [--stages FILE] [--waits]
 
 Runs `python -m slo_budget_sim.cli dump` in ../slo-budget-sim (its venv) and
 `go test -run TestDifferentialAgainstPythonDumps ./slobudget/` here with
@@ -32,6 +32,7 @@ def main() -> int:
     ap.add_argument("--arm", default="chosen-v2", help="simulator arm (preset) to dump, e.g. v2-keep-parent")
     ap.add_argument("--set", nargs="*", metavar="KEY=VALUE", help="BudgetConfig overrides passed to `cli dump`")
     ap.add_argument("--stages", metavar="FILE", help="call graph file whose sequential stages the corpora's graphs get (deploy/callgraph.stages.json)")
+    ap.add_argument("--waits", action="store_true", help="spans with a wait from the request's arrival (--set own_measure=within_service reads it)")
     ap.add_argument("--go", default=shutil.which("go") or "go")
     ap.add_argument("--keep", action="store_true", help="keep the dumps")
     a = ap.parse_args()
@@ -48,6 +49,8 @@ def main() -> int:
         cmd += ["--set", *a.set]
     if a.stages:
         cmd += ["--stages", str(Path(a.stages).resolve())]
+    if a.waits:
+        cmd += ["--waits"]
     print("+", " ".join(cmd))
     subprocess.run(cmd, cwd=SIM, check=True)
     env = dict(os.environ, SLOBUDGET_DUMPS=str(dumps), GOFLAGS="-mod=mod")

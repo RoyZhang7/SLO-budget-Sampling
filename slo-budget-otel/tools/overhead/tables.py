@@ -120,9 +120,13 @@ def arrival_share(rd: str) -> float:
 
 
 def program(rd: str, t0: float, t1: float) -> tuple[float, float]:
-    """The arrival program on the three app nodes during the load (E): cores, and ns per packet it ran on (arrivald's counter lines)."""
-    ns = runs = 0
+    """The arrival program on the three app nodes during the load (E): cores, and ns per packet it ran on (arrivald's counter lines).
+    nan when a node's lines are missing."""
+    ns = runs = nodes = 0
     for p in glob.glob(os.path.join(rd, "arrival-node-*.log")):
+        if p.endswith(".previous.log"):
+            continue
+        before = runs
         for ln in open(p, errors="replace"):
             try:
                 d = json.loads(ln)
@@ -132,7 +136,8 @@ def program(rd: str, t0: float, t1: float) -> tuple[float, float]:
             if d.get("msg") == "counters" and "run_ns" in d and t0 + 5 <= t <= t1:
                 ns += d["run_ns"]
                 runs += d["runs"]
-    return (ns / 1e9 / (t1 - t0 - 5), ns / runs) if runs else (float("nan"), float("nan"))
+        nodes += runs > before
+    return (ns / 1e9 / (t1 - t0 - 5), ns / runs) if nodes == len(APP_NODES) else (float("nan"), float("nan"))
 
 
 def load(root: str) -> list[dict]:

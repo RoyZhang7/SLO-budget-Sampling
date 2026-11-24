@@ -20,12 +20,14 @@ import (
 	"go.opentelemetry.io/collector/processor"
 	"go.uber.org/zap"
 
+	"github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/processor/internal/arrivalstamp"
 	"github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/slobudget"
 )
 
 const (
 	attrSamplingP = "sampling.p"
 	attrOwnUS     = "slobudget.own_us"
+	attrArrival   = arrivalstamp.Attr
 	attrRoot      = "slo.r"
 	attrClass     = "slo.c"
 )
@@ -129,7 +131,7 @@ func (c *central) Start(ctx context.Context, _ component.Host) error {
 	c.wg.Add(1)
 	go c.periodLoop(bg)
 	c.log.Info("slobudget central started", zap.String("listen", c.cfg.Listen), zap.Duration("period", c.cfg.Period),
-		zap.Float64("v_star", c.vStar), zap.Float64("cap", c.cap))
+		zap.Float64("v_star", c.vStar), zap.Float64("cap", c.cap), zap.String("own_measure", c.cfg.Sampler.OwnMeasure))
 	return nil
 }
 
@@ -202,6 +204,9 @@ func (c *central) admit(span ptrace.Span, svc string) bool {
 	if span.Kind() != ptrace.SpanKindClient { // client spans are the caller's view: not calibrated
 		sp := slobudget.Span{SpanID: 0, TraceID: 0, IsRoot: span.ParentSpanID().IsEmpty(), Service: svc, Start: start, Duration: dur,
 			StatusOK: span.Status().Code() != ptrace.StatusCodeError, Route: route, ReqClass: cls, Own: own}
+		if v, ok := attrs.Get(attrArrival); ok { // own_measure within_service calibrates from it
+			sp.Wait = slobudget.ArrivalWait(int64(span.StartTimestamp()), v.Int())
+		}
 		c.s.Cal.Observe(&sp, p)
 		c.graph.observe(route, svc, span.TraceID(), span.SpanID(), span.ParentSpanID(), start, start+dur, span.ParentSpanID().IsEmpty())
 	}

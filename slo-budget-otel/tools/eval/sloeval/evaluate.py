@@ -1,6 +1,7 @@
 """Read a run directory and compute its summary."""
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import time
@@ -12,10 +13,12 @@ except ImportError:            # pragma: no cover
 
 import numpy as np
 
-from . import runinfo
+from . import arrivals, runinfo
 from .metrics import CHOSEN_FAMILY, compute
 from .oracle import build_oracle, import_sim, load_callgraph
-from .spans import SERVER, join, read_export, read_shadow
+from .spans import SERVER, join, own_client, read_export, read_shadow
+
+WS_CALLGRAPH = "callgraph.stages.json"      # the common truth's call graph (deploy/): the staged one, for every arm
 
 
 def find(run_dir: str, *names: str) -> str | None:
@@ -37,6 +40,13 @@ def healthy_mask(meta: dict, t) -> np.ndarray:
     s = t.start / 1e9
     e = t.end / 1e9
     return (s >= t0) & (e < end)
+
+
+def ws_graph_fits(graph) -> bool:
+    """Has the staged call graph in deploy/ the services and calls of the run's graph (it is the application's, a test may have another)?"""
+    with open(os.path.join(runinfo.DEPLOY, WS_CALLGRAPH), encoding="utf-8") as f:
+        g = json.load(f)
+    return dict(g["root"]) == dict(graph.root) and {(r, s): list(k) for r, ch in g["children"].items() for s, k in ch.items()} == {k: list(v) for k, v in graph.children.items()}
 
 
 def collect_buffers(run_dir: str, meta: dict, spans_per_trace: float) -> dict:
@@ -145,7 +155,24 @@ def evaluate(run_dir: str, sim_path: str, callgraph: str, recon_bin: str | None 
         tr = time.time()
         recon = run_recon(run_dir, recon_bin, callgraph)
         timing["recon_s"] = round(time.time() - tr, 1)
-    out = compute(meta, t, kept, kidx, cal, status, gate, cpu, buffers, recon)
+    # the common truth of all arms, whatever measure or graph the run's agents had: the estimate, on the staged call graph
+    ws_graph = load_callgraph(os.path.join(runinfo.DEPLOY, WS_CALLGRAPH), CallGraph) if ws_graph_fits(graph) else graph
+    other_kids = (t.pidx >= 0) & (t.kind != 3) & (t.kind[np.maximum(t.pidx, 0)] == SERVER)
+    own = own_client(t) if other_kids.any() else t.own
+    healthy = healthy_mask(meta, t)
+    ws = arrivals.within_service(t, arrivals.estimated_wait(t, meta, healthy), own, healthy, ws_graph, Calibrator, routes_slo)
+    run_cg = runinfo.central_callgraph(meta)
+    cal_run = None
+    if os.path.basename(run_cg) != os.path.basename(callgraph) and ws_graph is not graph:       # the central had another graph of the same application
+        cal_run = build_oracle(t, healthy, load_callgraph(run_cg, CallGraph), Calibrator, routes_slo)
+    out = compute(meta, t, kept, kidx, cal, status, gate, cpu, buffers, recon, ws, cal_run)
+    out["truth_callgraph"] = os.path.basename(callgraph)        # of T, b and every truth but the common one
+    out["ws_callgraph"] = WS_CALLGRAPH if ws_graph is not graph else out["truth_callgraph"]
+    if (t.arrival > 0).any():       # a run with the stamp: the estimate against it
+        cmp = arrivals.compare(t, meta, healthy, own, ws_graph, Calibrator, routes_slo)
+        out["arrival_estimate_vs_stamp"] = {**{q: cmp[q] for q in ("share_stamped", "calls", "server_spans", "server_spans_with_the_attribute")}, **cmp["all"]}
+        with open(os.path.join(run_dir, "arrival-vs-estimate.json"), "w", encoding="utf-8") as f:
+            json.dump(cmp, f, indent=1)
     timing["metrics_s"] = round(time.time() - tic, 1)
     out["spans_per_trace"] = round(spt, 2)
     out.update(hold_cost(run_dir, t, pop_tr))

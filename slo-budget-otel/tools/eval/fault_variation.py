@@ -72,7 +72,7 @@ def wrk_stats(path: str) -> dict:
 def one(run_dir: str, sim: str, callgraph: str) -> dict:
     meta = runinfo.load_meta(run_dir)
     f = meta.get("fault") or {}
-    out = {"run_id": meta["run_id"], "arm": meta["arm"], "scenario": meta["scenario"], "seed": meta["seed"],
+    out = {"run_id": meta["run_id"], "arm": meta.get("arm_label") or meta["arm"], "scenario": meta["scenario"], "seed": meta["seed"],
            "volume_frac": meta["volume_frac"], "slo_ms": float(next(iter(meta["slo_ms"].values()))),
            "fault_mode": f.get("mode"), "fault_level": f.get("level"), "fault_limit": f.get("limit"),
            "culprit": f.get("culprit"), "culprit_node": None, "wrk": wrk_stats(os.path.join(run_dir, "wrk.log"))}

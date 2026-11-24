@@ -49,6 +49,7 @@ type Sampler struct {
 	g      func(float64) float64
 
 	calibrated  bool
+	within      bool // own_measure within_service: a span counts from its request's arrival
 	flagReasons map[string]bool
 	NNeed       float64
 	Hosts       []string
@@ -93,6 +94,7 @@ func NewSampler(cfg Config, graph *CallGraph, routesSLO map[string]float64, host
 	g, _ := growth(cfg.PRule)
 	s := &Sampler{Cfg: cfg, g: g, rng: NewPyRandom(seed), VStar: vStar, Oracle: oracle}
 	s.calibrated = cfg.CalibSource != "oracle"
+	s.within = cfg.OwnMeasure == "within_service"
 	prior := "none"
 	if s.calibrated {
 		prior = cfg.ColdPrior
@@ -102,8 +104,12 @@ func NewSampler(cfg Config, graph *CallGraph, routesSLO map[string]float64, host
 		return nil, err
 	}
 	s.Cal = cal
+	s.Cal.Within = s.within
 	if !s.calibrated && oracle == nil {
 		return nil, fmt.Errorf("oracle table requested but none provided")
+	}
+	if !s.calibrated && oracle.Within != s.within {
+		return nil, fmt.Errorf("the oracle table is on another own_measure")
 	}
 	s.flagReasons = map[string]bool{"outlier": true, "escalate": true, "parent": true, "credit": true, "reserve": true}
 	if cfg.RootFlagOn == "any" {
@@ -315,6 +321,28 @@ func (s *Sampler) spansSvcGet(svc string) float64 {
 	return v
 }
 
+// outlierTest is _outlier_test: is the span an outlier, and by how much does it miss its
+// threshold (>= 0)?
+func (s *Sampler) outlierTest(sp *Span) (outlier bool, miss float64) {
+	if s.Cfg.OutlierTrigger == "own" {
+		if b, ok := s.LookupB(sp.Route, sp.ReqClass, sp.Service); ok { // else cold start: plan sampling only
+			own := sp.Own
+			if s.within {
+				own = sp.Own + sp.Wait
+			}
+			miss = (own - b) / b
+			outlier = miss > s.Cfg.OwnMargin || !sp.StatusOK // own time over its share
+		}
+	} else if T, hasT := s.Lookup(sp.Route, sp.ReqClass, sp.Service); hasT { // else cold start: plan sampling only
+		miss = (sp.Duration - T) / T
+		outlier = miss > s.Cfg.OutlierMargin || !sp.StatusOK // margin 0: the plain over-T rule
+	}
+	if miss < 0.0 {
+		miss = 0.0
+	}
+	return outlier, miss
+}
+
 // decideSpan is _decide_span: the Decide(...) of the plan.  It reads the
 // span, the baggage state and the per-period counters only.
 func (s *Sampler) decideSpan(sp *Span, req *RequestState) Decision {
@@ -323,22 +351,7 @@ func (s *Sampler) decideSpan(sp *Span, req *RequestState) Decision {
 		delete(s.forced, sp.SpanID)
 		return s.spend(sp, req, 1.0, "parent")
 	}
-	outlier, miss := false, 0.0
-	if s.Cfg.OutlierTrigger == "own" {
-		if b, ok := s.LookupB(sp.Route, sp.ReqClass, svc); ok { // else cold start: plan sampling only
-			miss = (sp.Own - b) / b
-			outlier = miss > s.Cfg.OwnMargin || !sp.StatusOK // own time over its share
-			if miss < 0.0 {
-				miss = 0.0
-			}
-		}
-	} else if T, hasT := s.Lookup(sp.Route, sp.ReqClass, svc); hasT { // else cold start: plan sampling only
-		miss = (sp.Duration - T) / T
-		outlier = miss > s.Cfg.OutlierMargin || !sp.StatusOK // margin 0: the plain over-T rule
-		if miss < 0.0 {
-			miss = 0.0
-		}
-	}
+	outlier, miss := s.outlierTest(sp)
 	if outlier {
 		s.ndet[svc]++
 		if s.exhausted(sp, req) {

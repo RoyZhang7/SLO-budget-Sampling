@@ -4,12 +4,12 @@
 // network namespaces with a listener on the services' port; new ones are found by polling
 // /proc.  It needs the host's process ids, CAP_SYS_ADMIN, CAP_NET_ADMIN and CAP_BPF
 // (render.py --arrival: privileged), and the bpf filesystem.  On SIGTERM it takes the program
-// off every interface and removes the pins; arrivald -clean does that for one that could not.
-//
-// PREPARED, NOT DEPLOYED: run only in the overhead experiment's configuration E.
+// off every interface and removes the pins; arrivald -clean does that for one that could not,
+// arrivald -dump writes what the table holds.
 package main
 
 import (
+	"bufio"
 	"errors"
 	"flag"
 	"fmt"
@@ -34,6 +34,7 @@ const version = "arrivald 2"
 
 type options struct {
 	port, slots         uint
+	pid                 int
 	iface, pin          string
 	poll, print, verify time.Duration
 	stats               bool
@@ -177,10 +178,19 @@ func follow(o options, l *loaded, stop <-chan os.Signal) error {
 			slog.Warn("namespaces", "error", err)
 			return
 		}
+		if o.pid > 0 {
+			spaces = p.only(spaces, o.pid)
+		}
 		changed := false
 		for ns, a := range on {
 			if _, alive := spaces[ns]; !alive { // the pod is gone, its interface and filter with it
-				a.handle.Close()
+				if o.pid > 0 { // or only the process: a container that restarts keeps the pod's namespace
+					if err := a.detach(l.id); err != nil {
+						slog.Info("detach", "error", err)
+					}
+				} else {
+					a.handle.Close()
+				}
 				delete(on, ns)
 				changed = true
 			}
@@ -261,6 +271,7 @@ func clean(o options) error {
 		return err
 	}
 	n := 0
+	var bad []error // of one pod: the others are cleaned all the same
 	for _, pid := range spaces {
 		a, err := open(pid, o.iface)
 		if err != nil {
@@ -272,18 +283,49 @@ func clean(o options) error {
 			continue
 		}
 		a.qdisc = others == 0
-		if err := a.detach(0); err != nil {
-			return err
+		if err := a.detach(0); err != nil && !errors.Is(err, unix.ENODEV) { // (no device: the pod is going away)
+			bad = append(bad, err)
+			continue
 		}
 		n++
 	}
 	for _, f := range []string{arrival.PinTable, arrival.PinCounters} {
 		if err := os.Remove(filepath.Join(o.pin, f)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return err
+			bad = append(bad, err)
 		}
 	}
 	_ = os.Remove(o.pin)
 	fmt.Println("taken off", n, "interfaces")
+	return errors.Join(bad...)
+}
+
+// dump writes what the pinned table and counters hold, through the agent's mapping, and the two
+// clocks (the live check compares it with a capture).
+func dump(o options) error {
+	t, err := arrival.Open(o.pin)
+	if err != nil {
+		return err
+	}
+	defer t.Close()
+	c, err := arrival.OpenCounters(o.pin)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	unixNs, monoNs := arrival.SampleClocks()
+	w := bufio.NewWriter(os.Stdout)
+	defer w.Flush()
+	fmt.Fprintf(w, "clocks,%d,%d\nslots,%d\n", unixNs, monoNs, t.Slots())
+	for i, v := range c.Read() {
+		fmt.Fprintf(w, "counter,%s,%d\n", arrival.CounterNames[i], v)
+	}
+	for i := uint32(0); i < t.Slots(); i++ {
+		if id, ns, ok := t.Read(uint64(i)); !ok {
+			fmt.Fprintf(w, "torn,%d\n", i)
+		} else if id != 0 {
+			fmt.Fprintf(w, "id,%016x,%d\n", id, ns)
+		}
+	}
 	return nil
 }
 
@@ -319,16 +361,18 @@ func check(o options) error {
 func run() error {
 	var o options
 	flag.UintVar(&o.port, "port", 12345, "the services' gRPC port")
-	flag.UintVar(&o.slots, "slots", 1<<17, "slots of the table (a power of two, 16 bytes each)")
+	flag.UintVar(&o.slots, "slots", 1<<20, "slots of the table (a power of two, 16 bytes each)")
 	flag.StringVar(&o.iface, "iface", "eth0", "the pods' interface")
 	flag.StringVar(&o.pin, "pin", "/sys/fs/bpf/slobudget", "directory of the pinned maps (bpf filesystem)")
 	flag.DurationVar(&o.poll, "poll", 2*time.Second, "how often new pods are looked for")
 	flag.DurationVar(&o.verify, "verify", 10*time.Second, "how often the program is checked to be where it was put")
 	flag.DurationVar(&o.print, "print", 5*time.Second, "how often the counters are logged")
 	flag.BoolVar(&o.stats, "stats", false, "the kernel's run statistics of the program (time and runs, in the counters' line)")
+	flag.IntVar(&o.pid, "pid", 0, "only the pod this process is in (0: every service pod; the live check's one pod)")
 	show := flag.Bool("version", false, "print the version and exit")
 	doCheck := flag.Bool("check", false, "load the program (the kernel's verifier), attach nothing, exit")
 	doClean := flag.Bool("clean", false, "take the program off every pod, remove the pins, exit")
+	doDump := flag.Bool("dump", false, "write what the pinned table and counters hold, exit")
 	flag.Parse()
 	if *show {
 		fmt.Println(version)
@@ -343,9 +387,12 @@ func run() error {
 		return check(o)
 	case *doClean:
 		return clean(o)
+	case *doDump:
+		return dump(o)
 	}
 	stop := make(chan os.Signal, 1) // before the load: a signal during it must not skip the clean-up
 	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
+	signal.Ignore(syscall.SIGPIPE) // nor a lost stdout
 	l := &loaded{pins: map[string]*ebpf.Map{}}
 	defer l.Close()
 	defer l.unpin(o.pin)

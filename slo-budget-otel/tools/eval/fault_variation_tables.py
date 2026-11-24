@@ -79,7 +79,8 @@ def main() -> int:
     a = ap.parse_args()
     rows = load(a.dir)
     rows = [r for r in rows if r["scenario"] in SCEN]
-    rows.sort(key=lambda r: (SCEN.index(r["scenario"]), ARMS.index(r["arm"]) if r["arm"] in ARMS else 9, r["seed"]))
+    arms_all = ARMS + sorted({r["arm"] for r in rows} - set(ARMS))      # and every arm-variant
+    rows.sort(key=lambda r: (SCEN.index(r["scenario"]), arms_all.index(r["arm"]), r["seed"]))
     out = []
     out.append(f"## Per burner run ({len(rows)} runs: {sorted(set(r['scenario'] for r in rows))})\n")
     out += table_runs(rows)
@@ -94,7 +95,7 @@ def main() -> int:
         seeds = sorted({r["seed"] for r in rs})
         out.append(f"| {sc} | " + " | ".join(f"seed {sd}" for sd in seeds) + " | mean | share before the fault, mean |")
         out.append("|---|" + "---|" * (len(seeds) + 2))
-        for arm in ARMS:
+        for arm in arms_all:
             cell = {r["seed"]: r for r in rs if r["arm"] == arm}
             if not cell:
                 continue
@@ -146,7 +147,7 @@ def main() -> int:
     out.append("|---|---|---|---|---|---|---|")
     for sc in SCEN:
         rs = [r for r in rows if r["scenario"] == sc and r.get("share_during") is not None]
-        arms = [x for x in ARMS if any(r["arm"] == x for r in rs)]
+        arms = [x for x in arms_all if any(r["arm"] == x for r in rs)]
         seeds = sorted({r["seed"] for r in rs})
         cell = {(r["arm"], r["seed"]): 100 * r["share_during"] for r in rs}
         arms = [x for x in arms if all((x, sd) in cell for sd in seeds)]          # complete arms only
@@ -181,7 +182,7 @@ def main() -> int:
     out.append("| arm | pairs | mean diff p50 (ms) [min, max] | mean diff p95 (ms) [min, max] | mean diff p99 (ms) [min, max] | pairs slower at p95 | Wilcoxon p (diff p95) | diff share over SLO before (pts) |")
     out.append("|---|---|---|---|---|---|---|---|")
     by = {(r["arm"], r["scenario"], r["seed"]): r for r in rows}
-    for arm in ARMS:
+    for arm in arms_all:
         if arm == "head":
             continue
         dp50, dp95, dp99, dsh = [], [], [], []

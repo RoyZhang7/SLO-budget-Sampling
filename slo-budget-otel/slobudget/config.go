@@ -57,6 +57,12 @@ type Config struct {
 	// "duration" = the Stage 2c rule (duration over (1 + outlier_margin) x T).
 	OutlierTrigger string  `json:"outlier_trigger" mapstructure:"outlier_trigger"`
 	OwnMargin      float64 `json:"own_margin" mapstructure:"own_margin"`
+	// OwnMeasure: "handler" = the own trigger reads the handler's own time (default),
+	// "within_service" = the within-service latency, the handler's end minus the request's arrival
+	// at the pod minus the downstream time, i.e. the own time plus the wait between the arrival
+	// (slobudget.arrival_ns; without one the span's own start) and the handler's start.  The
+	// calibration is on the same measure, so agents and central must have the same setting.
+	OwnMeasure string `json:"own_measure" mapstructure:"own_measure"`
 	// PlanCoin / NNeedDecay: simulator exp16 switches; only the defaults (span, 0) are ported.
 	PlanCoin   string  `json:"plan_coin" mapstructure:"plan_coin"`
 	NNeedDecay float64 `json:"n_need_decay" mapstructure:"n_need_decay"`
@@ -75,7 +81,7 @@ func DefaultConfig() Config {
 		FreezeEwma: 0.3, FreezeRelease: 3, ColdPrior: "none", RootPolicy: "pin", RootFlagOn: "outlier", RecordCost: 0.1,
 		OutlierCredit: "none", InitialBudget: 3.0, InitialPlanP: 0.15, PoolFactor: 1.0, BMin: 0.05, BMax: 64.0,
 		RateEwma: 0.5, OrdinaryFloor: 0.05, OutlierMargin: 0.1,
-		OutlierTrigger: "own", OwnMargin: 0.1, PlanCoin: "span", NNeedDecay: 0,
+		OutlierTrigger: "own", OwnMargin: 0.1, OwnMeasure: "handler", PlanCoin: "span", NNeedDecay: 0,
 	}
 }
 
@@ -110,6 +116,12 @@ func (c *Config) Validate() error {
 	}
 	if c.OwnMargin < 0 {
 		return fmt.Errorf("own_margin must be >= 0")
+	}
+	if c.OwnMeasure != "handler" && c.OwnMeasure != "within_service" {
+		return fmt.Errorf("unknown own_measure %q; choose handler or within_service", c.OwnMeasure)
+	}
+	if c.OwnMeasure != "handler" && c.OutlierTrigger != "own" {
+		return fmt.Errorf("own_measure within_service is a measure of the own trigger")
 	}
 	if c.PlanCoin != "span" {
 		return fmt.Errorf("plan_coin %q is not ported to Go (only span)", c.PlanCoin)

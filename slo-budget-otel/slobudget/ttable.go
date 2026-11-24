@@ -300,6 +300,9 @@ type Calibrator struct {
 	// default); false derives own time from the inclusive quantiles (L minus the
 	// callees' L), for stacks where the stamped own time is unreliable.
 	UseOwn     bool
+	// Within: the samples start at the request's arrival (Span.Wait), not at the handler's start
+	// (own_measure within_service).
+	Within     bool
 	Version    int
 	PriorTable map[[2]string]float64 // (route, service) -> T before the first calibration
 	PriorB     map[[2]string]float64 // (route, service) -> own-time share of the prior split (cold_prior equal)
@@ -364,12 +367,16 @@ func (c *Calibrator) Observe(sp *Span, p float64) {
 		s = &samples{}
 		c.cur[k] = s
 	}
-	s.d = append(s.d, sp.Duration)
+	wait := 0.0
+	if c.Within {
+		wait = sp.Wait
+	}
+	s.d = append(s.d, sp.Duration+wait)
 	own := sp.Own
 	if !(own > 0.0) {
 		own = sp.Duration
 	}
-	s.o = append(s.o, own)
+	s.o = append(s.o, own+wait)
 	w := 1.0
 	if p > 0 {
 		w = 1.0 / p

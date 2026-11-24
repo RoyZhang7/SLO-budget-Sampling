@@ -63,8 +63,9 @@ type Config struct {
 	KeepParentAnchor bool `mapstructure:"keep_parent_anchor"`
 	// ArrivalTable is the pin directory of the arrival program (arrivald): a server span gets
 	// the arrival of its request at the pod (slobudget.arrival_ns), looked up by its parent span
-	// id when the span reaches the agent; on a miss, its own start.  No decision uses it.
-	// Empty: off.
+	// id when the span reaches the agent; on a miss, its own start.  Decisions use it only with
+	// sampler.own_measure within_service.  Empty: off (also when the stamp in the tee has attached
+	// it already, slobudgetarrivalprocessor).
 	ArrivalTable string `mapstructure:"arrival_table"`
 }
 

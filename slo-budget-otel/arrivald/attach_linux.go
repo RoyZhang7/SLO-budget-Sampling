@@ -41,6 +41,8 @@ func open(pid int, iface string) (*attachment, error) {
 }
 
 // attach puts the program at the ingress of the interface in the network namespace of a process.
+// The clsact qdisc's coming and going takes the interface's transmit queue down for a moment
+// (5.15: qdisc_graft deactivates the device), so attach and detach stay outside measured load.
 func attach(pid int, iface string, fd int) (*attachment, error) {
 	a, err := open(pid, iface)
 	if err != nil {

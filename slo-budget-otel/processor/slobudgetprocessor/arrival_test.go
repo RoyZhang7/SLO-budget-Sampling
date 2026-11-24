@@ -13,6 +13,7 @@ import (
 	"go.opentelemetry.io/collector/processor/processortest"
 
 	"github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/arrival"
+	"github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/slobudget"
 )
 
 // arrivalAgent is an agent with a table of 256 slots in memory (spanSpec ids are one byte: a
@@ -28,26 +29,21 @@ func arrivalAgent(t *testing.T, cfg *Config, sink *consumertest.TracesSink) (*ag
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = a.Shutdown(context.Background()) })
-	if a.arr.Table != nil {
+	if a.arr.Opened() {
 		t.Fatal("a table from an empty directory")
 	}
+	const lag = time.Hour
 	mem := make([]byte, 256*arrival.SlotSize+8)
 	for i := 0; i < 8; i++ {
 		if tab, err := arrival.NewTable(mem[i:i+256*arrival.SlotSize], nil); err == nil {
 			mem = mem[i : i+256*arrival.SlotSize]
-			a.mu.Lock()
-			a.arr.Table = tab
-			a.mu.Unlock()
+			a.arr.Use(tab, arrival.NewClock(func() (int64, int64) {
+				n := time.Now().UnixNano()
+				return n, n - int64(lag)
+			}))
 			break
 		}
 	}
-	const lag = time.Hour
-	a.mu.Lock()
-	a.arr.Clock = arrival.NewClock(func() (int64, int64) {
-		n := time.Now().UnixNano()
-		return n, n - int64(lag)
-	})
-	a.mu.Unlock()
 	return a, func(id byte, at time.Time) {
 		s := mem[int(id)*arrival.SlotSize:]
 		binary.LittleEndian.PutUint64(s[arrival.OffID:], uint64(id))
@@ -111,9 +107,7 @@ func TestArrivalIsAttached(t *testing.T) {
 	if at, src := arrivalOf(t, spans[4]); src != "" {
 		t.Errorf("a client span got an arrival (%d, %s)", at, src)
 	}
-	a.mu.Lock()
-	n := a.arr.Counts
-	a.mu.Unlock()
+	n := a.arr.Counts()
 	if n[arrival.Hit] != 1 || n[arrival.MissLate] != 1 || n[arrival.MissEmpty] != 1 {
 		t.Errorf("outcomes %v (%v)", n, arrival.CauseNames)
 	}
@@ -160,10 +154,8 @@ func TestArrivalIsLookedUpBeforeTheHold(t *testing.T) {
 			}
 		}
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.arr.Counts[arrival.MissRoot] != 1 || a.arr.Counts[arrival.Hit] != 1 {
-		t.Errorf("outcomes %v", a.arr.Counts)
+	if n := a.arr.Counts(); n[arrival.MissRoot] != 1 || n[arrival.Hit] != 1 {
+		t.Errorf("outcomes %v", n)
 	}
 }
 
@@ -201,14 +193,12 @@ func TestArrivalDoesNotChangeDecisions(t *testing.T) {
 			}
 		}
 		if table != "" {
-			a.mu.Lock()
-			if a.arr.Counts[arrival.MissNoTable] != 3 {
-				t.Errorf("outcomes %v", a.arr.Counts)
+			if n := a.arr.Counts(); n[arrival.MissNoTable] != 3 {
+				t.Errorf("outcomes %v", n)
 			}
-			if f := a.takeArrivals(); len(f) != int(arrival.NumCauses)+arrival.NumCounters+2 {
+			if f := a.arr.Take(); len(f) != int(arrival.NumCauses)+arrival.NumCounters+2 {
 				t.Errorf("%d log fields", len(f))
 			}
-			a.mu.Unlock()
 		}
 		return kept
 	}
@@ -220,6 +210,107 @@ func TestArrivalDoesNotChangeDecisions(t *testing.T) {
 		if !on[id] {
 			t.Fatalf("kept %v without, %v with", off, on)
 		}
+	}
+}
+
+// own_measure within_service: the outlier test counts from the arrival (the stamp, else the span's
+// start), also when the span was held; own_measure handler does not.
+func TestOwnMeasure(t *testing.T) {
+	for _, hold := range []time.Duration{0, 30 * time.Millisecond} {
+		for measure, want := range map[string][]byte{"handler": {7}, "within_service": {5, 7}} {
+			sink := new(consumertest.TracesSink)
+			cfg := testConfig(t)
+			cfg.Period = time.Hour
+			cfg.ServerHold = hold
+			cfg.Sampler.OutlierTrigger = "own"
+			cfg.Sampler.OwnMeasure = measure
+			cfg.Sampler.InitialPlanP = 0 // outliers only
+			cfg.Sampler.InitialBudget = 100
+			if err := cfg.Validate(); err != nil {
+				t.Fatal(err)
+			}
+			a, put := arrivalAgent(t, cfg, sink)
+			a.mu.Lock()
+			a.s.ApplyCentral(&slobudget.CentralUpdate{Version: 1, Table: map[string]map[string]map[string]float64{"compose_post": {"*": {"socialgraph": 0.003}}},
+				BTable: map[string]map[string]map[string]float64{"compose_post": {"*": {"socialgraph": 0.003}}}}, a.host)
+			a.mu.Unlock()
+			base := time.Now().Add(-100 * time.Millisecond)
+			put(4, base.Add(1500*time.Microsecond)) // span 5's request: 2.5 ms before its handler starts
+			td := buildTraces(1, base, []spanSpec{
+				{"socialgraph", "GetFollowers", 5, 4, 4 * time.Millisecond, time.Millisecond, ptrace.SpanKindServer},     // own 1 ms, 3.5 ms from its arrival
+				{"socialgraph", "GetFollowers", 6, 9, 4 * time.Millisecond, time.Millisecond, ptrace.SpanKindServer},     // no arrival
+				{"socialgraph", "GetFollowers", 7, 9, 4 * time.Millisecond, 4 * time.Millisecond, ptrace.SpanKindServer}, // own 4 ms
+			})
+			if err := a.ConsumeTraces(context.Background(), td); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(3*hold + 20*time.Millisecond)
+			kept := map[byte]bool{}
+			collect := func(td ptrace.Traces) {
+				for i := 0; i < td.ResourceSpans().Len(); i++ {
+					s := td.ResourceSpans().At(i).ScopeSpans().At(0).Spans().At(0)
+					kept[s.SpanID()[7]] = true
+					if v, ok := s.Attributes().Get(AttrOwnUS); !ok || v.Int() > 4000 { // the stamp stays the handler's own time
+						t.Errorf("span %d: own_us %v", s.SpanID()[7], v.AsRaw())
+					}
+				}
+			}
+			if hold == 0 {
+				collect(td)
+			}
+			for _, x := range sink.AllTraces() {
+				collect(x)
+			}
+			ok := len(kept) == len(want)
+			for _, id := range want {
+				ok = ok && kept[id]
+			}
+			if !ok {
+				t.Errorf("hold %v, %s: kept %v, want %v", hold, measure, kept, want)
+			}
+		}
+	}
+}
+
+// Behind the stamp in the tee the agent has no table: it reads the attribute the spans bring and
+// leaves it alone.
+func TestArrivalFromTheTee(t *testing.T) {
+	for measure, want := range map[string]int{"handler": 0, "within_service": 1} {
+		sink := new(consumertest.TracesSink)
+		cfg := testConfig(t)
+		cfg.Period = time.Hour
+		cfg.Sampler.OutlierTrigger = "own"
+		cfg.Sampler.OwnMeasure = measure
+		cfg.Sampler.InitialPlanP = 0 // outliers only
+		a, err := newAgent(processortest.NewNopSettings(typeStr), cfg, sink)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := a.Start(context.Background(), componenttest.NewNopHost()); err != nil {
+			t.Fatal(err)
+		}
+		a.mu.Lock()
+		a.s.ApplyCentral(&slobudget.CentralUpdate{Version: 1, Table: map[string]map[string]map[string]float64{"compose_post": {"*": {"socialgraph": 0.003}}},
+			BTable: map[string]map[string]map[string]float64{"compose_post": {"*": {"socialgraph": 0.003}}}}, a.host)
+		a.mu.Unlock()
+		base := time.Now().Add(-100 * time.Millisecond)
+		td := buildTraces(1, base, []spanSpec{{"socialgraph", "GetFollowers", 5, 4, 4 * time.Millisecond, time.Millisecond, ptrace.SpanKindServer}})
+		sp := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
+		at := base.Add(1500 * time.Microsecond).UnixNano() // own 1 ms, 3.5 ms from its arrival
+		sp.Attributes().PutInt(AttrArrival, at)
+		sp.Attributes().PutStr(AttrArrivalSource, "ebpf")
+		if err := a.ConsumeTraces(context.Background(), td); err != nil {
+			t.Fatal(err)
+		}
+		if td.SpanCount() != want {
+			t.Errorf("%s: %d spans kept, want %d", measure, td.SpanCount(), want)
+		}
+		if want == 1 {
+			if got, src := arrivalOf(t, td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)); got != at || src != "ebpf" {
+				t.Errorf("the stamp became %d, %s", got, src)
+			}
+		}
+		_ = a.Shutdown(context.Background())
 	}
 }
 

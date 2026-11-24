@@ -47,6 +47,7 @@ type EventsDump struct {
 		NBytes    []int     `json:"nbytes"`
 		Transit   []float64 `json:"transit"`
 		Own       []float64 `json:"own"`
+		Wait      []float64 `json:"wait"` // absent: no span has an arrival
 	} `json:"spans"`
 	// the oracle table (route, class, service -> T) when the arm uses calib_source oracle
 	Oracle map[string]map[string]map[string]float64 `json:"oracle,omitempty"`
@@ -87,6 +88,9 @@ func LoadEvents(path string) (*EventsDump, *Corpus, error) {
 			IsRoot: d.Spans.ParentIdx[i] < 0, Service: d.Spans.Service[i], Host: d.Spans.Host[i], Start: d.Spans.Start[i],
 			Duration: d.Spans.Duration[i], StatusOK: d.Spans.StatusOK[i], Depth: d.Spans.Depth[i], Route: d.Spans.Route[i],
 			ReqClass: d.Spans.ReqClass[i], NBytes: d.Spans.NBytes[i], Transit: d.Spans.Transit[i], Own: d.Spans.Own[i]}
+		if len(d.Spans.Wait) == n {
+			c.Spans[i].Wait = d.Spans.Wait[i]
+		}
 		if c.Spans[i].IsRoot {
 			c.Roots = append(c.Roots, i)
 		}

@@ -13,6 +13,7 @@ service is invisible to it: pass every service (comma-separated) to get all
 traces.  The
 output has the query-API shape ({"data": [...]}) that `slo_budget_sim.jaeger`
 loads.  A chunk that returns exactly `limit` traces is reported as truncated.
+Exits 1, without the file, when a chunk could not be fetched.
 """
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ import urllib.parse
 import urllib.request
 
 
-def fetch(base: str, service: str, start_s: float, end_s: float, limit: int, retries: int = 3) -> list:
+def fetch(base: str, service: str, start_s: float, end_s: float, limit: int, retries: int = 6) -> list | None:
     q = urllib.parse.urlencode({"service": service, "start": int(start_s * 1e6), "end": int(end_s * 1e6),
                                 "limit": limit})
     url = f"{base.rstrip('/')}/api/traces?{q}"
@@ -35,8 +36,8 @@ def fetch(base: str, service: str, start_s: float, end_s: float, limit: int, ret
             return obj.get("data") or []
         except Exception as e:                      # noqa: BLE001 - report and retry
             print(f"  attempt {attempt + 1} failed for {start_s:.0f}-{end_s:.0f}: {e}", file=sys.stderr)
-            time.sleep(5)
-    return []
+            time.sleep(min(60, 5 * 2 ** attempt))
+    return None
 
 
 def main() -> int:
@@ -60,6 +61,9 @@ def main() -> int:
         got, new = 0, 0
         for service in services:
             data = fetch(a.base, service, t, e, a.limit)
+            if data is None:
+                print(f"FAILED: {service}, {t:.0f}-{e:.0f}: no answer")
+                return 1
             got += len(data)
             for tr in data:
                 tid = tr.get("traceID")

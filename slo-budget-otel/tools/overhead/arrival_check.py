@@ -6,9 +6,10 @@ load running or just over) do the ids arrive?
 
 Per node: arrivald's container is ready and has not restarted, its newest "counters" line is under 15 s old and counts the node's gRPC
 service pods (the *-service-pb-es-ctr pods but the HTTP root and tracepressure, which have no listener on the services' port);
-the last thing the node's agent said about the table is that it is open.  With --traffic also: the program found ids and had no errors in
-its counters since it started, and the agent's newest period line has at least HIT of the lookups with a parent answered by the program.
-Exits 1, the last line saying what is missing, when that does not hold within --wait seconds.
+the last thing the node's stamping container (the tee where the collector pod has one, else the agent) said about the table is that it
+is open.  With --traffic also: the program found ids and had no errors in its counters since it started, and of that container's
+newest ENOUGH lookups with a parent (whole period lines) at least HIT were answered by the program.
+Exits 1, the last line saying what is missing, when that does not hold within --wait seconds (at least two attempts).
 """
 from __future__ import annotations
 
@@ -23,7 +24,9 @@ import time
 NOT_GRPC = ("wrk2api-", "tracepressure-")
 FRESH_S = 15
 HIT = 0.95
+ENOUGH = 200                    # lookups to judge by: the newest periods that have as many (a load's last one can hold a few only)
 MISSES = ("no_table", "empty", "not_stored", "overwritten", "torn", "late")
+AGENT, TEE = "otelcol-pb-es-ctr", "tee"     # a campaign run's collector pod has the tee in front of the agent
 
 
 def kubectl(*args: str) -> str:
@@ -40,7 +43,7 @@ def pods_of(doc: dict) -> list[dict]:
         if p["status"].get("phase") != "Running" or p["metadata"].get("deletionTimestamp"):
             continue
         cs = p["status"].get("containerStatuses") or []
-        out.append({"name": p["metadata"]["name"], "node": p["spec"].get("nodeName", ""), "ready": bool(cs) and all(c.get("ready") for c in cs),
+        out.append({"name": p["metadata"]["name"], "node": p["spec"].get("nodeName", ""), "containers": [c["name"] for c in p["spec"].get("containers") or []], "ready": bool(cs) and all(c.get("ready") for c in cs),
                     "restarts": sum(c.get("restartCount", 0) for c in cs)})
     return out
 
@@ -99,18 +102,18 @@ def agent_problems(node: str, pod: dict | None, log: str, traffic: bool) -> list
     if not traffic:
         return []
     hit = miss = 0
-    for ln in log.splitlines():
+    for ln in reversed(log.splitlines()):
+        if hit + miss >= ENOUGH:
+            break
         if "slobudget arrival" not in ln or "{" not in ln:
             continue
         try:
             d = json.loads(ln[ln.index("{"):])
         except ValueError:
             continue
-        h, m = d.get("hit", 0), sum(d.get(k, 0) for k in MISSES)
-        if h + m:       # the newest period with lookups (the load may be over)
-            hit, miss = h, m
+        hit, miss = hit + d.get("hit", 0), miss + sum(d.get(k, 0) for k in MISSES)
     if hit + miss == 0 or hit < HIT * (hit + miss):
-        return [f"{node}: {hit} of the {hit + miss} lookups of the agent's last period with any came from the program"]
+        return [f"{node}: {hit} of the {hit + miss} lookups of the agent's last periods came from the program"]
     return []
 
 
@@ -123,7 +126,7 @@ def problems(pods: list[dict], logs, now: float, traffic: bool) -> list[str]:
         loader = next((p for p in pods if p["name"].startswith("slobudget-arrival") and p["node"] == node), None)
         agent = next((p for p in pods if p["name"].startswith("otelcol-pb-es-ctr") and p["node"] == node), None)
         bad += loader_problems(node, loader, logs(loader["name"]) if loader else "", n, now, traffic)
-        bad += agent_problems(node, agent, logs(agent["name"]) if agent else "", traffic)
+        bad += agent_problems(node, agent, logs(agent["name"], TEE if TEE in agent["containers"] else AGENT) if agent else "", traffic)
     return bad
 
 
@@ -132,16 +135,17 @@ def main() -> int:
     ap.add_argument("--traffic", action="store_true")
     ap.add_argument("--wait", type=float, default=60)
     a = ap.parse_args()
-    end = time.time() + a.wait
+    end, tries = time.time() + a.wait, 0
     while True:
+        tries += 1
         try:
-            bad = problems(pods_of(json.loads(kubectl("get", "pods", "-o", "json"))), lambda p: kubectl("logs", p), time.time(), a.traffic)
+            bad = problems(pods_of(json.loads(kubectl("get", "pods", "-o", "json"))), lambda p, c=None: kubectl("logs", p, *(["-c", c] if c else [])), time.time(), a.traffic)
         except (ValueError, KeyError) as e:     # kubectl failed, or half an answer: once more
             bad = [str(e)]
         if not bad:
             print("arrival: the program is at every service pod, every agent reads the table" + (", the ids arrive" if a.traffic else ""))
             return 0
-        if time.time() > end:
+        if time.time() > end and tries >= 2:        # one kubectl error is not a missing arrival
             print("; ".join(bad))
             return 1
         time.sleep(3)

@@ -5,9 +5,11 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/cilium/ebpf"
+	"golang.org/x/sys/unix"
 
 	"github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/arrival"
 	"github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/arrivald/prog"
@@ -19,6 +21,23 @@ func TestKernelAgreesWithInterpreter(t *testing.T) {
 	if os.Getenv("ARRIVAL_KERNEL") == "" {
 		t.Skip("ARRIVAL_KERNEL is not set")
 	}
+	// one CPU: "crowded" depends on what earlier packets left in the per-CPU buffer, which the
+	// interpreter has one of
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	var all, one unix.CPUSet
+	if err := unix.SchedGetaffinity(0, &all); err != nil {
+		t.Fatal(err)
+	}
+	for c := 0; one.Count() == 0; c++ {
+		if all.IsSet(c) {
+			one.Set(c)
+		}
+	}
+	if err := unix.SchedSetaffinity(0, &one); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = unix.SchedSetaffinity(0, &all) }()
 	const slots = 256
 	cfg := prog.Config{Port: port, Slots: slots}
 	ts, cs, ss := prog.Specs(cfg)

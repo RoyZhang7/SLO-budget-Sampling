@@ -21,7 +21,7 @@ import (
 	"go.opentelemetry.io/collector/processor"
 	"go.uber.org/zap"
 
-	"github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/arrival"
+	"github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/processor/internal/arrivalstamp"
 	"github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/slobudget"
 )
 
@@ -39,9 +39,9 @@ const (
 	AttrRootPinned = "slobudget.root_pinned"
 	AttrBR         = "_br" // path bridge: uvarint(depth) || 8-byte checkpoint anchor || bloom
 	// the arrival of a server span's request at the pod, unix ns in the span's clock, and where
-	// it comes from: "ebpf" (the arrival program) or "start" (a miss: the span's own start)
-	AttrArrival       = "slobudget.arrival_ns"
-	AttrArrivalSource = "slobudget.arrival_source"
+	// it comes from: attached here (arrival_table) or already there (the stamp in the tee)
+	AttrArrival       = arrivalstamp.Attr
+	AttrArrivalSource = arrivalstamp.AttrSource
 )
 
 type interval struct{ start, end float64 }
@@ -111,12 +111,7 @@ type agent struct {
 	out        ptrace.Traces
 	heldBytes  int
 
-	// arrival stamps (arrival_table; nil: off): the lookups, the table's identity (it is opened
-	// again when arrivald pins it anew) and the program's counters at the last period
-	arr     *arrival.Resolver
-	arrID   string
-	arrCtr  *arrival.Counters
-	arrLast [arrival.NumCounters]uint64
+	arr *arrivalstamp.Stamper // arrival stamps (arrival_table; nil: off)
 }
 
 type decidedSpan struct {
@@ -161,7 +156,7 @@ func newAgent(set processor.Settings, cfg *Config, next consumer.Traces) (*agent
 	}
 	a.s = s
 	if cfg.ArrivalTable != "" { // opened in Start
-		a.arr = &arrival.Resolver{Clock: arrival.NewClock(arrival.SampleClocks)}
+		a.arr = arrivalstamp.New(cfg.ArrivalTable, set.Logger)
 	}
 	if cfg.TTableFile != "" {
 		raw, err := os.ReadFile(cfg.TTableFile)
@@ -199,7 +194,7 @@ func (a *agent) Start(ctx context.Context, _ component.Host) error {
 		go func() { _ = a.sdkSrv.Serve(ln) }()
 	}
 	if a.arr != nil {
-		a.openArrival()
+		a.arr.Open()
 	}
 	a.period = a.periodOf(time.Now())
 	a.wg.Add(2)
@@ -209,7 +204,8 @@ func (a *agent) Start(ctx context.Context, _ component.Host) error {
 		go a.pullConfig(bg, true)
 	}
 	a.log.Info("slobudget agent started", zap.String("host", a.host), zap.Duration("period", a.cfg.Period),
-		zap.String("central", a.cfg.Central), zap.Float64("n_need", a.s.NNeed), zap.Float64("B", a.s.B))
+		zap.String("central", a.cfg.Central), zap.Float64("n_need", a.s.NNeed), zap.Float64("B", a.s.B),
+		zap.String("own_measure", a.cfg.Sampler.OwnMeasure))
 	return nil
 }
 
@@ -225,7 +221,7 @@ func (a *agent) Shutdown(context.Context) error {
 	}
 	a.wg.Wait()
 	if a.arr != nil {
-		a.closeArrival()
+		a.arr.Close()
 	}
 	return nil
 }
@@ -311,8 +307,13 @@ func (a *agent) decide(rs ptrace.ResourceSpans, ss ptrace.ScopeSpans, span ptrac
 		}
 	}
 	parent := span.ParentSpanID()
-	if a.arr != nil && span.Kind() == ptrace.SpanKindServer {
-		a.stampArrival(span)
+	if span.Kind() == ptrace.SpanKindServer {
+		if a.arr != nil { // before any hold: the table keeps an id only until its slot is taken
+			a.arr.Stamp(span)
+		}
+		if v, ok := attrs.Get(AttrArrival); ok { // own_measure within_service counts from it
+			sp.Wait = slobudget.ArrivalWait(int64(span.StartTimestamp()), v.Int())
+		}
 	}
 	isClient := span.Kind() == ptrace.SpanKindClient
 	if isClient {
@@ -674,7 +675,7 @@ func (a *agent) flushLoop(ctx context.Context) {
 			}
 			n++
 			if a.arr != nil && n%40 == 0 { // every second
-				a.arr.Clock.Tick()
+				a.arr.Tick()
 			}
 			if n%4 != 0 {
 				out := a.out
@@ -748,13 +749,16 @@ func (a *agent) periodLoop(ctx context.Context) {
 		st.Version = a.version
 		kp := a.stats // keep_parent counters for the log line
 		a.stats = agentCounters{}
-		arrived := a.takeArrivals()
+		var arrived []zap.Field
+		if a.arr != nil {
+			arrived = a.arr.Take()
+		}
 		a.s.ResetPeriod()
 		a.lastStat = st
 		a.period++
 		a.mu.Unlock()
-		if arrived != nil {
-			a.openArrival()
+		if a.arr != nil {
+			a.arr.Open()
 		}
 		if a.cfg.StatsLog {
 			sent, recv, uni := a.notices.counts()

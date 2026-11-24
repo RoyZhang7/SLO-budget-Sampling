@@ -196,7 +196,7 @@ def evaluate_run(meta: dict, t: SpanTable, kidx: np.ndarray, recon: dict | None,
     normal = end_s < fs
     kept = np.zeros(t.n, dtype=bool)
     kept[kidx[kidx >= 0]] = True
-    out = {"run_id": meta["run_id"], "arm": meta["arm"], "scenario": meta["scenario"], "volume_frac": meta["volume_frac"],
+    out = {"run_id": meta["run_id"], "arm": meta.get("arm_label") or meta["arm"], "scenario": meta["scenario"], "volume_frac": meta["volume_frac"],
            "seed": meta["seed"], "truth": {"kind": kind, "services": hits},
            "window_s": {"normal": [w0, fs], "fault": [fs, fe]}, "variants": {}}
     inject_us = int(fs * 1e6)

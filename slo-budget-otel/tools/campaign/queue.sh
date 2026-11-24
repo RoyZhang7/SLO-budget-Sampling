@@ -7,7 +7,8 @@
 # It is re-read before every job, so jobs can be appended or reordered while it runs.  A job
 # whose run directory has `collected` is skipped; a failed job is retried once, then left
 # `failed`.  Touch $STAGE3/STOP (or let a sanity check do it) to halt after the current run;
-# the runner waits until STOP is removed.  Progress: $STAGE3/queue.log.
+# the runner waits until STOP is removed; it writes STOP itself when four tries in a row failed.
+# Progress: $STAGE3/queue.log.
 set -u
 cd "$(dirname "$0")/../.."
 MOD=$(pwd)
@@ -22,6 +23,7 @@ rundir() {   # rundir arm scenario volume seed [env tokens]
     echo "$STAGE3/runs/$id"
 }
 log "queue runner start (pid $$, queue $Q)"
+row=0
 while true; do
     if [ -f "$STAGE3/STOP" ]; then
         log "STOP present: $(tail -1 "$STAGE3/STOP")"
@@ -52,7 +54,11 @@ while true; do
     log "start $next (try $(cat "$rd/tries"))"
     if env "${@:5}" bash "$MOD/tools/campaign/run_one.sh" "$1" "$2" "$3" "$4" > "$rd/run_one.out" 2>&1; then
         log "collected $next"
+        row=0
     else
         log "FAILED $next: $(cat "$rd/failed" 2>/dev/null)"
+        row=$((row + 1))
+        if [ $row -ge 4 ]; then echo "$row tries in a row failed, the last one $next: $(cat "$rd/failed" 2>/dev/null)" >> "$STAGE3/STOP"; row=0; fi
+        sleep "${PAUSE:-60}"
     fi
 done

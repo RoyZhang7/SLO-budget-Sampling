@@ -3,3 +3,5 @@ results/
 *.test
 tools/hog/hog
 SOURCE.json
+__pycache__/
+.pytest_cache/

@@ -21,6 +21,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+from sloeval import runinfo  # noqa: E402
 from sloeval.rca import METHODS, SCORED, VARIANTS, evaluate_run, recon_parents  # noqa: E402
 from sloeval.spans import join, read_export, read_shadow  # noqa: E402
 
@@ -50,7 +51,7 @@ def main() -> int:
     ap.add_argument("--skip-existing", action="store_true", help="skip variants rca.json already holds")
     a = ap.parse_args()
     rd = a.run_dir
-    meta = json.load(open(os.path.join(rd, "meta.json")))
+    meta = runinfo.load_meta(rd)
     if meta.get("scenario") not in SCORED or not meta.get("fault"):
         print(f"{meta.get('run_id')}: scenario {meta.get('scenario')} is not scored")
         return 0

@@ -19,8 +19,8 @@ def stamp(ago):
     return datetime.datetime.fromtimestamp(NOW - ago, datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def pod(name, node, ready=True, restarts=0, deleting=False):
-    return {"metadata": {"name": name, **({"deletionTimestamp": "x"} if deleting else {})}, "spec": {"nodeName": node},
+def pod(name, node, ready=True, restarts=0, deleting=False, containers=("otelcol-pb-es-ctr",)):
+    return {"metadata": {"name": name, **({"deletionTimestamp": "x"} if deleting else {})}, "spec": {"nodeName": node, "containers": [{"name": c} for c in containers]},
             "status": {"phase": "Running", "containerStatuses": [{"ready": ready, "restartCount": restarts}]}}
 
 
@@ -39,7 +39,12 @@ LOGS = {"slobudget-arrival-a": '{"msg":"loaded"}\nplain\n[1]\n' + line(1, 30) + 
 
 
 def check(logs=None, doc=DOC, traffic=True):
-    return ac.problems(ac.pods_of(doc), {**LOGS, **(logs or {})}.get, NOW, traffic)
+    tees = {p["metadata"]["name"] for p in doc["items"] if len(p["spec"]["containers"]) > 1}
+
+    def of(pod, container=None):        # with a tee in the pod it is the tee that stamps
+        assert container == (("tee" if pod in tees else "otelcol-pb-es-ctr") if pod.startswith("otelcol") else None)
+        return {**LOGS, **(logs or {})}[pod]
+    return ac.problems(ac.pods_of(doc), of, NOW, traffic)
 
 
 def test_expected_counts_grpc_service_pods():
@@ -66,8 +71,25 @@ def test_what_is_missing(logs, says):
     assert len(bad) == 1 and says in bad[0]
 
 
+def test_campaign_run_with_a_tee():
+    doc = copy.deepcopy(DOC)
+    for p in doc["items"]:
+        if p["metadata"]["name"].startswith("otelcol"):
+            p["spec"]["containers"] = [{"name": "tee"}, {"name": "otelcol-pb-es-ctr"}]
+    assert check(doc=doc) == []
+    assert "has not opened the table" in check({"otelcol-pb-es-ctr-a": "x"}, doc=doc)[0]
+
+
 def test_lookups_are_asked_for_with_traffic_only():
     assert check({"otelcol-pb-es-ctr-a": "x arrival table open {}"}, traffic=False) == []
+
+
+def test_a_last_period_with_a_few_lookups():
+    few = 'x slobudget arrival {"hit": 15, "not_stored": 2}\n'         # one split id among the load's last lookups
+    good, old = 'x slobudget arrival {"hit": 1990, "empty": 8}\n', 'x slobudget arrival {"hit": 0, "no_table": 5000}\n'
+    assert check({"otelcol-pb-es-ctr-a": "x arrival table open {}\n" + old + good + few}) == []
+    assert "17 lookups" in check({"otelcol-pb-es-ctr-a": "x arrival table open {}\n" + few})[0]
+    assert "5017 lookups" in check({"otelcol-pb-es-ctr-a": "x arrival table open {}\n" + good + old + few})[0]
 
 
 def test_restart_missing_loader_no_pods():
@@ -80,7 +102,7 @@ def test_restart_missing_loader_no_pods():
 
 def test_age():
     assert ac.age(stamp(7.25), NOW) == pytest.approx(7.25, abs=1e-3)
-    assert ac.age("2026-11-23T22:43:01.123456789-06:00", 0) == pytest.approx(ac.age("2026-11-24T04:43:01.123456Z", 0))
+    assert ac.age("2026-11-23T22:43:01.123456789-06:00", 0) == pytest.approx(ac.age("2026-11-24T04:43:01.123456Z", 0), abs=1e-3)
     for bad in ("", "yesterday", "2026-11-23"):
         with pytest.raises(ValueError):
             ac.age(bad, 0)
@@ -95,9 +117,13 @@ def test_arrival_share(tmp_path):
 def test_program_cost_inside_the_load(tmp_path):
     t0 = NOW - 100
     lines = ["not json", line(3, 200, run_ns=10 ** 9, runs=1)] + [line(3, s, run_ns=3_000_000, runs=1500) for s in (90, 85, 80)] + [line(3, -50, run_ns=10 ** 9, runs=1)]
-    (tmp_path / "arrival-node-1.log").write_text("\n".join(lines) + "\n")
+    for n in (1, 2):
+        (tmp_path / f"arrival-node-{n}.log").write_text("\n".join(lines) + "\n")
+    (tmp_path / "arrival-node-2.previous.log").write_text("\n".join(lines) + "\n")
+    assert all(math.isnan(x) for x in tables.program(str(tmp_path), t0, NOW))      # one node's log is missing
+    (tmp_path / "arrival-node-3.log").write_text("\n".join(lines) + "\n")
     cores, ns = tables.program(str(tmp_path), t0, NOW)
-    assert cores == pytest.approx(9e6 / 1e9 / 95) and ns == pytest.approx(2000)
+    assert cores == pytest.approx(3 * 9e6 / 1e9 / 95) and ns == pytest.approx(2000)
 
 
 def test_node_cpu_over_its_own_interval(tmp_path):

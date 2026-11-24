@@ -11,8 +11,9 @@ late_everywhere's spinner sets the severity only roughly) and, for the burner sc
 load's bursts fell in the burner's quota period ("burst after the refresh, by seed"; burst_phase.json of
 burst_phase.py), which the over-SLO share follows.  Tables: (1) competitors
 (chosen, head, tail, reservoir, canopy, hindsight / vaif when their runs exist), (2)
-ablations (chosen, threshold, keep-parent), (3) the fault window under each truth (Stage 3:
-single culprit, own time, the culprit's node, duration), (4) reconstruction coverage.  The
+ablations (chosen, threshold, keep-parent, and every arm-variant of run_one.sh's VARIANT), (3) the fault window under
+each truth (Stage 3: single culprit, own time, the culprit's node, duration), (4) the common truth of all arms
+(the runs evaluated with it), (5) reconstruction coverage.  The
 Stage 2d series (run ids 2d-*, tools/eval/compare2d.py), invalid-* and smoke-* runs and runs with an
 INVALID file are left out.
 """
@@ -59,6 +60,19 @@ FAULT_COLUMNS = [
     ("faulty-span coverage", "faulty_span_coverage", "{:.2f}", 1.0),
     ("culprit keeps/period", "culprit_outlier_keeps_per_period", "{:.1f}", 1.0),
     ("caller share", "outlier_keeps_callers_window_frac", "{:.2f}", 1.0),
+]
+# the common truth of all arms (sloeval/arrivals.py): within-service latency on the estimated kernel receive time
+WS_COLUMNS = [
+    ("volume / target", "vol_ratio", "{:.2f}", 1.0),
+    ("healthy truth rate", "truth_rate_healthy_ws", "{:.2f}%", 100.0),
+    ("outlier share", "outlier_share_ws", "{:.1f}%", 100.0),
+    ("precision", "outlier_precision_ws", "{:.2f}", 1.0),
+    ("prec. in the window", "outlier_precision_ws_window", "{:.2f}", 1.0),
+    ("recall in the window", "recall_ws_window", "{:.2f}", 1.0),
+    ("culprit recall", "recall_culprit_ws", "{:.2f}", 1.0),
+    ("evidence s", "evidence_ws_s", "{:.2f}", 1.0),
+    ("over SLO with a culprit outlier", "over_slo_with_culprit_truth_ws", "{:.1f}%", 100.0),
+    ("... kept", "over_slo_with_culprit_outlier_kept", "{:.1f}%", 100.0),
 ]
 RECON_COLUMNS = [
     ("orphans/kept", "recon_orphans_frac_of_kept", "{:.0f}%", 100.0),
@@ -209,19 +223,24 @@ def main() -> int:
     a = ap.parse_args()
     summaries = load(a.runs_root)
     comp = build(summaries, a.volume, a.scenarios, a.seeds, COMPETITORS, COLUMNS)
-    abl = build(summaries, a.volume, a.scenarios, a.seeds, ABLATIONS, COLUMNS)
     arms_present = [x for x in dict.fromkeys(s.get("arm") for s in summaries) if x]
-    present = [x for x in COMPETITORS + ABLATIONS[1:] if x in arms_present]
+    variants = tuple(sorted(x for x in arms_present if x not in COMPETITORS + ABLATIONS))      # arm-variant (run_one.sh's VARIANT)
+    abl = build(summaries, a.volume, a.scenarios, a.seeds, ABLATIONS + variants, COLUMNS)
+    present = [x for x in COMPETITORS + ABLATIONS[1:] + variants if x in arms_present]
     rec = build(summaries, a.volume, a.scenarios, a.seeds, present, RECON_COLUMNS)
+    with_ws = [s for s in summaries if s.get("recall_ws") is not None]
+    ws = build(with_ws, a.volume, a.scenarios, a.seeds, [x for x in present if any(s.get("arm") == x for s in with_ws)], WS_COLUMNS) if with_ws else []
     faulted = [sc for sc in a.scenarios if sc not in ("steady", "bursty")]
     flt = build(summaries, a.volume, faulted, a.seeds, present, FAULT_COLUMNS)
     if a.json:
-        print(json.dumps({"volume": a.volume, "competitors": comp, "ablations": abl, "fault": flt, "recon": rec}, indent=1))
+        print(json.dumps({"volume": a.volume, "competitors": comp, "ablations": abl, "fault": flt, "recon": rec, "common_truth": ws}, indent=1))
         return 0
     v = f"collection volume target {a.volume:.0%}"
     print(markdown(comp, COLUMNS, f"Competitors, {v}"))
     print(markdown(abl, COLUMNS, f"Ablations, {v}"))
     print(markdown(flt, FAULT_COLUMNS, f"Fault window under each truth, {v}"))
+    if ws:
+        print(markdown(ws, WS_COLUMNS, f"Common truth of all arms: within-service latency on the estimated kernel receive time, {v} (window: the fault, bursty: the burst, steady: the run)"))
     print(markdown(rec, RECON_COLUMNS, f"Reconstruction coverage, {v}", extra=("hole length 1/2/3/4+", "hole_dist")))
     return 0
 

@@ -14,12 +14,14 @@ exec 9> "$STAGE3/postprocess.lock"
 flock 9
 log() { echo "$(date '+%F %T') $*"; }
 log "postprocess $RD"
+rm -f "$RD/postprocess-failed"
 SERVICES=$(for n in wrk2api composepost hometimeline usertimeline post_storage text urlshorten usermention socialgraph uniqueid media user; do printf 'unknown_service:%s_service_pb_es_proc,' $n; done)
 T0=$(python3 -c "import json; print(int(json.load(open('$RD/meta.json'))['t0']))")
 T1=$(python3 -c "import json; print(int(json.load(open('$RD/meta.json'))['t1']) + 1)")
 if [ ! -s "$RD/export.json" ] && [ ! -s "$RD/export.json.zst" ]; then
     nice -n 5 python3 "$HOME/slo-budget-sim/tools/jaeger_export.py" --base "$JQ" --service "$SERVICES" --start $((T0 - 5)) --end $((T1 + 30)) \
-        --chunk 60 --limit 50000 --out "$RD/export.json" > "$RD/export.log" 2>&1 || { log "export failed"; echo "export" > "$RD/postprocess-failed"; exit 1; }
+        --chunk 60 --limit 50000 --out "$RD/export.json" > "$RD/export.log" 2>&1 || { log "export failed: $(tail -1 "$RD/export.log")"; rm -f "$RD/export.json"; echo "export" > "$RD/postprocess-failed"
+             [ "${SANITY:-1}" = 1 ] && echo "$(basename "$RD"): the Jaeger export failed, the run is not checked: $(tail -1 "$RD/export.log")" >> "$STAGE3/STOP"; exit 1; }
     log "export: $(tail -1 "$RD/export.log")"
 fi
 grep -h 'capgate period' "$RD/central.log" | sed 's/^[^{]*//' > "$RD/gate.jsonl"

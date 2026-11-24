@@ -7,6 +7,7 @@ import json
 import os
 import re
 
+DEPLOY = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "deploy"))
 PROM_LINE = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+([-+0-9.eEinfINFNa]+)(\s+\d+)?$')
 PROM_LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"')
 
@@ -27,7 +28,18 @@ def load_meta(run_dir: str) -> dict:
     meta.setdefault("slo_ms", {"compose_post": 23.4})
     meta.setdefault("arm_params", {})
     meta.setdefault("placement", {})
+    meta["arm_label"] = arm_label(meta)
     return meta
+
+
+def arm_label(meta: dict) -> str:
+    """The run's arm in every table: a variant of an arm is an arm of its own."""
+    return meta["arm"] + (f"-{meta['variant']}" if meta.get("variant") else "")
+
+
+def central_callgraph(meta: dict) -> str:
+    """The call graph file the run's central had (runs from before it was recorded: callgraph.json)."""
+    return os.path.join(DEPLOY, meta.get("callgraph") or "callgraph.json")
 
 
 def zap_records(path: str, message: str) -> list[dict]:

@@ -5,7 +5,8 @@ with --no-tee), for one arm and volume.
 
   python3 tools/campaign/render.py --arm chosen --volume 0.12 --seed 1 --image IMG [--no-tee] > m.yaml
   python3 tools/campaign/render.py --arm tail --volume 0.12 --image IMG --print central   # one collector config
-  ... --arrival /sys/fs/bpf/slobudget      the eBPF arrival stamp: arrivald on every node, and the agents read its table
+  ... --arrival /sys/fs/bpf/slobudget      the eBPF arrival stamp: arrivald on every node, and the tee (before its fork, so that
+                                           the 100 % shadow carries the stamp too) or, without a tee, the agent reads its table
 
 Arms: chosen, threshold, keep-parent (the SLO-budget agent and central), head (stock
 probabilistic_sampler at the agents, hash of the trace id), tail (stock tail_sampling at the
@@ -27,7 +28,7 @@ import sys
 SPANS_PER_PERIOD = 11500          # 100 req/s x 23 spans x 5 s, the deployment's measured volume
 SLO_MS = 23.4
 SERVICE_PORT = 12345              # the services' gRPC port
-ARRIVAL_SLOTS = 1 << 17           # 2 MiB: under 0.1 % lost at 300 req/s at the SDKs' export delay (README, arrival stamp)
+ARRIVAL_SLOTS = 1 << 20           # 16 MiB a node; how many are needed: README, arrival stamp
 SLOBUDGET_ARMS = ("chosen", "threshold", "keep-parent")
 ARMS = SLOBUDGET_ARMS + ("head", "tail", "reservoir", "canopy")
 
@@ -76,6 +77,9 @@ def sampler_overrides(arm: str) -> str:
         lines += [f"outlier_trigger: {os.environ['OUTLIER_TRIGGER']}"]
     if os.environ.get("OWN_MARGIN"):
         lines += [f"own_margin: {float(os.environ['OWN_MARGIN']):g}"]
+    # handler (default) | within_service (the own time counts from the request's arrival; needs --arrival)
+    if os.environ.get("OWN_MEASURE"):
+        lines += [f"own_measure: {os.environ['OWN_MEASURE']}"]
     return "".join(ln + "\n" for ln in lines)
 
 
@@ -285,14 +289,33 @@ service:
 """
 
 
-def tee_config(shadow: str) -> str:
+def tee_config(shadow: str, arrival: str = "") -> str:
+    if arrival:         # one pipeline: every span is stamped once, and the agent and the shadow get the same stamp
+        procs = f"""processors:
+  slobudgetarrival:
+    arrival_table: {arrival}
+"""
+        pipes = """    traces:
+      receivers: [otlp]
+      processors: [slobudgetarrival]
+      exporters: [otlp/agent, otlp/shadow]
+"""
+    else:
+        procs = ""
+        pipes = """    traces/agent:
+      receivers: [otlp]
+      exporters: [otlp/agent]
+    traces/shadow:
+      receivers: [otlp]
+      exporters: [otlp/shadow]
+"""
     return f"""receivers:
   otlp:
     protocols:
       grpc:
         endpoint: 0.0.0.0:4317
         max_recv_msg_size_mib: 32
-exporters:
+{procs}exporters:
   otlp/agent:
     endpoint: localhost:4319
     tls:
@@ -322,13 +345,7 @@ exporters:
       max_elapsed_time: 120s
 service:
 {block(telemetry(8889, 'normal'), 2)}  pipelines:
-    traces/agent:
-      receivers: [otlp]
-      exporters: [otlp/agent]
-    traces/shadow:
-      receivers: [otlp]
-      exporters: [otlp/shadow]
-"""
+{pipes}"""
 
 
 def arrival_daemonset(image: str, pin: str, slots: int) -> str:
@@ -354,8 +371,8 @@ spec:
           command: ["/arrivald"]
           args: ["-port", "{SERVICE_PORT}", "-slots", "{slots}", "-pin", "{pin}", "-stats"]
           securityContext: {{privileged: true}}
-          resources:
-            limits: {{cpu: 200m, memory: 256Mi}}
+          resources:          # a core: not throttled while it holds the RTNL lock (attach, detach)
+            limits: {{cpu: "1", memory: 256Mi}}
             requests: {{cpu: 50m, memory: 64Mi}}
           volumeMounts:
             - {{name: bpffs, mountPath: /sys/fs/bpf}}
@@ -399,10 +416,12 @@ def main() -> int:
     agent_port = 4319 if tee else 4317
     if a.arrival and a.arm not in SLOBUDGET_ARMS:
         raise SystemExit("--arrival: the agent of the SLO-budget arms reads the table")
-    agent = agent_config(a.arm, a.volume, v_star, a.seed, agent_port, json.loads(a.shares), a.arrival)
+    if os.environ.get("OWN_MEASURE") == "within_service" and a.arm in SLOBUDGET_ARMS and not a.arrival:
+        raise SystemExit("OWN_MEASURE=within_service needs --arrival: without the arrivals it is the handler's own time")
+    agent = agent_config(a.arm, a.volume, v_star, a.seed, agent_port, json.loads(a.shares), "" if tee else a.arrival)
     central = central_config(a.arm, a.volume, v_star, a.seed, a.tail_wait, not a.no_capgate)
     if a.print:
-        sys.stdout.write({"agent": agent, "central": central, "tee": tee_config(a.shadow)}[a.print])
+        sys.stdout.write({"agent": agent, "central": central, "tee": tee_config(a.shadow, a.arrival)}[a.print])
         return 0
     docs = [configmap("slobudget-central-config", "slobudget-central", "config.yaml", central),
             configmap("slobudget-callgraph", "slobudget-central", "callgraph.json", pathlib.Path(a.callgraph).read_text())]
@@ -464,7 +483,7 @@ spec:
             raise SystemExit("reservoir needs --ttable")
         docs.append(configmap("slobudget-ttable", "slobudget-agent", "ttable.json", pathlib.Path(a.ttable).read_text()))
     if tee:
-        docs.append(configmap("slobudget-tee-config", "slobudget-agent", "config.yaml", tee_config(a.shadow)))
+        docs.append(configmap("slobudget-tee-config", "slobudget-agent", "config.yaml", tee_config(a.shadow, a.arrival)))
     docs.append("""apiVersion: v1
 kind: Service
 metadata:
@@ -482,11 +501,16 @@ spec:
     if a.arm == "reservoir":
         mounts += "            - {name: ttable, mountPath: /etc/slobudget}\n"
         vols += "        - name: ttable\n          configMap: {name: slobudget-ttable}\n"
-    sec = ""
-    if a.arrival:               # the agent maps the pinned table: CAP_BPF opens it, reading needs nothing more
-        mounts += "            - {name: bpffs, mountPath: /sys/fs/bpf, readOnly: true}\n"
+    sec = tee_sec = tee_mounts = ""
+    if a.arrival:               # the container that stamps maps the pinned table: CAP_BPF opens it, reading needs nothing more
+        bpffs = "            - {name: bpffs, mountPath: /sys/fs/bpf, readOnly: true}\n"
+        cap = "          securityContext:\n            capabilities: {add: [BPF]}\n"
+        if tee:
+            tee_sec, tee_mounts = cap, bpffs
+        else:
+            sec = cap
+            mounts += bpffs
         vols += "        - name: bpffs\n          hostPath: {path: /sys/fs/bpf, type: Directory}\n"
-        sec = "          securityContext:\n            capabilities: {add: [BPF]}\n"
         docs.append(arrival_daemonset(a.image, a.arrival, a.arrival_slots))
     tee_c = ""
     if tee:
@@ -503,9 +527,9 @@ spec:
           resources:
             limits: {{cpu: "1", memory: 2Gi}}
             requests: {{cpu: "1", memory: 2Gi}}
-          volumeMounts:
+{tee_sec}          volumeMounts:
             - {{name: tee-config, mountPath: /etc/otelcol-tee}}
-"""
+{tee_mounts}"""
     docs.append(f"""apiVersion: apps/v1
 kind: DaemonSet
 metadata:

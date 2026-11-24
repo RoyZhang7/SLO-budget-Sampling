@@ -395,6 +395,37 @@ func TestTooManyCandidates(t *testing.T) {
 	}
 }
 
+// Payload in page fragments (outside the skb's linear part) is read like any other and counted.
+func TestPaged(t *testing.T) {
+	const hdr = 14 + 20 + 32 // of a frame with 12 bytes of TCP options
+	two := append(message(100, 0xa1), message(300, 0xb2)...)
+	first := 100 + prog.KeyLen + prog.IDLen            // the first id's end in the payload
+	second := len(message(100, 1)) + 300 + first - 100 // the second's
+	for _, x := range []struct{ linear, paged, ids uint64 }{
+		{0, 0, 0}, {hdr, 1, 2}, {hdr + 1, 1, 2}, {hdr + uint64(first) - 1, 1, 2}, {hdr + uint64(first), 1, 1},
+		{hdr + uint64(second) - 1, 1, 1}, {hdr + uint64(second), 1, 0}, {hdr + uint64(len(two)) - 1, 1, 0}, {hdr + uint64(len(two)), 0, 0}, {1 << 16, 0, 0},
+	} {
+		b := newBench(t, 1024)
+		b.vm.Linear = int(x.linear)
+		b.want(b.run(frame(two, opts{tcpOpts: 12}), 9), pk, 1, id, 2, arrival.CountPaged, x.paged, arrival.CountPagedIDs, x.ids)
+		b.stored(0xa1, 9)
+		b.stored(0xb2, 9)
+		b.want(b.run(frame(two, opts{tcpOpts: 12}), 10), pk, 1, id, 2, arrival.CountRepeats, 2, arrival.CountPaged, x.paged, arrival.CountPagedIDs, x.ids)
+	}
+	// an id in a later chunk, the linear part ending before, inside and after it
+	b := newBench(t, 1024)
+	m := message(5*prog.Chunk+17, 0xc3)
+	end := hdr + 5*prog.Chunk + 17 + prog.KeyLen + prog.IDLen
+	for _, x := range []struct{ linear, ids int }{{hdr + 200, 1}, {end - 1, 1}, {end, 0}} {
+		b.vm.Linear = x.linear
+		d := b.run(frame(m, opts{tcpOpts: 12}), 9)
+		if d[arrival.CountPaged] != 1 || d[arrival.CountPagedIDs] != uint64(x.ids) || d[id] != 1 {
+			t.Fatalf("linear %d: %v", x.linear, d)
+		}
+	}
+	b.vm.Linear = 0
+}
+
 // The limits of the kernel's verifier the program is built around, and what a packet costs.
 func TestSize(t *testing.T) {
 	b := newBench(t, 1<<17)

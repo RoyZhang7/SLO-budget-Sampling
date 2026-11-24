@@ -11,7 +11,7 @@ responses, the collectors' restarts, the fault or burst record, the agents' upda
 family), and the admitted volume against the target, taken from the central's exporter counters
 (start and end scrapes; they match the evaluation's vol_ratio within 1 % on 171 runs of every arm).
 The full check repeats all of it with the volume from the evaluation, plus the evaluation's shadow
-size.  A crash of the pre-check itself is a note, not a problem: the full check still runs.
+size and the export's against what the central admitted.  A crash of the pre-check itself is a note, not a problem: the full check still runs.
 """
 from __future__ import annotations
 
@@ -24,6 +24,10 @@ from datetime import datetime, timezone
 SLOBUDGET_ARMS = ("chosen", "threshold", "keep-parent")
 VOLUME_SCENARIOS = ("steady", "saturated", "noisy_neighbour", "cascade", "cold_start")
 VOLUME_RANGE = (0.6, 1.3)
+ARRIVAL_HIT = 0.95
+EXPORT_MIN = 0.9                # of the spans the central admitted in the load's periods
+CLOCK_STEP = 0.001              # s
+ARRIVAL_MISSES = ("no_table", "empty", "not_stored", "overwritten", "torn", "late")
 SENT_SPANS = re.compile(r"^otelcol_exporter_sent_spans_total\{([^}]*)\}\s+([0-9.eE+-]+)")
 
 
@@ -59,6 +63,43 @@ def central_checks(rd: str, meta: dict) -> list:
             probs.append(f"{fn}: the agent never received a central update (config version 0 all run)")
         elif stale > 0.1 * len(vers):
             probs.append(f"{fn}: the central update did not advance in {stale} of {len(vers)} periods")
+    return probs
+
+
+def arrival_checks(rd: str, meta: dict) -> list:
+    """A run with the arrival stamp: on every node, at least ARRIVAL_HIT of the load's lookups with a parent were
+    answered by the program, its counters have no errors, and (own_measure within_service) the node's wall clock did
+    not step: arrivals of up to a second after a step are off by it.  The tee stamps, without a tee the agent."""
+    probs, agents = [], 0
+    t0, t1 = float(meta["t0"]), float(meta["t1"])
+    prefix = "tee-" if meta.get("tee") else "agent-"
+    for fn in sorted(os.listdir(rd)):
+        if not (fn.startswith(prefix) and fn.endswith(".log")):
+            continue
+        agents += 1
+        hit = miss = err = 0
+        step = 0.0
+        for ln in open(os.path.join(rd, fn), errors="replace"):
+            if "slobudget arrival" not in ln or "{" not in ln:
+                continue
+            try:
+                ts = datetime.strptime(ln.split(None, 1)[0], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc).timestamp()
+                d = json.loads(ln[ln.index("{"):])
+            except ValueError:
+                continue
+            if t0 <= ts <= t1 + 5:
+                hit += d.get("hit", 0)
+                miss += sum(d.get(k, 0) for k in ARRIVAL_MISSES)
+                err += d.get("bpf_errors", 0)
+                step = max(step, abs(d.get("clock_step", 0.0)))
+        if hit + miss == 0 or hit < ARRIVAL_HIT * (hit + miss):
+            probs.append(f"{fn}: {hit} of {hit + miss} arrival lookups answered by the program")
+        if err:
+            probs.append(f"{fn}: the arrival program counted {err} errors")
+        if step > CLOCK_STEP and (meta.get("sampler_env") or {}).get("own_measure") == "within_service":
+            probs.append(f"{fn}: the wall clock stepped by {1e3 * step:.1f} ms during the load")
+    if not agents:
+        probs.append("no logs of the stamp: the arrivals were not checked")
     return probs
 
 
@@ -123,6 +164,9 @@ def summary_checks(rd: str, meta: dict) -> list:
     exp = 23 * meta["rps"] * meta["dur_s"]
     if isinstance(sh, (int, float)) and sh < 0.9 * exp:
         probs.append(f"shadow has {sh} spans, expected about {exp}")
+    ex, admitted = s.get("export_spans"), (s.get("kept_per_period") or 0.0) * (s.get("gate_periods") or 0)
+    if s.get("volume_source") == "gate" and isinstance(ex, (int, float)) and ex < EXPORT_MIN * admitted:
+        probs.append(f"the Jaeger export has {ex} spans, the central admitted about {admitted:.0f} in the load's periods")
     return probs
 
 
@@ -145,6 +189,8 @@ def pre_check(rd: str) -> tuple[list, list]:
         probs += in_range(ratio, meta, "central exporter counters")
     if meta["arm"] in SLOBUDGET_ARMS:
         probs += central_checks(rd, meta)
+    if meta.get("arrival_pin"):
+        probs += arrival_checks(rd, meta)
     return probs, notes
 
 
@@ -156,6 +202,8 @@ def full_check(rd: str) -> list:
     probs = run_checks(rd, meta) + summary_checks(rd, meta)
     if meta["arm"] in SLOBUDGET_ARMS:
         probs += central_checks(rd, meta)
+    if meta.get("arrival_pin"):
+        probs += arrival_checks(rd, meta)
     return probs
 
 

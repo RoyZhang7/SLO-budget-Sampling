@@ -66,6 +66,7 @@ type VM struct {
 	skb       []byte
 	now       uint64
 	seen      []bool // instructions ever executed (coverage)
+	Linear    int    // bytes of a frame in the skb's linear part (0: all of it)
 	MaxSteps  int    // most instructions a packet took
 	TotalRuns int
 }
@@ -210,6 +211,13 @@ func (v *VM) Run(frame []byte, etherType uint16, now uint64) (ret int32, steps i
 	v.reg[10], v.regOK[10] = regionStack<<32|stackSize, true
 	binary.LittleEndian.PutUint32(v.ctx[0:], uint32(len(frame)))
 	binary.BigEndian.PutUint16(v.ctx[16:], etherType) // __be16 in the low half of the word
+	lin := len(frame)
+	if v.Linear > 0 && v.Linear < lin {
+		lin = v.Linear
+	}
+	const data = 0x10000 // two pointers of which only the difference means something
+	binary.LittleEndian.PutUint32(v.ctx[76:], data)
+	binary.LittleEndian.PutUint32(v.ctx[80:], data+uint32(lin))
 	v.skb, v.now = frame, now
 	v.TotalRuns++
 	pc := 0

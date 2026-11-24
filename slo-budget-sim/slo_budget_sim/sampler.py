@@ -48,6 +48,13 @@ Pluggable parts (BudgetConfig):
                              Callers above a slow callee stay ordinary and show as holes.
                   duration   the full-duration rule: duration > (1 + outlier_margin) x T_i
   own_margin      m          the margin of the own-time trigger, default 0.1 (the exp15 sweep)
+  own_measure     handler    the own time is the handler's (default): its end minus its start minus the
+                             client children's intervals
+                  within_service  the within-service latency: the handler's end minus the request's
+                             arrival at the pod minus the client children's intervals, i.e. the
+                             own time plus span.wait (arrival to handler start; 0 when no arrival is
+                             known).  Own trigger only.  The calibration is on the same measure: L
+                             and O, and so b_i and T_i, are of spans that start at their arrival.
   outlier_margin  m          the margin of the duration trigger: a span is an outlier only when its
                              duration exceeds (1 + m) T_i (or its status is not OK); spans between
                              T_i and (1 + m) T_i are ordinary (plan-sampled).  0 = the plain rule.
@@ -88,6 +95,7 @@ from .ttable import PRIORS, Calibrator
 
 ROOT_POLICIES = ("pin", "on_demand", "record", "plan")
 OUTLIER_TRIGGERS = ("own", "duration")
+OWN_MEASURES = ("handler", "within_service")
 PLAN_COINS = ("span", "trace")
 CALIB_SOURCES = ("kept", "plan", "frozen", "oracle")
 CREDIT_POLICIES = ("none", "credit", "reserve")
@@ -194,6 +202,7 @@ class BudgetConfig:
     outlier_margin: float = 0.1     # duration trigger: outlier only when duration > (1 + m) T_i; Stage 2c default
     outlier_trigger: str = "own"    # own | duration  (Stage 2d: own time against the own-time share; see module docstring)
     own_margin: float = 0.1         # own trigger: outlier only when own > (1 + m) b_i (exp15)
+    own_measure: str = "handler"    # handler | within_service  (own trigger and calibration; see module docstring)
     plan_coin: str = "span"         # span | trace  (trace-consistent plan coin, exp16)
     n_need_decay: float = 0.0       # 0: N_need counters reset every period; d > 0: multiplied by d instead (exp16)
     n_need_healthy: bool = False    # N_need and the frozen trigger count misses beyond the healthy over-T rate
@@ -238,6 +247,10 @@ class BudgetConfig:
             raise ValueError(f"unknown outlier_trigger {self.outlier_trigger}; choose from {OUTLIER_TRIGGERS}")
         if self.own_margin < 0.0:
             raise ValueError("own_margin must be >= 0")
+        if self.own_measure not in OWN_MEASURES:
+            raise ValueError(f"unknown own_measure {self.own_measure}; choose from {OWN_MEASURES}")
+        if self.own_measure != "handler" and self.outlier_trigger != "own":
+            raise ValueError("own_measure within_service is a measure of the own trigger")
         if self.plan_coin not in PLAN_COINS:
             raise ValueError(f"unknown plan_coin {self.plan_coin}; choose from {PLAN_COINS}")
         if not 0.0 <= self.n_need_decay < 1.0:
@@ -270,12 +283,15 @@ class BudgetSampler(Sampler):
         super().start_run(ctx)
         cfg, corpus = self.cfg, ctx.corpus
         self.calibrated = cfg.calib_source != "oracle"
+        self._within = cfg.own_measure == "within_service"
         self.cal = Calibrator(corpus.graph, corpus.routes_slo, q=cfg.calib_q,
                               min_class_samples=cfg.min_class_samples,
                               window=cfg.calib_window, use_class=cfg.use_class,
-                              prior=cfg.cold_prior if self.calibrated else "none")
+                              prior=cfg.cold_prior if self.calibrated else "none", within=self._within)
         if not self.calibrated and ctx.oracle is None:
             raise ValueError("oracle table requested but none provided")
+        if not self.calibrated and ctx.oracle.within != self._within:
+            raise ValueError("the oracle table is on another own_measure")
         self.record_cost = cfg.record_cost
         self._flag_reasons = ({"outlier", "escalate", "parent", "credit", "reserve"} if cfg.root_flag_on == "outlier"
                               else {"outlier", "escalate", "parent", "credit", "reserve", "plan"})
@@ -499,6 +515,24 @@ class BudgetSampler(Sampler):
         self._kept_by_reason["root_record"] = self._kept_by_reason.get("root_record", 0) + 1
         return True, 1.0, "root_record"
 
+    def _outlier_test(self, span: Span) -> tuple[bool, float]:
+        """Is the span an outlier, and by how much does it miss its threshold (>= 0)?"""
+        cfg = self.cfg
+        if cfg.outlier_trigger == "own":
+            b = self._lookup_b(span)
+            if b is None:                   # cold start: plan sampling only
+                return False, 0.0
+            own = span.own + span.wait if self._within else span.own
+            miss = (own - b) / b
+            outlier = miss > cfg.own_margin or not span.status_ok         # own time over its share
+        else:
+            T = self._lookup(span)
+            if T is None:                   # cold start: plan sampling only
+                return False, 0.0
+            miss = (span.duration - T) / T
+            outlier = miss > cfg.outlier_margin or not span.status_ok      # margin 0: the plain over-T rule
+        return outlier, max(0.0, miss)
+
     def _decide_span(self, span: Span, req: RequestState) -> tuple[bool, float, str]:
         """The Decide(...) of the plan: reads the span, the baggage and the
         per-period counters only."""
@@ -509,24 +543,7 @@ class BudgetSampler(Sampler):
         if cfg.keep_parent and span.idx in self._forced:
             self._forced.discard(span.idx)
             return self._spend(span, req, 1.0, "parent")
-        if cfg.outlier_trigger == "own":
-            b = self._lookup_b(span)
-            if b is None:                   # cold start: plan sampling only
-                outlier, miss = False, 0.0
-            else:
-                miss = (span.own - b) / b
-                outlier = miss > cfg.own_margin or not span.status_ok         # own time over its share
-                if miss < 0.0:
-                    miss = 0.0
-        else:
-            T = self._lookup(span)
-            if T is None:                   # cold start: plan sampling only
-                outlier, miss = False, 0.0
-            else:
-                miss = (span.duration - T) / T
-                outlier = miss > cfg.outlier_margin or not span.status_ok      # margin 0: the plain over-T rule
-                if miss < 0.0:
-                    miss = 0.0
+        outlier, miss = self._outlier_test(span)
         if outlier:
             self._ndet[svc] = self._ndet.get(svc, 0) + 1
             if self._exhausted(span, req):

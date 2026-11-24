@@ -28,6 +28,10 @@ processors:
   - gomod: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel v0.0.0
     import: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/processor/slobudgetcentralprocessor
     name: slobudgetcentralprocessor
+  # the arrival stamp in the tee (runs with the eBPF arrival stamp)
+  - gomod: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel v0.0.0
+    import: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel/processor/slobudgetarrivalprocessor
+    name: slobudgetarrivalprocessor
   # Stage 3 arms: the common cap gate (central), the Canopy-style rate target (central), the
   # reservoir top-K (agent)
   - gomod: github.com/RoyZhang7/SLO-budget-Sampling/slo-budget-otel v0.0.0

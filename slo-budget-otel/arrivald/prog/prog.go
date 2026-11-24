@@ -9,9 +9,9 @@
 // linear in general.  A chunk is scanned four positions at a time without a branch per
 // position: the eight bytes at each position, xor the key's first eight, are multiplied, and a
 // product of 0 makes the four positions a candidate.  That keeps the verifier's walk inside its
-// limits: about 5 300 pending branches of 8 192 and, by a count on paper, some 350 000
-// instructions of one million (arrivald -check prints the kernel's number).  The candidates of a
-// chunk are then checked against the whole key and parsed.
+// limits: 5.15.0-203 walks 812 036 of one million instructions (arrivald -check), about 5 300 of
+// 8 192 pending branches; the walk grows with the number of chunks.  The candidates of a chunk
+// are then checked against the whole key and parsed.
 package prog
 
 import (
@@ -60,6 +60,8 @@ const (
 const (
 	skbLen      = 0
 	skbProtocol = 16
+	skbData     = 76
+	skbDataEnd  = 80
 	ethLen      = 14
 	ethIPv4     = 0x0800
 	ipTCP       = 6
@@ -74,6 +76,8 @@ const (
 	stEnd = -56 // end of the payload in the packet
 	stN   = -64 // bytes of the chunk that are valid
 	stID  = -72 // the id being stored
+	stLin = -80 // bytes of the packet in the skb's linear part
+	stPos = -84 // the key's position in the chunk
 )
 
 // Config of a program.
@@ -121,6 +125,14 @@ func (b *builder) at(label string) {
 func (b *builder) count(i int) {
 	b.emit(asm.LoadMapValue(asm.R1, b.maps.Counters, uint32(8*i)),
 		asm.Mov.Imm(asm.R2, 1),
+		asm.AddAtomic.Mem(asm.R1, asm.R2, asm.DWord, 0))
+}
+
+// countNegative adds one to a counter when r2 is negative (r1, r2); no branch, so that the
+// verifier's walk does not grow.
+func (b *builder) countNegative(i int) {
+	b.emit(asm.LoadMapValue(asm.R1, b.maps.Counters, uint32(8*i)),
+		asm.RSh.Imm(asm.R2, 63),
 		asm.AddAtomic.Mem(asm.R1, asm.R2, asm.DWord, 0))
 }
 
@@ -209,6 +221,12 @@ func Build(c Config, m Maps) (asm.Instructions, error) {
 		asm.FnKtimeGetNs.Call(), asm.StoreMem(asm.R7, scratchNow, asm.R0, asm.DWord), // one time for the packet
 		asm.StoreImm(asm.R7, scratchFound, 0, asm.Word))
 	b.count(arrival.CountPackets)
+	// the linear part: data_end - data (the rest of the packet is in page fragments, which
+	// skb_load_bytes copies from all the same)
+	b.emit(asm.LoadMem(asm.R2, asm.R6, skbDataEnd, asm.Word), asm.LoadMem(asm.R1, asm.R6, skbData, asm.Word),
+		asm.Sub.Reg(asm.R2, asm.R1), asm.StoreMem(asm.R10, stLin, asm.R2, asm.DWord),
+		asm.LoadMem(asm.R1, asm.R10, stEnd, asm.DWord), asm.Sub.Reg(asm.R2, asm.R1))
+	b.countNegative(arrival.CountPaged)
 	b.emit(asm.Mov.Imm(asm.R9, 0))
 
 	// a chunk: r8 its offset in the packet, r9 its number
@@ -261,6 +279,7 @@ func Build(c Config, m Maps) (asm.Instructions, error) {
 		b.at(l("key")) // r1: the key's position in the chunk
 		b.emit(asm.LoadMem(asm.R4, asm.R10, stN, asm.DWord),
 			asm.Mov.Reg(asm.R3, asm.R1), asm.Add.Imm(asm.R3, need), asm.JGT.Reg(asm.R3, asm.R4, l("short")),
+			asm.StoreMem(asm.R10, stPos, asm.R1, asm.Word),
 			asm.Mov.Reg(asm.R2, asm.R7), asm.Add.Reg(asm.R2, asm.R1),
 			asm.LoadMem(asm.R3, asm.R2, KeyLen, asm.DWord), asm.LoadMem(asm.R4, asm.R2, KeyLen+8, asm.DWord),
 			asm.Mov.Imm(asm.R2, 0))
@@ -284,6 +303,9 @@ func Build(c Config, m Maps) (asm.Instructions, error) {
 		b.at(l("same")) // a retransmission: the first time stays
 		b.count(arrival.CountRepeats)
 		b.at(l("stored"))
+		b.emit(asm.LoadMem(asm.R2, asm.R10, stLin, asm.DWord), asm.LoadMem(asm.R1, asm.R10, stPos, asm.Word),
+			asm.Sub.Reg(asm.R2, asm.R1), asm.Sub.Reg(asm.R2, asm.R8), asm.Sub.Imm(asm.R2, need))
+		b.countNegative(arrival.CountPagedIDs)
 		b.count(arrival.CountIDs)
 		b.emit(asm.StoreImm(asm.R7, scratchFound, 1, asm.Word), asm.Ja.Label(next))
 		b.at(l("bad"))

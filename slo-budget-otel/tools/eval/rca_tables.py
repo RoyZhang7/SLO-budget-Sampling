@@ -107,6 +107,7 @@ def bursts(runs: list[dict]) -> str:
 def tables(runs: list[dict], volume: float | None) -> str:
     lines = []
     vols = sorted({_vol(r) for r in runs}) if volume is None else [volume]
+    arms = ARMS + tuple(sorted({r.get("arm") or "" for r in runs} - set(ARMS) - {""}))      # and every arm-variant
     for vol in vols:
         for sc in SCENARIOS:
             rs = [r for r in runs if r.get("scenario") == sc and abs(_vol(r) - vol) < 1e-6]
@@ -125,7 +126,7 @@ def tables(runs: list[dict], volume: float | None) -> str:
             lines.append(f"| (every run) | full data (100 % shadow) | {len(sh)} | {cells(sh, sfxs)} | "
                          f"{_mean([v['normal_set']['spans_per_trace'] for v in sh]):.1f} | "
                          f"{_mean([v['fault_set']['spans_per_trace'] for v in sh]):.1f} |" + (" |" if burner else ""))
-            for arm in ARMS:
+            for arm in arms:
                 ar = [r for r in rs if r.get("arm") == arm and not r["_invalid"]]
                 if not ar:
                     continue
@@ -147,7 +148,7 @@ def tables(runs: list[dict], volume: float | None) -> str:
                   "Crashed runs / scored runs, every scored scenario together; `other` counts any other error.", "",
                   "| arm | " + " | ".join(f"{NAMES[m]} {'full data' if v == 'shadow' else v}" for m, v in cols) + " |",
                   "|---" * (len(cols) + 1) + "|"]
-        for arm in ARMS:
+        for arm in arms:
             ar = [r for r in rs if r.get("arm") == arm and not r["_invalid"]]
             if not ar:
                 continue

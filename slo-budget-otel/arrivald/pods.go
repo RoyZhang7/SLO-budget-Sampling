@@ -42,6 +42,15 @@ func (p proc) namespaces() (map[string]int, error) {
 	return out, nil
 }
 
+// only keeps the namespace a process is in.
+func (p proc) only(spaces map[string]int, pid int) map[string]int {
+	ns, err := p.readlink(filepath.Join(p.root, strconv.Itoa(pid), "ns", "net"))
+	if _, ok := spaces[ns]; err != nil || !ok {
+		return nil
+	}
+	return map[string]int{ns: pid}
+}
+
 // looks spaces the checks of a namespace without the listener: at every poll in its first
 // minute (a pod's server comes up seconds after its namespace), then every half minute.  Each
 // check walks the host's whole table of connections.

@@ -35,7 +35,7 @@ def main() -> int:
             continue
         for window, res in gaps.items():
             for edge, v in (res.get("edges") or {}).items():
-                rows.append([meta["run_id"], meta["scenario"], meta["arm"], meta["seed"], window, edge, v.get("hosts")]
+                rows.append([meta["run_id"], meta["scenario"], meta["arm"] + (f"-{meta['variant']}" if meta.get("variant") else ""), meta["seed"], window, edge, v.get("hosts")]
                             + [v.get(f) for f in FIELDS])
     with open(a.out, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)

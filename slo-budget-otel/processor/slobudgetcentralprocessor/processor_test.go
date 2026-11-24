@@ -240,3 +240,51 @@ func TestLoadCallGraphWithStages(t *testing.T) {
 		}
 	}
 }
+
+// own_measure within_service: the thresholds are calibrated from the arrivals the agents stamped.
+func TestCentralCalibratesFromTheArrival(t *testing.T) {
+	quantiles := func(measure string) (L, O float64) {
+		cfg := createDefaultConfig().(*Config)
+		cfg.Listen = "127.0.0.1:0"
+		cfg.VStar = 1000
+		cfg.StatsLog = false
+		cfg.Sampler.OwnMeasure = measure
+		if err := cfg.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		c, err := newCentral(processortest.NewNopSettings(typeStr), cfg, new(consumertest.TracesSink))
+		if err != nil {
+			t.Fatal(err)
+		}
+		base := time.Now()
+		for i := 0; i < 30; i++ {
+			td := request(byte(i), base, false)
+			for k := 0; k < td.ResourceSpans().Len(); k++ {
+				span := td.ResourceSpans().At(k).ScopeSpans().At(0).Spans().At(0)
+				switch span.Name() {
+				case "socialgraph": // 0.5 ms of handler, 2 ms after its request arrived
+					span.Attributes().PutInt(attrArrival, int64(span.StartTimestamp())-2_000_000)
+				case "poststorage": // a miss: the stamp is the span's own start
+					span.Attributes().PutInt(attrArrival, int64(span.StartTimestamp()))
+				}
+			}
+			if err := c.ConsumeTraces(context.Background(), td); err != nil {
+				t.Fatal(err)
+			}
+		}
+		c.s.Cal.Graph = &slobudget.CallGraph{Root: map[string]string{"compose_post": "wrk2api"}, Children: map[string]map[string][]string{"compose_post": {
+			"wrk2api": {"composepost"}, "composepost": {"poststorage", "socialgraph"}}}, Parallel: map[string]map[string]bool{}}
+		c.s.Cal.EndPeriod(nil)
+		if v := c.s.Cal.O[slobudget.TableKey{Route: "compose_post", Class: "*", Service: "poststorage"}]; math.Abs(v-0.0005) > 1e-6 {
+			t.Errorf("%s: poststorage's own quantile %v", measure, v)
+		}
+		k := slobudget.TableKey{Route: "compose_post", Class: "*", Service: "socialgraph"}
+		return c.s.Cal.L[k], c.s.Cal.O[k]
+	}
+	if L, O := quantiles("handler"); math.Abs(L-0.0005) > 1e-6 || math.Abs(O-0.00025) > 1e-6 {
+		t.Errorf("handler: L %v O %v", L, O)
+	}
+	if L, O := quantiles("within_service"); math.Abs(L-0.0025) > 1e-6 || math.Abs(O-0.00225) > 1e-6 {
+		t.Errorf("within_service: L %v O %v", L, O)
+	}
+}

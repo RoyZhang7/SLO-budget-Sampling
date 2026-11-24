@@ -33,6 +33,12 @@ def _parse_overrides(items: list[str]) -> dict:
     return out
 
 
+def _needs_arrivals(overrides: dict, corpus=None) -> None:
+    """within_service reads Span.wait, which only `dump --waits` sets: generated and loaded spans have none."""
+    if overrides.get("own_measure", "handler") != "handler" and not any(s.wait for s in (corpus.spans if corpus else ())):
+        raise SystemExit("own_measure=within_service: no span has an arrival, it would be the handler's own time")
+
+
 def cmd_generate(a) -> int:
     corpus, reference = build_scenario(a.scenario, a.seed)
     out = Path(a.out)
@@ -55,6 +61,7 @@ def cmd_replay(a) -> int:
                      if a.reference else corpus)
     else:
         corpus, reference = build_scenario(a.scenario, a.seed)
+    _needs_arrivals(_parse_overrides(a.set), corpus)
     oracle = oracle_table(reference)
     arrays = CorpusArrays(corpus, oracle)
     v_star = a.volume_frac * len(corpus.spans) * corpus.period / max(corpus.period, corpus.t_end - corpus.t0)
@@ -83,7 +90,7 @@ def cmd_dump(a) -> int:
         stages = obj.get("stages", obj)
     for sc in a.scenario:
         for sd in a.seeds:
-            ev, de = dump_replay(sc, sd, a.volume_frac, Path(a.out), a.arm, _parse_overrides(a.set), stages=stages)
+            ev, de = dump_replay(sc, sd, a.volume_frac, Path(a.out), a.arm, _parse_overrides(a.set), stages=stages, waits=a.waits)
             print(f"{sc} seed {sd}: {ev.name} {ev.stat().st_size // 1024} KB, {de.name} {de.stat().st_size // 1024} KB")
     return 0
 
@@ -93,6 +100,7 @@ def cmd_exp(a) -> int:
     results.mkdir(parents=True, exist_ok=True)
     exps = list(EXPERIMENTS) if a.exp == "all" else [a.exp]
     extra = _parse_overrides(a.set)
+    _needs_arrivals(extra)
     for exp in exps:
         t = time.perf_counter()
         rows = run_experiment(exp, results, a.seeds, a.jobs, extra or None, a.volumes, fresh=a.fresh)
@@ -139,6 +147,7 @@ def main(argv=None) -> int:
     d.add_argument("--arm", default="chosen-v2", choices=ALL_ARMS)
     d.add_argument("--set", nargs="*", metavar="KEY=VALUE", help="BudgetConfig overrides")
     d.add_argument("--stages", metavar="FILE", help="call graph file whose \"stages\" the corpora's graphs get (sequential stages per service)")
+    d.add_argument("--waits", action="store_true", help="give the spans a wait from the request's arrival to their start (own_measure=within_service reads it)")
     d.add_argument("--out", default="dumps")
     d.set_defaults(func=cmd_dump)
 

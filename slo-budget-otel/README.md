@@ -18,7 +18,9 @@ slobudget/                         pure Go port of the decider, calibration, ref
   agentcentral.go                  the agent / central split: budget issue, period snapshot, central update
 processor/slobudgetprocessor/      the per-host agent (decider at span end, root hold + kept-notice, stats)
 processor/slobudgetcentralprocessor/  the central (1/p-weighted calibration, frozen trigger, refill, cap, config channel)
-arrival/                           the arrival stamp, agent side: the mapped table, the clock, the lookup (prepared, not deployed)
+processor/slobudgetarrivalprocessor/  the arrival stamp in the tee (a collector in front of the agent and the 100 % shadow)
+processor/internal/arrivalstamp/   the stamp itself, the same code in the agent and in the tee
+arrival/                           what it reads: the mapped table, the clock, the lookup (prepared, not deployed)
 arrivald/                          its eBPF program (prog/), the loader, an interpreter and the replay of captures (own module)
 sdk/budgetissuer/                  W3C-baggage budget issuer + baggage-to-attribute copier (own module)
 builder/                           ocb manifest and Dockerfile; tools/build-node0.sh builds and pushes on node-0
@@ -88,7 +90,8 @@ file).  The learned graph has the flag only.  `GET
 ## Arrival stamp (prepared, not deployed)
 
 When a request reached its pod, taken by an eBPF program at the pod's interface and looked up by the
-agent; only the overhead experiment's configuration E uses it, no decision does.
+agent or the tee in front of it; the overhead experiment's configuration E uses it, and decisions only with
+`own_measure: within_service` (below).
 
 - **The program** (`arrivald/prog`, tc at the ingress of `eth0` in the pod's network namespace): for TCP
   payload to the services' port (12345) it scans for the key `"SpanID":"` and parses the 16 hexadecimal
@@ -97,15 +100,22 @@ agent; only the overhead experiment's configuration E uses it, no decision does.
   array indexed by the id's low bits; an id that is already in its slot keeps its first time, another
   one's slot is taken.  Counters: packets scanned, ids, packets with payload but no id, slots overwritten,
   packets past the cap, keys whose id the packet cuts, keys without 16 digits, repeats, chunks with more
-  candidates than are kept, helper errors.
+  candidates than are kept, helper errors, packets with payload outside the skb's linear part (page
+  fragments) and ids read from there.
   It returns "unspecified" and changes nothing.  Written with cilium/ebpf's assembler: no C toolchain, and
-  the tests run the very instructions the loader loads.
+  the tests run the very instructions the loader loads.  The kernel's verifier takes it on 5.15.0-203 (node-0,
+  2026-11-24): 812 036 of one million instructions, 0.4 s.
 - **The loader** (`arrivald`, a privileged DaemonSet): pins the table and the counters under
   `/sys/fs/bpf/slobudget`, attaches the program to every network namespace that listens on the
   services' port and to new ones as pods come, looks every 10 s whether it is still there, takes it off on
-  SIGTERM.  `arrivald -check` only runs the kernel's verifier; `arrivald -clean` takes off what a loader
-  that was killed left behind; `-stats` logs the kernel's own count of the program's runs and time.
-- **The agent** (`slobudget: arrival_table: <pin directory>`, off by default): maps the table read-only
+  SIGTERM.  Attaching and detaching stop the pod's transmit queue for a moment (the clsact qdisc on 5.15), so they
+  stay outside measured load.  `arrivald -check` only runs the kernel's verifier; `arrivald -clean` takes off what a
+  loader that was killed left behind; `-dump` writes what the table and the counters hold; `-pid` limits it to one
+  pod; `-stats` logs the kernel's own count of the program's runs and time.
+- **The stamp** is attached in one of two places, by the same code (`processor/internal/arrivalstamp`): in the
+  agent (`slobudget: arrival_table: <pin directory>`, off by default; the overhead experiment's E, which has no tee),
+  or in the tee in front of its fork (`slobudgetarrival`, the campaign's runs with the stamp), so that the agent and
+  the 100 % export carry the same `slobudget.arrival_ns`.  It maps the table read-only
   (CAP_BPF to open it) and, when a server span reaches it, looks its parent span id up and attaches
   `slobudget.arrival_ns`, the arrival in the span's clock (the monotonic time plus the node's offset
   between the two clocks, sampled every second), with `slobudget.arrival_source` `ebpf`; on a miss the
@@ -115,19 +125,38 @@ agent; only the overhead experiment's configuration E uses it, no decision does.
   `late` stored after the span's start), the mean wait, the largest step of the wall clock and what the
   program's counters gained.  An id the program never stored (its digits split between two packets) is
   `empty` or `not_stored`, by what its slot happens to hold: compare the sum of the two.
-- **Table size**: the lookup comes the SDK's export delay after the arrival (its 100-ms flush: 0 to about
-  0.1 s plus the request), so an id is lost when its slot is taken in that time.  131 072 slots (2 MiB,
-  `arrivald -slots`, `render.py --arrival-slots`) keep that under 0.1 % at 300 req/s.
-- **Tests**: `go test ./arrival ./processor/slobudgetprocessor`; in `arrivald` the program runs on an
+- **Table size** (`arrivald -slots`, `render.py --arrival-slots`; a power of two, default 1 048 576, 16 MiB a
+  node): an id is lost when another one takes its slot before the lookup.  With L ids arriving per second at a
+  node and T the time an id must survive, the share lost is 1 - exp(-L T / slots), so **slots >= 1000 x L x T**
+  keeps it under 0.1 % (T: the mean for the mean loss, the largest for every id).  L is 4 ids per request on the
+  busiest node here (node-1 and node-2; node-3 has 3).  T is the SDK's export delay, its 100-ms flush plus the
+  request: 42 ms on average, 99.7 ms p99, 117 ms at most in healthy traffic; the agent looks up when the span
+  arrives, before its 200-ms hold, so the hold does not add to it (if it did: 317 ms).  The default holds 0.1 % for ids
+  up to 2.6 s old at 100 req/s and 0.87 s at 300; at 117 ms up to 2 240 req/s, at 317 ms up to 827 req/s.
+- **Tests**: `go test ./arrival ./processor/...`; in `arrivald` the program runs on an
   interpreter that stops at what the kernel's verifier would (reads before writes, accesses outside a
   map value), over constructed packets and (`replay CAPDIR TRUTHDIR`) over captures: every counter's
   change, every id and its time after every packet, against a ground truth made by TCP reassembly without
   the program, and the outcome and time of every lookup at the moment the span reached the collector.
   `ARRIVAL_KERNEL=1 go test ./prog` (root) is the kernel's verifier and the kernel against the
   interpreter (BPF_PROG_TEST_RUN, nothing attached), and the agent's mapping of the pinned maps; it has
-  not been run.
-- **Manifests**: `render.py --arrival /sys/fs/bpf/slobudget` adds the agent's setting, CAP_BPF and the bpf
-  filesystem to the agents, and arrivald's DaemonSet; the image needs `/arrivald` (`builder/Dockerfile`).
+  not been run.  `tools/overhead/live_check.sh` is the first live check: the program on one pod during a warm-up,
+  a capture at the same interface at the same time, and the stored ids and times against the capture
+  (`live_check.py`).
+- **Manifests**: `render.py --arrival /sys/fs/bpf/slobudget` adds arrivald's DaemonSet, and the stamp, CAP_BPF and the
+  bpf filesystem to the tee (`--no-tee`: to the agent); the image needs `/arrivald` (`builder/Dockerfile`).
+
+## The own trigger's measure (prepared, not deployed)
+
+`sampler.own_measure` (the same setting at agents and central): `handler` (default) is the handler's own time, its
+duration minus the union of its client spans; `within_service` is the **within-service latency**, the handler's end
+minus the request's arrival at the pod minus the downstream time (the union of the client spans).  The arrival is
+`slobudget.arrival_ns` when the span has it and the span's own start otherwise, so the measure is the own time plus
+the wait between the two (`Span.Wait`).  Only the own trigger has it.  The calibration is on the same measure (the
+central adds the wait, from the kept spans' attribute, to the inclusive and the own time), so the thresholds are too.
+`slobudget.own_us` stays the handler's own time.  Python: `BudgetConfig.own_measure`, `Span.wait`; the differential test
+with waits: `tools/difftest.py --waits --set own_measure=within_service`.  `render.py` takes it from `OWN_MEASURE` and
+refuses `within_service` without `--arrival`.
 
 ## Build and run
 
@@ -135,6 +164,7 @@ agent; only the overhead experiment's configuration E uses it, no decision does.
 go test ./... && (cd sdk && go test ./...) && (cd arrivald && go test ./...)   # unit tests
 python tools/difftest.py                                    # 21 Python dumps vs the Go replay (about 1 GB of dumps)
 python tools/difftest.py --stages deploy/callgraph.stages.json   # the same with sequential stages
+python tools/difftest.py --waits --set own_measure=within_service   # the own trigger on the within-service latency
 tools/build-node0.sh                                        # on node-0: tests, benchmark, ocb build, image push
 tools/run_cluster.sh                                        # on node-0: deploy, 10 min wrk2 at 100 rps, CPU hog min 4-7, export, restore
 ROOT_POLICY=pin RECON=1 ARM=pin-recon tools/run_cluster.sh  # arms: root policy on_demand|pin, reconstruction on|off
@@ -266,6 +296,13 @@ on node-0 as the deploy user; nothing needs root.
    with `burn` phases and `tools/hog/calib_own.py` (the target's own-time P95
    against its own-time share b).  meta.json records the image digests each run's
    pods ran.
+7. Runs with the arrival stamp (after the live check, `tools/overhead/README.md`): the same queue, with
+   `ARRIVAL=1` (arrivald's DaemonSet and the stamp in the tee), `OWN_MEASURE=within_service` (agents and
+   central), `CALLGRAPH=deploy/callgraph.stages.json`, and a `VARIANT` and `RUN_ID` of their own, so that every
+   table keeps them apart from the plain arm (`make_queue2.py` prints the lines; `#hold` in front unless `--go`).
+   A run fails unless the program is at every service pod before the load and the ids arrived in it
+   (`arrival_check.py`); `sanity.py` also wants at least 95 % of every node's lookups answered by the program, no
+   errors in its counters and no step of the wall clock.
 
 What a fresh CloudLab instantiation would miss without step 2 and 3: the app
 images' issuer (the agent then self-issues budgets, the fallback) and our

@@ -77,7 +77,7 @@ def _fmt_top(pairs, k=5, fmt="{:.2f}") -> str:
 
 
 def compute(meta: dict, t: SpanTable, kept: KeptSet, kidx: np.ndarray, cal, status: dict | None,
-            gate: list[dict], cpu: dict, buffers: dict, recon: dict | None) -> dict:
+            gate: list[dict], cpu: dict, buffers: dict, recon: dict | None, ws=None, cal_run=None) -> dict:
     P = float(meta["period_s"])
     t0, t1 = float(meta["t0"]), float(meta["t1"])
     margin = float(meta.get("margin", 0.1))
@@ -88,6 +88,7 @@ def compute(meta: dict, t: SpanTable, kept: KeptSet, kidx: np.ndarray, cal, stat
     slo_s = {r: ms / 1000.0 for r, ms in (meta.get("slo_ms") or {"compose_post": 23.4}).items()}
     n = t.n
     out: dict = {k: meta.get(k) for k in ("run_id", "arm", "scenario", "volume_frac", "seed", "v_star", "cap")}
+    out["arm"] = meta.get("arm_label") or arm       # a variant of an arm is an arm of its own in the tables
     out["margin"] = margin
 
     S = t.kind == SERVER
@@ -179,10 +180,14 @@ def compute(meta: dict, t: SpanTable, kept: KeptSet, kidx: np.ndarray, cal, stat
     own2d = (own_client(t) if other_kids.any() else t.own) / 1e9
     has_B = ~np.isnan(B)
     truth_own = (has_B & (own2d > B)) | t.err
+    # the common truth of all arms: the within-service latency on the estimated kernel receive time, over its own oracle share (ws)
+    ws_x, ws_b = ws if ws is not None else (np.full(n, np.nan), np.full(n, np.nan))
+    truth_ws = (np.isfinite(ws_b) & (ws_x > ws_b)) | t.err
+    over_ws = (np.isfinite(ws_b) & (ws_x > (1.0 + margin) * ws_b)) | t.err
     rr = np.bincount(t.route[t.is_root & pop], minlength=max(1, len(t.routes)))
     main_route = t.routes[int(np.argmax(rr))] if rr.sum() else (next(iter(slo_s)) if slo_s else "compose_post")
     out["route"] = main_route
-    oracle_rl = route_level_table(cal, main_route)
+    oracle_rl = route_level_table(cal_run or cal, main_route)       # the drift compares it with the central's table: the central's call graph
     out["oracle_T_ms"] = {s: round(v * 1000, 3) for s, v in sorted(oracle_rl.items())}
 
     # volume and spend (cap gate) ---------------------------------------------------------------
@@ -263,6 +268,18 @@ def compute(meta: dict, t: SpanTable, kept: KeptSet, kidx: np.ndarray, cal, stat
     out["outlier_share_window"] = _safe_div((kept_nr_w & truth).sum(), kept_nr_w.sum())
     tow = truth_own_nr & window
     out["recall_own_window"] = _safe_div((tow & kept_mask).sum(), tow.sum())
+    if ws is not None:
+        truth_ws_nr = truth_ws & nonroot & SP
+        tws = truth_ws_nr & window
+        out["truth_outliers_ws"] = int(truth_ws_nr.sum())
+        out["recall_ws"] = _safe_div((truth_ws_nr & kept_mask).sum(), truth_ws_nr.sum())
+        out["recall_ws_window"] = _safe_div((tws & kept_mask).sum(), tws.sum())
+        out["outlier_share_ws"] = _safe_div((kept_nr & truth_ws).sum(), kept_nr.sum())
+        out["outlier_share_ws_window"] = _safe_div((kept_nr_w & truth_ws).sum(), kept_nr_w.sum())
+        out["kept_outliers_ws"] = int((kept_mask & truth_ws_nr & warm).sum())
+        hs = SP & warm & (end_s < w0) if math.isfinite(w0) else SP & warm       # before the fault or the burst
+        out["truth_rate_healthy_ws"] = _safe_div((truth_ws_nr & hs).sum(), (hs & nonroot).sum())
+        out["truth_rate_healthy_own"] = _safe_div((truth_own & nonroot & hs).sum(), (hs & nonroot).sum())
     n_svc_codes = max(1, len(t.services))
     nk = int(k.max()) + 1 if n and k.max() >= 0 else 1
     kc = np.clip(k, 0, nk - 1)
@@ -280,6 +297,9 @@ def compute(meta: dict, t: SpanTable, kept: KeptSet, kidx: np.ndarray, cal, stat
         out["outlier_precision_server"] = float(truth[is_flag & S].mean()) if (is_flag & S).any() else math.nan
         out["outlier_precision_own"] = float(truth_own[is_flag].mean())
         out["outlier_precision_own_window"] = float(truth_own[fw].mean()) if fw.any() else math.nan
+        if ws is not None:
+            out["outlier_precision_ws"] = float(truth_ws[is_flag].mean())
+            out["outlier_precision_ws_window"] = float(truth_ws[fw].mean()) if fw.any() else math.nan
     else:
         out["outlier_precision"] = out["outlier_precision_window"] = out["outlier_precision_server"] = math.nan
         out["outlier_precision_own"] = out["outlier_precision_own_window"] = math.nan
@@ -451,6 +471,21 @@ def compute(meta: dict, t: SpanTable, kept: KeptSet, kidx: np.ndarray, cal, stat
             out["evidence_s"] = float(admit_s[me].min() - t_f) if me.any() else math.nan
             mf = me & reason_in(EVIDENCE_FLAG_REASONS)
             out["evidence_flagged_s"] = float(admit_s[mf].min() - t_f) if mf.any() else math.nan
+            if ws is not None:
+                cw = truth_ws & window & nonroot & SP & (t.svc == cc)
+                out["truth_outliers_ws_culprit_window"] = int(cw.sum())
+                out["recall_culprit_ws"] = _safe_div((cw & kept_mask).sum(), cw.sum())
+                mw = kept_mask & over_ws & window & nonroot & SP & (t.svc == cc)
+                out["evidence_ws_s"] = float(admit_s[mw].min() - t_f) if mw.any() else math.nan
+                # requests over the SLO that end in the fault: is a kept outlier of the culprit in them?
+                late = window & t.is_root & SP & (dur > np.array([slo_s.get(r, math.inf) for r in t.routes])[t.route])
+                has = np.zeros(max(1, t.n_traces), dtype=bool)
+                has[t.trace[cw & kept_mask]] = True
+                out["over_slo_requests_window"] = int(late.sum())
+                out["over_slo_with_culprit_outlier_kept"] = _safe_div(has[t.trace[late]].sum(), late.sum())
+                tro = np.zeros(max(1, t.n_traces), dtype=bool)
+                tro[t.trace[cw]] = True
+                out["over_slo_with_culprit_truth_ws"] = _safe_div(tro[t.trace[late]].sum(), late.sum())
         else:
             out["recall_culprit"] = out["evidence_s"] = out["evidence_flagged_s"] = math.nan
         # Stage 2d: single-culprit truth and the keeps spent on the culprit's callers

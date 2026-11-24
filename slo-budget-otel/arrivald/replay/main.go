@@ -4,7 +4,7 @@
 // packets; and, with the spans and the times their exports reached the collector, the agent's
 // lookups (../../arrival) at those times, each against the outcome the truth implies.
 //
-//	replay [-slots 131072] [-mono -1h] CAPDIR TRUTHDIR
+//	replay [-slots 1048576] [-mono -1h] CAPDIR TRUTHDIR
 //
 // CAPDIR holds node-*.pcap (tcpdump -i any -y LINUX_SLL2) and node-*.net (ip -o link; ==; ip route);
 // TRUTHDIR, written by a separate program: truth.csv (node, id, key_packet, key_last_packet,
@@ -424,7 +424,7 @@ func diff(a, b [arrival.NumCounters]uint64) (d [arrival.NumCounters]int64) {
 }
 
 func run() error {
-	slots := flag.Uint("slots", 1<<17, "slots of the table in the main check")
+	slots := flag.Uint("slots", 1<<20, "slots of the table in the main check")
 	mono := flag.Duration("mono", -time.Hour, "the replay's monotonic clock minus the capture's wall clock")
 	flag.Parse()
 	if flag.NArg() != 2 {

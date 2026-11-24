@@ -13,12 +13,24 @@ $PY tools/eval/tables.py /storage/royno7/stage3/runs --volume 0.12 [--scenarios 
 $PY -m pytest -q tools/eval/tests                         # fixture arithmetic
 $PY tools/eval/make_fake_run.py <100 % Jaeger export> OUT [--frac 0.12] [--fault-service socialgraph]   # dev only
 $PY tools/eval/burst_phase.py RUN_DIR...                  # burner runs, before the tables: burst_phase.json, the bursts' position in the quota period
+$PY tools/eval/arrival_estimate.py RUN_DIR... [--md out.md]   # runs with the arrival stamp: the estimated kernel receive time against it, per edge
 $PY tools/eval/derive_stages.py RUN_DIR... [--merge deploy/callgraph.json --out deploy/callgraph.stages.json]   # sequential stages from the shadows
 ```
 
 `~/bin/recon` is `go build -o ~/bin/recon ./tools/recon`; it runs on the export
 when the run directory has no `recon-report.json` and writes
 `export.recon.json` and `recon-report.json` next to it.
+
+**Common truth of all arms** (`*_ws` keys, table 4; `sloeval/arrivals.py`): a span is an outlier when its within-service latency, the
+handler's end minus the estimated kernel receive time minus the downstream time, is over its oracle share b, which is calibrated on the
+same measure from the run's healthy spans and split on the staged call graph (`deploy/callgraph.stages.json`) whatever measure or
+graph the run's agents had (every other truth has `deploy/callgraph.json`, the campaign's, for every run: `truth_callgraph`; only
+`oracle_T_ms` and `t_drift_*`, which are set against the central's table, have the central's graph).  The estimate is the caller's send time plus the edge's healthy median gap to the handler's start (an
+edge: caller and callee service and host), so it needs nothing but the 100 % export and is the same for every arm.  A run with the
+eBPF stamp has `slobudget.arrival_ns` in its 100 % export (attached in the tee, in front of the fork): `eval_run.py` compares the two per edge
+(`arrival-vs-estimate.json`, `arrival_estimate.py`), the check on the estimate.  The estimate takes the callee's healthy median wait
+for travel: it is later than the stamp by about that on every call of the edge, in the thresholds too; the report gives the difference
+around its healthy median.
 
 ## Inputs (the campaign runner's run directory)
 

@@ -125,6 +125,11 @@ class SpanTable:
     lines: int = 0
     name: np.ndarray = field(default=None, repr=False)        # int32 span-name code (shadow: name, export: operationName)
     names: list = field(default_factory=list)
+    # shadow only: the arrival stamp (slobudget.arrival_ns, 0: none), whether the eBPF program gave it, the root's host
+    arrival: np.ndarray = field(default=None, repr=False)     # int64 ns
+    arr_ebpf: np.ndarray = field(default=None, repr=False)    # bool
+    rhost: np.ndarray = field(default=None, repr=False)       # int16 code into hosts (slo.root_host; "": none)
+    hosts: list = field(default_factory=list)
     # derived by finish()
     pidx: np.ndarray = field(default=None, repr=False)        # parent index (-1: root or parent missing)
     depth: np.ndarray = field(default=None, repr=False)       # bridge depth, else depth by parent chain
@@ -235,7 +240,8 @@ def read_shadow(path: str, default_route: str = DEFAULT_ROUTE) -> SpanTable:
     sid, pid, trace, start, end = array("Q"), array("Q"), array("q"), array("q"), array("q")
     kind, err, bdepth = bytearray(), bytearray(), array("h")
     svc, cls, route, nm = array("i"), array("i"), array("i"), array("i")
-    svcs, clss, routes, traces, nms = _Codes(), _Codes(), _Codes(), _Codes(), _Codes()
+    arrival, ebpf, rhost = array("q"), bytearray(), array("h")
+    svcs, clss, routes, traces, nms, hosts = _Codes(), _Codes(), _Codes(), _Codes(), _Codes(), _Codes()
     seen: set[int] = set()
     dups = lines = 0
     for line in open_lines(path):
@@ -258,9 +264,16 @@ def read_shadow(path: str, default_route: str = DEFAULT_ROUTE) -> SpanTable:
                         continue
                     seen.add(s_id)
                     c_cls, c_route, depth = "", "", -1
+                    at, by_program, host = 0, 0, ""
                     for a in sp.get("attributes") or ():
                         k = a.get("key")
-                        if k == "slo.class":
+                        if k == "slobudget.arrival_ns":
+                            at = int((a.get("value") or {}).get("intValue", 0))
+                        elif k == "slobudget.arrival_source":
+                            by_program = int((a.get("value") or {}).get("stringValue") == "ebpf")
+                        elif k == "slo.root_host":
+                            host = (a.get("value") or {}).get("stringValue", "")
+                        elif k == "slo.class":
                             c_cls = (a.get("value") or {}).get("stringValue", "")
                         elif k == "slo.root":
                             c_route = (a.get("value") or {}).get("stringValue", "")
@@ -285,6 +298,9 @@ def read_shadow(path: str, default_route: str = DEFAULT_ROUTE) -> SpanTable:
                     nm.append(nms.code(sp.get("name", "")))
                     cls.append(clss.code(c_cls or f"{r}|any"))
                     route.append(routes.code(r))
+                    arrival.append(at)
+                    ebpf.append(by_program)
+                    rhost.append(hosts.code(host))
     t = SpanTable(
         sid=np.frombuffer(sid, dtype=np.uint64).copy() if len(sid) else np.zeros(0, np.uint64),
         pid=np.frombuffer(pid, dtype=np.uint64).copy() if len(pid) else np.zeros(0, np.uint64),
@@ -299,6 +315,9 @@ def read_shadow(path: str, default_route: str = DEFAULT_ROUTE) -> SpanTable:
         bdepth=np.frombuffer(bdepth, dtype=np.int16).copy() if len(bdepth) else np.zeros(0, np.int16),
         services=svcs.names, classes=clss.names, routes=routes.names, n_traces=len(traces.names),
         duplicates=dups, lines=lines,
+        arrival=np.frombuffer(arrival, dtype=np.int64).copy() if len(arrival) else np.zeros(0, np.int64),
+        arr_ebpf=np.frombuffer(bytes(ebpf), dtype=np.uint8).astype(bool),
+        rhost=np.frombuffer(rhost, dtype=np.int16).copy() if len(rhost) else np.zeros(0, np.int16), hosts=hosts.names,
         name=np.frombuffer(nm, dtype=np.int32).copy() if len(nm) else np.zeros(0, np.int32), names=nms.names)
     return t.finish()
 

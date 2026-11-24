@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 from dataclasses import asdict
 from pathlib import Path
 
@@ -67,6 +68,8 @@ def events_dump(corpus: Corpus, cfg, v_star: float, cap: float, rng_seed: int, a
             "nbytes": [s.nbytes for s in spans], "transit": [s.transit for s in spans], "own": [s.own for s in spans],
         },
     }
+    if any(s.wait for s in spans):
+        out["spans"]["wait"] = [s.wait for s in spans]
     if oracle is not None and cfg.calib_source == "oracle":
         out["oracle"] = _oracle_table(oracle)
     return out
@@ -98,23 +101,37 @@ def set_stages(corpus: Corpus, stages: dict[str, dict[str, list[list[str]]]]) ->
             corpus.graph.stages[(route, svc)] = [list(group) for group in st]
 
 
+def add_waits(corpus: Corpus, seed: int) -> None:
+    """Give every span but the roots a wait between its request's arrival at the pod and its start: lognormal, median
+    0.3 ms, 20 times that for the spans that carry the corpus's fault."""
+    rng = random.Random(seed)
+    onsets = corpus.fault.onsets if corpus.fault else {}
+    for s in corpus.spans:
+        w = 0.0003 * math.exp(0.6 * rng.gauss(0.0, 1.0))
+        lo, hi = onsets.get(s.service, (math.inf, math.inf))
+        s.wait = 0.0 if s.parent_idx < 0 else w * (20.0 if lo <= s.start < hi else 1.0)
+
+
 def dump_replay(scenario: str, seed: int, volume_frac: float, out_dir: Path, arm: str = "chosen-v2",
                 overrides: dict | None = None, cap_factor: float = 1.25,
-                stages: dict[str, dict[str, list[list[str]]]] | None = None) -> tuple[Path, Path]:
+                stages: dict[str, dict[str, list[list[str]]]] | None = None, waits: bool = False) -> tuple[Path, Path]:
     """Build the scenario, replay the arm exactly as the experiments do and write both files.  `stages` gives the
-    corpus's and its reference's call graph sequential stages."""
+    corpus's and its reference's call graph sequential stages, `waits` their spans arrivals (add_waits)."""
     corpus, reference = build_scenario(scenario, seed)
     if stages:
         for c in (corpus, reference):
             set_stages(c, stages)
-    oracle = oracle_table(reference, q=0.95, use_class=True)
+    if waits:
+        add_waits(corpus, 7000 + seed)
+        add_waits(reference, 8000 + seed)
+    sampler = make_arm(arm, overrides or {})
+    oracle = oracle_table(reference, q=0.95, use_class=True, within=getattr(getattr(sampler, "cfg", None), "own_measure", "handler") == "within_service")
     v_star = volume_frac * len(corpus.spans) * corpus.period / max(corpus.period, corpus.t_end - corpus.t0)
     cap = cap_factor * v_star
-    sampler = make_arm(arm, overrides or {})
     rng_seed = 1000 + seed
     res = replay(corpus, sampler, v_star, cap, seed=rng_seed, oracle=oracle)
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"{scenario}-s{seed}-v{volume_frac:g}" + ("-stages" if stages else "")
+    stem = f"{scenario}-s{seed}-v{volume_frac:g}" + ("-stages" if stages else "") + ("-waits" if waits else "")
     ev, de = out_dir / f"{stem}.events.json", out_dir / f"{stem}.decisions.json"
     with open(ev, "w", encoding="utf-8") as f:
         json.dump(events_dump(corpus, sampler.cfg, v_star, cap, rng_seed, arm, scenario, seed, oracle), f)

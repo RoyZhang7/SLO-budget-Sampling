@@ -13,6 +13,12 @@
 # socialgraph, the saturated scenario before 2026-11-22) spins unconfined; late_everywhere spins in
 # every service pod, unconfined (spin; spinf: plus a seventh thread spinning a fraction f of every
 # 10 ms) or under a CPU limit per pod (burn).
+# ARRIVAL=1 (SLO-budget arms): the eBPF arrival stamp, arrivald's DaemonSet and the stamp in the tee (TEE=0: in the
+# agents), so that the 100 % shadow carries slobudget.arrival_ns; the run fails unless the program is at every service
+# pod before the load and the ids arrived in it (arrival_check.py; a second failure writes STOP), and arrivald goes at
+# the end.  OWN_MEASURE=within_service: the agents' and the central's own time counts from the arrival.  CALLGRAPH:
+# the central's call graph file (the evaluation's truth does not change with it).  VARIANT: a label that keeps the
+# run apart from the plain arm in every table (arm-variant).  Any of these needs a VARIANT and a RUN_ID of its own.
 # meta.json records the image digests the pods ran (images.*_digest) and the source commit of
 # the synced tree (images.source_commit and source_tree, the commit's tree hash, which a reworded
 # commit keeps; from SOURCE.json; source_dirty lists files that differ).
@@ -24,12 +30,22 @@ source ~/bridges-env.sh 2>/dev/null || true
 ARM=$1; SCENARIO=$2; VOL=$3; SEED=$4
 : "${STAGE3:=/storage/royno7/stage3}"
 : "${DUR:=600}" ; : "${RPS:=100}" ; : "${WARMUP:=30}" ; : "${TEE:=1}"
+: "${ARRIVAL:=0}" ; : "${ARRIVAL_PIN:=/sys/fs/bpf/slobudget}" ; : "${ARRIVAL_SLOTS:=}" ; : "${VARIANT:=}"
+: "${CALLGRAPH:=$MOD/deploy/callgraph.json}"
+case "$CALLGRAPH" in /*) ;; *) CALLGRAPH=$MOD/$CALLGRAPH ;; esac
 : "${URL:=${WRK2API_URL:-http://10.10.1.1:22903}}"
 : "${LUA:=$HOME/blueprint-docc-mod/examples/dsb_sn/scripts/compose-post.lua}"
 : "${IMAGE_TAG:=$(cat "$MOD/build/IMAGE_TAG")}"
 IMG=10.10.1.1:30000/otelcol-slobudget:$IMAGE_TAG
 # shellcheck disable=SC1091
 source "$MOD/tools/campaign/faults.env"
+if [ "$ARRIVAL" = 1 ] || [ -n "$VARIANT${OWN_MEASURE:-}" ] || [ "$(basename "$CALLGRAPH")" != callgraph.json ]; then   # not a plain arm: a label and a directory of its own
+    { [ -n "$VARIANT" ] && [ -n "${RUN_ID:-}" ]; } || { echo "ARRIVAL, OWN_MEASURE, CALLGRAPH and VARIANT need a VARIANT and a RUN_ID of their own"; exit 2; }
+fi
+# the overhead experiment has the cluster (a job can be appended while its runs are on): wait
+while pgrep -f '^([^ ]*/)?bash [^ ]*tools/overhead/(run_overhead|overhead_queue|knee|live_check)\.sh' > /dev/null; do sleep 30; done
+exec 8> "$STAGE3/run_one.lock"      # one run at a time (the processes left behind do not hold it: 8>&-)
+flock 8
 VPCT=$(python3 -c "print(round($VOL*100))")
 RUN_ID=${RUN_ID:-v${VPCT}-${SCENARIO}-${ARM}-s${SEED}}
 RD=$STAGE3/runs/$RUN_ID
@@ -53,7 +69,36 @@ restore() {
     kubectl rollout status ds/otelcol-pb-es-ctr --timeout=300s >> "$RD/run.log" 2>&1
     kubectl delete deploy/slobudget-central svc/slobudget-central cm/slobudget-central-config cm/slobudget-callgraph \
         --ignore-not-found >> "$RD/run.log" 2>&1
+    # arrivald takes the program off on SIGTERM; the DaemonSet goes only when its pods are gone (none there: returns at once)
+    kubectl delete ds/slobudget-arrival --ignore-not-found --cascade=foreground --wait --timeout=90s >> "$RD/run.log" 2>&1 \
+        || log "WARNING: arrivald is not gone: $(kubectl get pods -l app=slobudget-arrival --no-headers 2>&1 | tr '\n' ' ')"
     log "restored: $(kubectl get ds otelcol-pb-es-ctr -o jsonpath='{.spec.template.spec.containers[0].image}')"
+}
+# the collectors' logs, and arrivald's; a kubectl error is not a log: up to three tries
+logs_to() {     # logs_to <file> <kubectl logs arguments>
+    local f=$1 _; shift
+    for _ in 1 2 3; do kubectl logs "$@" --since=30m > "$f" 2>&1 && return; sleep 3; done
+}
+run_logs() {
+    logs_to "$RD/central.log" deploy/slobudget-central
+    for p in $(kubectl get pods -l io.kompose.service=otelcol-pb-es-ctr -o jsonpath='{.items[*].metadata.name}'); do
+        node=$(kubectl get pod "$p" -o jsonpath='{.spec.nodeName}')
+        logs_to "$RD/agent-$node.log" "$p" -c otelcol-pb-es-ctr
+        [ "$TEE" = 1 ] && logs_to "$RD/tee-$node.log" "$p" -c tee
+    done
+    if [ "$ARRIVAL" = 1 ]; then
+        for p in $(kubectl get pods -l app=slobudget-arrival -o jsonpath='{.items[*].metadata.name}'); do
+            node=$(kubectl get pod "$p" -o jsonpath='{.spec.nodeName}')
+            logs_to "$RD/arrival-$node.log" "$p"
+            kubectl logs "$p" --previous > "$RD/arrival-$node.previous.log" 2>/dev/null || rm -f "$RD/arrival-$node.previous.log"
+        done
+    fi
+}
+# a defect of the stamp: the logs before the pods go; when the retry fails too, the queue halts
+arrival_fail() {
+    run_logs
+    if [ "${SANITY:-1}" = 1 ] && [ "$(cat "$RD/tries" 2>/dev/null || echo 0)" -ge 2 ]; then echo "$RUN_ID (arrival): $*" >> "$STAGE3/STOP"; fi
+    fail "$*"
 }
 scrape() {   # scrape <label>: every collector's Prometheus endpoint
     for line in $(kubectl get pods -l io.kompose.service=otelcol-pb-es-ctr -o jsonpath='{range .items[*]}{.spec.nodeName}={.status.podIP}{" "}{end}'); do
@@ -67,6 +112,21 @@ scrape() {   # scrape <label>: every collector's Prometheus endpoint
 
 log "run $RUN_ID: arm=$ARM scenario=$SCENARIO volume=$VOL seed=$SEED image=$IMG tee=$TEE"
 [ "$(kubectl get ds otelcol-pb-es-ctr -o jsonpath='{.spec.template.spec.containers[0].image}')" = "$STOCK_COLLECTOR_IMAGE" ] || fail "the stock collector is not in place"
+[ -z "$(kubectl get ds,pods -l app=slobudget-arrival --no-headers 2>/dev/null)" ] || fail "arrivald is still there (an earlier run): kubectl delete ds/slobudget-arrival"
+[ -f "$CALLGRAPH" ] || fail "no call graph $CALLGRAPH"
+BADENV=$(kubectl get deploy,ds -o json | python3 -c "
+import json, sys
+for x in json.load(sys.stdin)['items']:
+    n = x['metadata']['name']
+    if '-service-pb-es-ctr' in n and 'tracepressure' not in n:
+        e = {v['name']: v.get('value') for v in x['spec']['template']['spec']['containers'][0].get('env') or []}
+        if e.get('BRIDGE_KIND', 'pb') != 'pb' or 'OTEL_SAMPLE_RATIO' in e or 'SLO_BUDGET_PORT' in e:
+            print(n, end=' ')
+") || fail "kubectl get deploy,ds"
+[ -z "$BADENV" ] || fail "the services' env is not the campaign's (an overhead run's?): $BADENV"
+if [ "$ARRIVAL" = 1 ]; then
+    docker run --rm --entrypoint /arrivald "$IMG" -version > "$RD/arrivald-version" 2>&1 || arrival_fail "no arrivald in $IMG: $(tail -1 "$RD/arrivald-version")"
+fi
 
 # 1. reseed + warm-up (stock collector) ------------------------------------------------
 log "reseed"
@@ -78,7 +138,7 @@ wrk -t2 -c10 -d"${WARMUP}"s -s "$LUA" "$URL" -R"$RPS" > "$RD/wrk-warmup.log" 2>&
 # 2. shadow collector + the arm ------------------------------------------------------------
 if [ "$TEE" = 1 ]; then
     sed "s#__PATH__#$RD/shadow.jsonl#" "$MOD/tools/campaign/shadow-config.yaml" > "$RD/shadow-config.yaml"
-    nohup "$SHADOW_BIN" --config "$RD/shadow-config.yaml" > "$RD/shadow.log" 2>&1 &
+    nohup "$SHADOW_BIN" --config "$RD/shadow-config.yaml" > "$RD/shadow.log" 2>&1 8>&- &
     echo $! > "$RD/shadow.pid"
     for _ in $(seq 1 30); do ss -ltn 2>/dev/null | grep -q ':14317 ' && break; sleep 1; done
     ss -ltn | grep -q ':14317 ' || fail "shadow collector did not start: $(tail -3 "$RD/shadow.log")"
@@ -86,14 +146,20 @@ fi
 TT=""; [ "$ARM" = reservoir ] && TT="--ttable $STAGE3/reservoir-ttable.json"
 NT=""; [ "$TEE" = 1 ] || NT="--no-tee"
 [ "${CAPGATE:-1}" = 1 ] || NT="$NT --no-capgate"
-python3 "$MOD/tools/campaign/render.py" --arm "$ARM" --volume "$VOL" --seed "$SEED" --image "$IMG" $NT $TT \
-    --shares "$RESERVOIR_SHARES" --tail-wait "$TAIL_WAIT" > "$RD/manifests.yaml" || fail "render"
+ARR=""; [ "$ARRIVAL" = 1 ] && ARR="--arrival $ARRIVAL_PIN${ARRIVAL_SLOTS:+ --arrival-slots $ARRIVAL_SLOTS}"
+# shellcheck disable=SC2086
+python3 "$MOD/tools/campaign/render.py" --arm "$ARM" --volume "$VOL" --seed "$SEED" --image "$IMG" $NT $TT $ARR \
+    --callgraph "$CALLGRAPH" --shares "$RESERVOIR_SHARES" --tail-wait "$TAIL_WAIT" > "$RD/manifests.yaml" || fail "render"
 kubectl apply -f "$RD/manifests.yaml" >> "$RD/run.log" 2>&1 || fail "apply"
 kubectl rollout status deploy/slobudget-central --timeout=180s >> "$RD/run.log" 2>&1 || fail "central did not come up"
 kubectl rollout status ds/otelcol-pb-es-ctr --timeout=300s >> "$RD/run.log" 2>&1 || fail "agents did not roll"
 sleep 15
 NREADY=$(kubectl get pods -l io.kompose.service=otelcol-pb-es-ctr --no-headers | grep -c Running)
 [ "$NREADY" = 3 ] || fail "agents running: $NREADY"
+if [ "$ARRIVAL" = 1 ]; then
+    kubectl rollout status ds/slobudget-arrival --timeout=120s >> "$RD/run.log" 2>&1 || arrival_fail "arrivald did not come up"
+    python3 "$MOD/tools/overhead/arrival_check.py" > "$RD/arrival-check.txt" 2>&1 || arrival_fail "arrival: $(tail -1 "$RD/arrival-check.txt")"
+fi
 # the image digests the pods run (container=imageID per container)
 AGENT_IMAGES=$(kubectl get pods -l io.kompose.service=otelcol-pb-es-ctr -o jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.name}={.imageID}{" "}{end}{end}')
 CENTRAL_IMAGES=$(kubectl get pods -l app=slobudget-central -o jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.name}={.imageID}{" "}{end}{end}')
@@ -172,12 +238,10 @@ sleep 30
 scrape end
 cip=$(kubectl get pod -l app=slobudget-central -o jsonpath='{.items[0].status.podIP}')
 case "$ARM" in chosen|threshold|keep-parent) curl -s -m 10 "http://$cip:8081/slobudget/status" > "$RD/central-status.json" ;; esac
-kubectl logs deploy/slobudget-central --since=30m > "$RD/central.log" 2>&1
-for p in $(kubectl get pods -l io.kompose.service=otelcol-pb-es-ctr -o jsonpath='{.items[*].metadata.name}'); do
-    node=$(kubectl get pod "$p" -o jsonpath='{.spec.nodeName}')
-    kubectl logs "$p" -c otelcol-pb-es-ctr --since=30m > "$RD/agent-$node.log" 2>&1
-    [ "$TEE" = 1 ] && kubectl logs "$p" -c tee --since=30m > "$RD/tee-$node.log" 2>&1
-done
+run_logs
+if [ "$ARRIVAL" = 1 ]; then
+    python3 "$MOD/tools/overhead/arrival_check.py" --traffic --wait 5 >> "$RD/arrival-check.txt" 2>&1 || arrival_fail "arrival, after the load: $(tail -1 "$RD/arrival-check.txt")"
+fi
 RESTARTS=$(kubectl get pods -l io.kompose.service=otelcol-pb-es-ctr -o jsonpath='{range .items[*]}{.status.containerStatuses[*].restartCount}{" "}{end}')
 PLACEMENT=$(kubectl get pods -o jsonpath='{range .items[*]}{.metadata.labels.io\.kompose\.service}={.spec.nodeName}{" "}{end}')
 APPIMG=$(kubectl get deploy composepost-service-pb-es-ctr -o jsonpath='{.spec.template.spec.containers[0].image}')
@@ -224,7 +288,7 @@ for item in "$PLACEMENT".split():
         svc = lab[: -len("-service-pb-es-ctr")].replace("-", "")
         placement[svc] = node
         placement_nodes.setdefault(svc, set()).add(node)
-meta = {"run_id": "$RUN_ID", "arm": "$ARM", "scenario": "$SCENARIO", "volume_frac": $VOL, "v_star": round($VOL * 11500),
+meta = {"run_id": "$RUN_ID", "arm": "$ARM", "variant": "$VARIANT" or None, "scenario": "$SCENARIO", "volume_frac": $VOL, "v_star": round($VOL * 11500),
         "cap": 1.25 * round($VOL * 11500), "seed": $SEED, "slo_ms": {"compose_post": 23.4}, "period_s": 5, "margin": 0.1,
         "t0": $T0, "t1": $T1, "delta_s": $DELTA, "fault": fault, "burst": burst, "placement": placement,
         "placement_nodes": {k: sorted(v) for k, v in placement_nodes.items()},
@@ -232,8 +296,9 @@ meta = {"run_id": "$RUN_ID", "arm": "$ARM", "scenario": "$SCENARIO", "volume_fra
                        "reservoir_shares": json.loads('$RESERVOIR_SHARES')},
         "images": images, "tee": $TEE == 1, "agent_restarts": "$RESTARTS".split(),
         "rps": $RPS, "dur_s": $DUR,
+        "callgraph": os.path.basename("$CALLGRAPH"), "arrival_pin": "$ARRIVAL_PIN" if "$ARRIVAL" == "1" else None,
         "sampler_env": {"outlier_trigger": "${OUTLIER_TRIGGER:-}" or None, "own_margin": "${OWN_MARGIN:-}" or None,
-                        "server_hold": "${SERVER_HOLD:-}" or None}}
+                        "own_measure": "${OWN_MEASURE:-}" or None, "server_hold": "${SERVER_HOLD:-}" or None}}
 json.dump(meta, open(os.path.join(rd, "meta.json"), "w"), indent=1)
 PY
 touch "$RD/collected"
@@ -245,5 +310,5 @@ if ! grep -q '^OK' "$RD/precheck.txt"; then
     [ "${SANITY:-1}" = 1 ] && echo "$RUN_ID (pre-check): $(head -3 "$RD/precheck.txt" | tr '\n' ' ')" >> "$STAGE3/STOP"
 fi
 log "collected; postprocess queued"
-nohup bash "$MOD/tools/campaign/postprocess.sh" "$RD" >> "$RD/postprocess.log" 2>&1 &
+nohup bash "$MOD/tools/campaign/postprocess.sh" "$RD" >> "$RD/postprocess.log" 2>&1 8>&- &
 exit 0

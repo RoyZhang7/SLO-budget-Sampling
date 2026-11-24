@@ -92,7 +92,7 @@ EXP14_SCENARIOS = SCENARIOS + DRIFT_SCENARIOS + ("steady+ht",)     # fitted, dri
 VOLUMES = (0.25, 0.12, 0.05)
 # BudgetConfig fields added after the result rows of passes 1-5 were written: they enter the
 # config hash only when set away from their default, so those rows stay valid
-HASH_OPTIONAL = {"n_need_healthy": False, "plan_coin": "span", "n_need_decay": 0.0,      # outlier_margin always enters the hash since its default moved to 0.1 (Stage 2c)
+HASH_OPTIONAL = {"n_need_healthy": False, "plan_coin": "span", "n_need_decay": 0.0, "own_measure": "handler",      # outlier_margin always enters the hash since its default moved to 0.1 (Stage 2c)
                  "freeze_release": 1}       # Stage 3: rows before the field existed used the release at the first quiet period
 # Stage 2d: outlier_trigger and own_margin enter the hash only for the own trigger, so that a
 # duration-trigger configuration hashes as it did before the fields existed

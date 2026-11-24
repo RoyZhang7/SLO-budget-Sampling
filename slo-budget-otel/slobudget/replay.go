@@ -68,6 +68,10 @@ func Replay(c *Corpus, cfg Config, vStar, cap float64, seed uint64, oracle *Cali
 		res.Decisions[i].Reason = ""
 	}
 	reqs := map[uint64]*RequestState{}
+	left := map[uint64]int{} // per trace: its spans that have not ended (the request is kept until the last one, as an agent does)
+	for i := range c.Spans {
+		left[c.Spans[i].TraceID]++
+	}
 	cur := 0
 	st := PeriodStats{Period: 0, Dropped: map[string]int{}}
 	costInPeriod := 0.0
@@ -128,7 +132,7 @@ func Replay(c *Corpus, cfg Config, vStar, cap float64, seed uint64, oracle *Cali
 			st.Dropped[d.Reason]++
 			res.Decisions[ev.idx] = d
 		}
-		if sp.IsRoot {
+		if left[sp.TraceID]--; left[sp.TraceID] == 0 {
 			delete(reqs, sp.TraceID)
 		}
 	}

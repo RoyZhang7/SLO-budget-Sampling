@@ -172,7 +172,7 @@ class Calibrator:
     periods, reweighted by 1/p.  `lookup` is what the decider calls."""
 
     def __init__(self, graph: CallGraph, routes_slo: dict[str, float], q: float = 0.95,
-                 min_class_samples: int = 20, window: int = 2, use_class: bool = True, prior: str = "none"):
+                 min_class_samples: int = 20, window: int = 2, use_class: bool = True, prior: str = "none", within: bool = False):
         self.graph = graph
         self.routes_slo = routes_slo
         self.q = q
@@ -201,13 +201,15 @@ class Calibrator:
         self.L: dict[tuple[str, str, str], float] = {}
         self.O: dict[tuple[str, str, str], float] = {}
         self.freeze: set[str] = set()      # services whose previous L, O are reused at the next rebuild
+        self.within = within               # the samples start at the request's arrival (span.wait), not at the handler's start
         self.version = 0
 
     def observe(self, span: Span, p: float) -> None:
         cls = span.req_class if self.use_class else "*"
         d, o, w = self._cur.setdefault((span.route, cls, span.service), ([], [], []))
-        d.append(span.duration)
-        o.append(span.own if span.own > 0.0 else span.duration)
+        wait = span.wait if self.within else 0.0
+        d.append(span.duration + wait)
+        o.append((span.own if span.own > 0.0 else span.duration) + wait)
         w.append(1.0 / p if p > 0 else 1.0)
 
     def discard_period(self) -> None:
@@ -315,11 +317,11 @@ class Calibrator:
         return v
 
 
-def oracle_table(reference: Corpus, q: float = 0.95, use_class: bool = True) -> Calibrator:
+def oracle_table(reference: Corpus, q: float = 0.95, use_class: bool = True, within: bool = False) -> Calibrator:
     """The table the calibration procedure yields with complete (p = 1) data
     from a healthy reference workload: the ground-truth T_i."""
     cal = Calibrator(reference.graph, reference.routes_slo, q=q, min_class_samples=MIN_SAMPLES,
-                     window=1, use_class=use_class)
+                     window=1, use_class=use_class, within=within)
     for s in reference.spans:
         cal.observe(s, 1.0)
     cal.end_period()

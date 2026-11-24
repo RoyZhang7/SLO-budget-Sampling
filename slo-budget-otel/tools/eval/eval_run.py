@@ -40,7 +40,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("run_dir")
     ap.add_argument("--sim", default=os.path.expanduser("~/slo-budget-sim"), help="checkout holding the slo_budget_sim package")
-    ap.add_argument("--callgraph", default=os.path.join(HERE, "..", "..", "deploy", "callgraph.json"))
+    ap.add_argument("--callgraph", default=os.path.join(HERE, "..", "..", "deploy", "callgraph.json"),
+                    help="the truth's call graph, the same for every run whatever its central had (the common truth, *_ws, has the staged one)")
     ap.add_argument("--recon", default=os.path.expanduser("~/bin/recon"), help="tools/recon binary (run when no recon-report.json exists)")
     ap.add_argument("--no-recon", action="store_true")
     ap.add_argument("--out", help="default: <run_dir>/summary.json")

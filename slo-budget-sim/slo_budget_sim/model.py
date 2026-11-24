@@ -23,6 +23,7 @@ class Span:
     transit: float = 0.0    # one-way network time of the call that created this span
     own: float = 0.0        # own (self) time, when known (generator / complete traces)
     children: list = field(default_factory=list)   # child span indexes
+    wait: float = 0.0       # from the request's arrival at the pod to this span's start (0: no arrival known, or a later one)
 
     @property
     def end(self) -> float:

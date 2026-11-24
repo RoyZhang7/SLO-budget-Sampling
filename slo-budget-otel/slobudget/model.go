@@ -28,6 +28,7 @@ type Span struct {
 	NBytes    int
 	Transit   float64
 	Own       float64 // own (self) time when known, else 0
+	Wait      float64 // seconds from the request's arrival at the pod to Start (0: no arrival known, or a later one)
 
 	ParentSpanID uint64 // the parent's span id (0 for a root): keep_parent forces it
 }
@@ -145,3 +146,11 @@ func (c *Corpus) TEnd() float64 {
 }
 
 func maxf(a, b float64) float64 { return math.Max(a, b) }
+
+// ArrivalWait is a span's Wait from its start and its request's arrival at the pod (unix ns).
+func ArrivalWait(startNs, arrivalNs int64) float64 {
+	if arrivalNs <= 0 || arrivalNs >= startNs {
+		return 0
+	}
+	return float64(startNs-arrivalNs) / 1e9
+}

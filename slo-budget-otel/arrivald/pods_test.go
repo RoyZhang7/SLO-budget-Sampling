@@ -59,6 +59,22 @@ func TestNamespaces(t *testing.T) {
 	}
 }
 
+func TestOnly(t *testing.T) {
+	p := fakeProc(t, map[string]map[string]string{"1": {"ns/net": "net:[1]"}, "100": {"ns/net": "net:[7]"}, "101": {"ns/net": "net:[7]"}, "200": {"ns/net": "net:[8]"}})
+	spaces, err := p.namespaces()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := p.only(spaces, 101); len(got) != 1 || got["net:[7]"] != 101 {
+		t.Fatalf("%v", got)
+	}
+	for _, pid := range []int{1, 999} { // the host's own namespace, no such process
+		if got := p.only(spaces, pid); len(got) != 0 {
+			t.Fatalf("process %d: %v", pid, got)
+		}
+	}
+}
+
 func TestLooks(t *testing.T) {
 	l := looks{}
 	now := time.Unix(1000, 0)
