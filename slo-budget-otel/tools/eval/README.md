@@ -31,7 +31,9 @@ eBPF stamp has `slobudget.arrival_ns` in its 100 % export (attached in the tee, 
 (`arrival-vs-estimate.json`, `arrival_estimate.py`), the check on the estimate.  The estimate takes the callee's healthy median wait
 for travel: it is later than the stamp by about that on every call of the edge, in the thresholds too; the report gives the difference
 around its healthy median.  Table 5, over the window (the fault; bursty: the burst; steady: the run): per 5-s period the services (roots apart) with a
-true outlier and those of them with one of their true outliers kept, the mean of the ratio (`ws_services_covered`); the shares of the window's kept spans
+true outlier and those of them with one of their true outliers kept, the mean of the ratio (`ws_services_covered`); the same of the struggling services (`ws_struggling_*`:
+at least 2 % of a service's spans in the period are true outliers), with their number per period (periods without one count as 0) and the share of the periods
+that have one, the mean of the ratio being over those; the shares of the window's kept spans
 that are true outliers of the culprit, of other services, and everything else (`ws_kept_*`); and the culprit's true outliers, those kept and, for our
 arms, those kept as outliers per period next to N_need (`n_need_window`; no limit for threshold-only).
 

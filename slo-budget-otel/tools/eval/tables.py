@@ -85,6 +85,10 @@ VOLUME_COLUMNS = [
     ("services with a true outlier, a period", "ws_services_with_an_outlier_per_period", "{:.1f}", 1.0),
     ("... with one kept", "ws_services_covered_per_period", "{:.1f}", 1.0),
     ("services covered", "ws_services_covered", "{:.2f}", 1.0),
+    ("struggling services, a period", "ws_struggling_per_period", "{:.2f}", 1.0),
+    ("... with a true outlier kept", "ws_struggling_covered_per_period", "{:.2f}", 1.0),
+    ("struggling covered", "ws_struggling_covered", "{:.2f}", 1.0),
+    ("periods with a struggling one", "ws_periods_with_struggling", "{:.0f}%", 100.0),
     ("kept: culprit's outliers", "ws_kept_culprit_outliers", "{:.1f}%", 100.0),
     ("kept: other services' outliers", "ws_kept_other_outliers", "{:.1f}%", 100.0),
     ("kept: ordinary spans", "ws_kept_ordinary", "{:.1f}%", 100.0),
@@ -272,7 +276,7 @@ def main() -> int:
     if ws:
         print(markdown(ws, WS_COLUMNS, f"Common truth of all arms: within-service latency on the estimated kernel receive time, {v} (window: the fault, bursty: the burst, steady: the run)"))
     if vol:
-        print(markdown(vol, VOLUME_COLUMNS, f"Common truth: services covered in the window and where its kept spans went, {v} (ordinary: every kept span that is no true outlier of a service, client spans and roots too)"))
+        print(markdown(vol, VOLUME_COLUMNS, f"Common truth: services covered in the window and where its kept spans went, {v} (struggling: at least 2 % of the service's spans of the period are true outliers; ordinary: every kept span that is no true outlier of a service, client spans and roots too)"))
     stamped = [s for s in summaries if s.get("arrival") and abs(float(s["volume_frac"]) - a.volume) < 1e-6 and s.get("scenario") in a.scenarios]
     if stamped:
         print(f"### Arrival stamp, {v}\n")

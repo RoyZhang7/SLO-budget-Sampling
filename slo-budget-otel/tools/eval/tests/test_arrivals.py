@@ -240,6 +240,7 @@ def test_services_covered_and_where_the_volume_went(tmp_path):
     r = evaluate(run, SIM, os.path.join(run, "callgraph.json"), recon_bin=None, do_recon=False)
     # the fault: 150 traces in 3 periods (the last one's spans end in the fourth); c is the only service with true outliers, all but one kept
     assert r["ws_services_with_an_outlier_per_period"] == 1.0 and r["ws_services_covered"] == 1.0 and r["ws_services_covered_per_period"] == 1.0
+    assert r["ws_struggling_per_period"] == 1.0 and r["ws_struggling_covered"] == 1.0 and r["ws_struggling_covered_per_period"] == 1.0 and r["ws_periods_with_struggling"] == 1.0
     kept_c, kept_b, kept_a = 149, 50, 150
     assert r["ws_kept_window"] == pytest.approx(kept_a + kept_b + kept_c, abs=2)
     assert r["ws_kept_culprit_outliers"] == pytest.approx(149 / r["ws_kept_window"], abs=0.005) and r["ws_kept_other_outliers"] == 0.0
@@ -256,6 +257,11 @@ def test_services_covered_and_where_the_volume_went(tmp_path):
     r = evaluate(run, SIM, os.path.join(run, "callgraph.json"), recon_bin=None, do_recon=False)
     assert r["ws_kept_culprit_outliers"] != r["ws_kept_culprit_outliers"] and r["ws_kept_other_outliers"] > 0.4 and r["ws_services_covered"] == 1.0
     assert "ws_culprit_kept_per_period" not in r
+    # a run without a fault: the one error among d's spans (2 of 100 in its period would be struggling) makes no service struggle
+    m["fault"], m["scenario"] = None, "steady"
+    json.dump(m, open(mp, "w"))
+    r = evaluate(run, SIM, os.path.join(run, "callgraph.json"), recon_bin=None, do_recon=False)
+    assert 0.2 < r["ws_periods_with_struggling"] < 0.4 and r["ws_struggling_per_period"] == pytest.approx(r["ws_periods_with_struggling"], abs=0.1)       # c's, in the (unnamed) fault's periods
 
 
 def test_report_tool_without_a_stamp(tmp_path, capsys):

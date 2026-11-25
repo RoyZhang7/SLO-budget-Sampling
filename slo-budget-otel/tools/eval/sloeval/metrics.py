@@ -40,6 +40,7 @@ from .spans import CLIENT, SERVER, KeptSet, SpanTable, own_client
 
 CHOSEN_FAMILY = ("chosen", "threshold", "keep-parent")
 FLAG_REASONS = ("outlier", "escalate")
+STRUGGLING = 0.02           # of a service's spans in a period
 EVIDENCE_FLAG_REASONS = ("outlier", "escalate", "parent")
 
 
@@ -290,6 +291,20 @@ def compute(meta: dict, t: SpanTable, kept: KeptSet, kidx: np.ndarray, cal, stat
             out["ws_services_with_an_outlier_per_period"] = _mean(list(has_outlier.values()))
             out["ws_services_covered_per_period"] = _mean([has_kept.get(p, 0) for p in has_outlier])
             out["ws_services_covered"] = _mean([has_kept.get(p, 0) / c for p, c in has_outlier.items()])
+        # the same of the struggling ones: at least STRUGGLING of the service's spans of the period are true outliers
+        ns = max(1, len(t.services))
+        in_w = SP & nonroot & window & warm
+        cells_n = ((int(k[in_w].max()) + 1) if in_w.any() else 1) * ns
+        per_cell = [np.bincount(k[m] * ns + t.svc[m], minlength=cells_n).reshape(-1, ns) for m in (in_w, in_w & truth_ws, in_w & truth_ws & kept_mask)]
+        there = per_cell[0].sum(axis=1) > 0                     # the periods of the window
+        struggling = (per_cell[1] > 0) & (per_cell[1] >= STRUGGLING * per_cell[0])
+        n_struggling, n_kept = struggling.sum(axis=1)[there], (struggling & (per_cell[2] > 0)).sum(axis=1)[there]
+        if there.any():
+            some = n_struggling > 0
+            out["ws_struggling_per_period"] = float(n_struggling.mean())                # the periods without one count
+            out["ws_struggling_covered_per_period"] = float(n_kept.mean())
+            out["ws_periods_with_struggling"] = float(some.mean())
+            out["ws_struggling_covered"] = float((n_kept[some] / n_struggling[some]).mean()) if some.any() else math.nan
         # where the volume of the window went
         kept_w = kp & warm & window
         is_culprit = t.svc == t.services.index(fault["culprit"]) if fault and fault.get("culprit") in t.services else np.zeros(n, dtype=bool)
