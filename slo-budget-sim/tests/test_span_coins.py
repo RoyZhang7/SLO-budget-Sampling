@@ -13,7 +13,7 @@ def test_span_coin_golden():
 
 
 def test_span_coins_are_the_spans_own_and_a_count_record_counts():
-    corpus = chain_corpus()
+    corpus = chain_corpus([2.0, 3.0, 4.0])
     cfg = BudgetConfig(coin_source="span", plan_coin="hash")
     s = BudgetSampler(cfg, name="x")
     s.start_run(RunContext(corpus, 100.0, 125.0, None, 7))
@@ -30,5 +30,5 @@ def test_span_coins_are_the_spans_own_and_a_count_record_counts():
 
 def test_rng_is_the_default():
     s = BudgetSampler(BudgetConfig(), name="x")
-    s.start_run(RunContext(chain_corpus(), 100.0, 125.0, None, 7))
+    s.start_run(RunContext(chain_corpus([2.0, 3.0, 4.0]), 100.0, 125.0, None, 7))
     assert type(s.rng).__name__ == "Random"

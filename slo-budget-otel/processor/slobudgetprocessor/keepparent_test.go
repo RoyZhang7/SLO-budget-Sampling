@@ -125,7 +125,9 @@ func TestForceNoticeKeepsTheParentAndTheAnchorOnAnotherAgent(t *testing.T) {
 // A force for a span the agent already decided is late: counted, not kept.
 func TestLateForceIsCountedNotHonoured(t *testing.T) {
 	sink := new(consumertest.TracesSink)
-	b, err := newAgent(processortest.NewNopSettings(typeStr), keepParentConfig(t, "node-b"), sink)
+	cfg := keepParentConfig(t, "node-b")
+	cfg.KeepParentGrace = 0 // no grace: the late force is counted, not honoured
+	b, err := newAgent(processortest.NewNopSettings(typeStr), cfg, sink)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,5 +189,51 @@ func TestBrAnchorDecoding(t *testing.T) {
 	m.PutEmptyBytes(AttrBR).FromRaw([]byte{2, 1})
 	if _, ok := brAnchor(m); ok {
 		t.Fatal("a short payload must not decode")
+	}
+}
+
+// keep_parent_grace: a force that arrives after this agent dropped the span, but within the grace, exports the span as
+// parent_late; after the grace it is late as before.
+func TestLateForceWithinTheGraceIsHonoured(t *testing.T) {
+	sink := new(consumertest.TracesSink)
+	cfg := keepParentConfig(t, "node-b")
+	cfg.KeepParentGrace = 300 * time.Millisecond
+	b, err := newAgent(processortest.NewNopSettings(typeStr), cfg, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(context.Background(), componenttest.NewNopHost()); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = b.Shutdown(context.Background()) }()
+	base := time.Now().Add(-100 * time.Millisecond)
+	_ = b.ConsumeTraces(context.Background(), buildTraces(8, base, []spanSpec{
+		{"hometimeline", "SocialGraphServiceClient_GetFollowers", 6, 3, time.Millisecond, 2 * time.Millisecond, ptrace.SpanKindClient}}))
+	if sink.SpanCount() != 0 {
+		t.Fatal("the ordinary client span should be dropped (plan rate 0)")
+	}
+	var sid pcommon.SpanID
+	sid[7] = 6
+	b.onForce([16]byte{}, [8]byte(sid))
+	time.Sleep(150 * time.Millisecond) // the ticker drains a.out
+	b.mu.Lock()
+	rec, late := b.stats.forceLateRecovered, b.stats.forceLate
+	b.mu.Unlock()
+	if rec != 1 || late != 0 {
+		t.Fatalf("recovered %d late %d", rec, late)
+	}
+	if sink.SpanCount() != 1 {
+		t.Fatalf("the span should be exported now: %d", sink.SpanCount())
+	}
+	out := sink.AllTraces()[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
+	if v, ok := out.Attributes().Get(AttrReason); !ok || v.Str() != "parent_late" {
+		t.Fatalf("reason %v", v.AsRaw())
+	}
+	// the same force again: nothing more (decided as kept now)
+	b.onForce([16]byte{}, [8]byte(sid))
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.stats.forceLateKept != 1 || b.stats.forceLateRecovered != 1 {
+		t.Fatalf("second force: lateKept %d recovered %d", b.stats.forceLateKept, b.stats.forceLateRecovered)
 	}
 }

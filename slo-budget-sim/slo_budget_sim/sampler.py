@@ -218,6 +218,7 @@ class BudgetConfig:
     alpha: float = 0.5              # refill damping
     calib_q: float = 0.95           # calibration percentile for T_i
     calib_window: int = 2           # periods of kept spans used for calibration
+    table_smooth: int = 1           # the published b: mean of the last K calibrations (1: the latest alone); the freeze is kept
     min_class_samples: int = 20     # class key falls back to the route key below this
     use_class: bool = True          # key T_i by (service, root, class) rather than (service, root)
     plan: str = "uniform"           # uniform | sqrt   (ordinary-span plan weights)
@@ -295,6 +296,8 @@ class BudgetConfig:
             raise ValueError(f"unknown coin_source {self.coin_source}; choose from {COIN_SOURCES}")
         if not 0.0 <= self.n_need_decay < 1.0:
             raise ValueError("n_need_decay must be in [0, 1)")
+        if int(self.table_smooth) < 1:
+            raise ValueError("table_smooth must be >= 1")
 
 
 def _growth(rule: str):
@@ -327,7 +330,7 @@ class BudgetSampler(Sampler):
             self.rng = SpanCoins(self)
         self.calibrated = cfg.calib_source != "oracle"
         self._within = cfg.own_measure == "within_service"
-        self.cal = Calibrator(corpus.graph, corpus.routes_slo, q=cfg.calib_q,
+        self.cal = Calibrator(corpus.graph, corpus.routes_slo, q=cfg.calib_q, smooth=cfg.table_smooth,
                               min_class_samples=cfg.min_class_samples,
                               window=cfg.calib_window, use_class=cfg.use_class,
                               prior=cfg.cold_prior if self.calibrated else "none", within=self._within)

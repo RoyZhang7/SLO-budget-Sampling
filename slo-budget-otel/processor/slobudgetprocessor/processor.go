@@ -112,6 +112,8 @@ type agent struct {
 	// peer's force-notice), span ids this agent broadcast, and recently decided span ids
 	// (to tell a late force from one that will be honoured)
 	forcedAt  map[uint64]time.Time
+	// keep_parent_grace: spans dropped here, kept aside for a late force (span id -> the span with its decision's facts)
+	lateBuf map[uint64]*lateSpan
 	sentForce map[uint64]time.Time
 	decided   map[uint64]decidedSpan
 
@@ -138,6 +140,7 @@ type agentCounters struct {
 	// keep_parent: kept because forced, forced but refused (budget / pool), forces that
 	// arrived after the span was decided (dropped / kept anyway), forces never used
 	forcedKept, forcedRefused, forceLate, forceLateKept, forcedExpired int
+	forceLateRecovered, lateBufPeak                                    int // late forces honoured within keep_parent_grace; the buffer's peak
 	// server_hold: spans held, client spans that arrived after their parent was released
 	// (own time overestimated), summed hold time, peak spans and bytes held at once
 	srvHeld, srvLateClients, srvHeldPeak, srvBytesPeak int
@@ -155,7 +158,7 @@ func newAgent(set processor.Settings, cfg *Config, next consumer.Traces) (*agent
 	a := &agent{cfg: cfg, log: set.Logger, next: next, host: host, reqs: map[pcommon.TraceID]*request{},
 		pending: map[pcommon.TraceID]*pendingRoot{}, pendingSrv: map[pcommon.SpanID]*pendingServer{},
 		released: map[pcommon.SpanID]time.Time{}, out: ptrace.NewTraces(), httpc: &http.Client{Timeout: 2 * time.Second},
-		forcedAt: map[uint64]time.Time{}, sentForce: map[uint64]time.Time{}, decided: map[uint64]decidedSpan{}}
+		forcedAt: map[uint64]time.Time{}, sentForce: map[uint64]time.Time{}, decided: map[uint64]decidedSpan{}, lateBuf: map[uint64]*lateSpan{}}
 	graph := &slobudget.CallGraph{Root: map[string]string{}, Children: map[string]map[string][]string{}, Parallel: map[string]map[string]bool{}}
 	vStar := cfg.StandaloneVStar
 	if vStar <= 0 {
@@ -358,6 +361,9 @@ func (a *agent) decide(rs ptrace.ResourceSpans, ss ptrace.ScopeSpans, span ptrac
 			a.afterDecision(span, &sp, d, forced, now)
 			a.countRefusal(d)
 			a.noteChild(req, parent, d.Keep)
+			if !d.Keep {
+				a.keepAside(rs, ss, span, sp, req, now)
+			}
 			if d.Keep {
 				attrs.PutDouble(AttrSamplingP, d.P)
 				attrs.PutStr(AttrReason, d.Reason)
@@ -397,6 +403,7 @@ func (a *agent) decide(rs ptrace.ResourceSpans, ss ptrace.ScopeSpans, span ptrac
 	a.countRefusal(d)
 	a.noteChild(req, parent, d.Keep)
 	if !d.Keep {
+		a.keepAside(rs, ss, span, sp, req, now)
 		return false
 	}
 	a.stamp(span, &sp, d, req)
@@ -440,18 +447,69 @@ func (a *agent) afterDecision(span ptrace.Span, sp *slobudget.Span, d slobudget.
 	}
 }
 
-// forceHere records a local force; a span already decided here makes it late.
+// forceHere records a local force; a span already decided here makes it late, unless it was dropped within
+// keep_parent_grace: then it is exported now (parent_late).
 func (a *agent) forceHere(id uint64, now time.Time) {
 	if d, ok := a.decided[id]; ok {
 		a.s.Unforce(id)
 		if d.kept {
 			a.stats.forceLateKept++
-		} else {
+		} else if !a.recoverLate(id, now) {
 			a.stats.forceLate++
 		}
 		return
 	}
 	a.forcedAt[id] = now
+}
+
+// lateSpan is a span dropped here, kept aside for keep_parent_grace with what a forced keep needs.
+type lateSpan struct {
+	td  ptrace.Traces
+	sp  slobudget.Span
+	req *request
+	at  time.Time
+}
+
+// keepAside copies a dropped span into the late buffer (keep_parent with a grace window).  Called with a.mu held.
+func (a *agent) keepAside(rs ptrace.ResourceSpans, ss ptrace.ScopeSpans, span ptrace.Span, sp slobudget.Span, req *request, now time.Time) {
+	if !a.cfg.Sampler.KeepParent || a.cfg.KeepParentGrace <= 0 || sp.IsRoot {
+		return
+	}
+	td := ptrace.NewTraces()
+	nrs := td.ResourceSpans().AppendEmpty()
+	rs.Resource().CopyTo(nrs.Resource())
+	nss := nrs.ScopeSpans().AppendEmpty()
+	ss.Scope().CopyTo(nss.Scope())
+	span.CopyTo(nss.Spans().AppendEmpty())
+	a.lateBuf[sp.SpanID] = &lateSpan{td: td, sp: sp, req: req, at: now}
+	if n := len(a.lateBuf); n > a.stats.lateBufPeak {
+		a.stats.lateBufPeak = n
+	}
+}
+
+// recoverLate exports a span dropped within the grace window for which a force arrived: the sampler's forced spend
+// (parent_late), the stamps, the root's flag.  Called with a.mu held.
+func (a *agent) recoverLate(id uint64, now time.Time) bool {
+	l, ok := a.lateBuf[id]
+	if !ok {
+		return false
+	}
+	delete(a.lateBuf, id)
+	if now.Sub(l.at) > a.cfg.KeepParentGrace {
+		return false
+	}
+	d := a.s.ForceKeep(&l.sp, &l.req.st)
+	a.decided[id] = decidedSpan{now, d.Keep}
+	if !d.Keep {
+		a.stats.forcedRefused++
+		return false
+	}
+	a.stats.forceLateRecovered++
+	span := l.td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
+	a.stamp(span, &l.sp, d, l.req)
+	a.notify(span.TraceID(), span.Attributes())
+	l.td.ResourceSpans().MoveAndAppendTo(a.out.ResourceSpans())
+	return true
 }
 
 func (a *agent) broadcastForce(tid [16]byte, sid pcommon.SpanID, id uint64, now time.Time) {
@@ -477,7 +535,7 @@ func (a *agent) onForce(_ [16]byte, sid [8]byte) {
 	if d, ok := a.decided[id]; ok {
 		if d.kept {
 			a.stats.forceLateKept++
-		} else {
+		} else if !a.recoverLate(id, now) {
 			a.stats.forceLate++
 		}
 		return
@@ -662,6 +720,9 @@ func (a *agent) releaseServer(p *pendingServer, now time.Time) {
 	a.countRefusal(d)
 	a.noteChild(p.req, p.parent, d.Keep)
 	if !d.Keep {
+		if a.cfg.Sampler.KeepParent && a.cfg.KeepParentGrace > 0 {
+			a.lateBuf[p.sp.SpanID] = &lateSpan{td: p.td, sp: p.sp, req: p.req, at: now}
+		}
 		return
 	}
 	a.stamp(span, &p.sp, d, p.req)
@@ -727,6 +788,13 @@ func (a *agent) flushLoop(ctx context.Context) {
 				if r.last.Before(cut) {
 					if _, held := a.pending[tid]; !held {
 						delete(a.reqs, tid) // held server spans keep their own *request
+					}
+				}
+			}
+			if a.cfg.KeepParentGrace > 0 {
+				for id, l := range a.lateBuf {
+					if now.Sub(l.at) > a.cfg.KeepParentGrace {
+						delete(a.lateBuf, id)
 					}
 				}
 			}

@@ -169,6 +169,13 @@ func (s *Sampler) Unforce(spanID uint64) { delete(s.forced, spanID) }
 // IsForced reports whether a span id is forced.
 func (s *Sampler) IsForced(spanID uint64) bool { return s.forced[spanID] }
 
+// ForceKeep keeps a span the sampler already dropped because a force for it came late (keep_parent, the agent's grace
+// window): the forced spend at p = 1 with the reason parent_late; the span was counted as seen when it was decided.
+func (s *Sampler) ForceKeep(sp *Span, req *RequestState) Decision {
+	delete(s.forced, sp.SpanID)
+	return s.spend(sp, req, 1.0, "parent_late")
+}
+
 func (s *Sampler) resetCounters() {
 	s.nseen = map[string]int{}
 	s.ndet = map[string]int{}

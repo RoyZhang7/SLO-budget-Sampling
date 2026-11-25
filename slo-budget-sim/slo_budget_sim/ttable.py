@@ -172,10 +172,15 @@ class Calibrator:
     periods, reweighted by 1/p.  `lookup` is what the decider calls."""
 
     def __init__(self, graph: CallGraph, routes_slo: dict[str, float], q: float = 0.95,
-                 min_class_samples: int = 20, window: int = 2, use_class: bool = True, prior: str = "none", within: bool = False):
+                 min_class_samples: int = 20, window: int = 2, use_class: bool = True, prior: str = "none", within: bool = False,
+                 smooth: int = 1):
         self.graph = graph
         self.routes_slo = routes_slo
         self.q = q
+        # smooth K: the published b of a key is the mean of its last K calibrations' raw values (1: today's, the latest alone);
+        # a frozen service's raw value is its held b, so the freeze is kept
+        self.smooth = max(1, int(smooth))
+        self._braw: list[dict[tuple[str, str, str], float]] = []
         self.min_class_samples = min_class_samples
         self.use_class = use_class
         if prior not in PRIORS:
@@ -289,7 +294,16 @@ class Calibrator:
             for svc in L:
                 Ltab[(route, cls, svc)] = L[svc]
                 Otab[(route, cls, svc)] = O[svc]
-        self.table, self.b, self.L, self.O = table, btab, Ltab, Otab
+        self.table, self.L, self.O = table, Ltab, Otab
+        self._braw.append(btab)
+        del self._braw[:-self.smooth]
+        if self.smooth == 1:
+            self.b = btab
+        else:
+            self.b = {}
+            for key in btab:
+                vals = [h[key] for h in self._braw if key in h]
+                self.b[key] = sum(vals) / len(vals)
         self.calibrated.update((r, s) for (r, _, s) in table)
         self.version += 1
 

@@ -61,6 +61,10 @@ type Config struct {
 	// its parent span (the caller's client span) and, with this on, also its `_br`
 	// checkpoint anchor (the caller's server span, its parent in the simulator's model).
 	KeepParentAnchor bool `mapstructure:"keep_parent_anchor"`
+	// KeepParentGrace (keep_parent ablation): a span this agent dropped is kept aside this long, so that a force for it
+	// that arrives late (the child's agent decided after the parent reached here: the timing race) still exports it,
+	// as parent_late.  0: a late force is counted and not honoured.
+	KeepParentGrace time.Duration `mapstructure:"keep_parent_grace"`
 	// ArrivalTable is the pin directory of the arrival program (arrivald): a server span gets
 	// the arrival of its request at the pod (slobudget.arrival_ns), looked up by its parent span
 	// id when the span reaches the agent; on a miss, its own start.  Decisions use it only with

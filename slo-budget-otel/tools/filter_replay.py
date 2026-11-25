@@ -239,9 +239,14 @@ def main() -> int:
     elif a.run:
         sys.path.insert(0, os.path.expanduser("~/an13"))
         from measure13 import build  # noqa: E402
-        _, corpus, _, waits, _, _ = build(os.path.basename(a.run.rstrip("/")))
+        import math
+        t, corpus, _, waits, _, _ = build(os.path.basename(a.run.rstrip("/")))
         for sp, w in zip(corpus.spans, waits["iv"].tolist()):
             sp.wait = max(0.0, float(w))
+        fw = (t.meta or {}).get("fault")
+        if fw:    # the fault window in the corpus's clock (measure13: spans start at t0 floored to the period)
+            base = math.floor(float(t.meta["t0"]) / 5.0) * 5
+            corpus.fault_window = (float(fw["start"]) - base, float(fw["end"]) - base)
     else:
         corpus = pickle.load(open(a.corpus, "rb"))
     n = len(corpus.spans)
