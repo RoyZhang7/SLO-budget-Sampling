@@ -19,6 +19,7 @@ fix ignores the stages).
 | B, SDK head sampling 12 % | `OTEL_SAMPLE_RATIO=0.12`, `SLO_BUDGET_PORT=off`, `BRIDGE_KIND=pb` | 12 % of traces, whole (ParentBased(TraceIDRatioBased) at the root) | full work on those spans: breadcrumbs, `_br` / `_d`, HP/LP buffered export | the stock DaemonSet -> Jaeger |
 | C, record everything into our agent | both unset (AlwaysSample; the budget issuer on), `BRIDGE_KIND=pb` | every span | full work on every span, all exported to the node's agent | our agent at a collection volume target of 12 % of the spans at the run's rate, the share B keeps (the campaign's chosen arm, no tee, no shadow; 1 380 spans per 5 s at 100 req/s, 4 140 at 300) -> the central on node-0 -> Jaeger |
 | D, C with the bridge off | both unset, `BRIDGE_KIND=v` | every span | none: the SDK's vanilla processor (`v`), no new image; the same plain OTLP export (one 100-ms / 512-span buffer instead of the Bridge's HP / LP pair), no `_br` / `_d` | as C |
+| F, record everything into tail sampling at 12 % | as C | every span | as C | our image's pass-through agents -> the central with the stock `tail_sampling` processor (errors, roots over the SLO, 12 % of the rest; the campaign's tail arm) and the cap gate -> Jaeger |
 | E, C with the eBPF arrival program attached | as C | every span | as C | as C, and: `arrivald` (a privileged DaemonSet, same image) keeps the program at every service pod's interface (tc ingress); the agent looks every server span's arrival up in the program's table (mmap, 1 048 576 slots) and attaches `slobudget.arrival_ns` |
 
 The Bridge acts only on recorded spans, so its work cannot be held equal between B and C; each run
@@ -32,6 +33,10 @@ kernel's receive path, on the caller's CPU for a call within the node (charged t
 on the network card's otherwise (charged to no container); it is far too small for the nodes' CPU
 figures, so its own cost comes from the kernel's run statistics (`arrivald -stats`: columns "arrival
 program, cores" and "ns per packet"; the statistics themselves cost some 40 ns a run).
+C minus F is what our agent costs against the stock tail sampling at the same volume.  During the warm-up and the
+load a reader on every app node samples the CPUs' effective frequency every 5 s (`scaling_cur_freq`, APERF/MPERF over the
+interval since the last read, so a 5-s mean per CPU): one ssh session and 40 file reads a node every 5 s; the tables give
+the mean over the three nodes' CPUs inside the load, and list the runs without it.
 `run_overhead.sh` runs the kernel's verifier first (`arrivald -check`, node-0) and fails an E run unless
 the program is at every service pod, every agent has opened the table and, in the warm-up and again after
 the load, the ids arrive (`arrival_check.py`: at least 95 % of the agents' lookups answered by the program, no

@@ -11,6 +11,8 @@
 #      tee and the shadow; 1 380 spans per 5 s at 100 req/s) -> the central on node-0 -> Jaeger
 #   D  C with the Path Bridge off (BRIDGE_KIND=v: the SDK's vanilla processor, the same plain
 #      OTLP export, no breadcrumbs), same image: a span carries no _br / _d
+#   F  record everything into the stock tail_sampling processor at 12 % (the campaign's tail arm: pass-through
+#      agents, the central with tail_sampling and the cap gate), same env as C
 #   E  C with the eBPF arrival program attached: arrivald's DaemonSet keeps it at every service
 #      pod's interface (tc ingress), the agents look every server span's arrival up in its table
 #      and attach it.  Needs a collector image with arrivald in it (IMAGE_TAG, built from this
@@ -25,6 +27,8 @@
 # <rate> -> CPU snapshot -> 5-min wrk2 load at <rate> req/s (exponential gaps, one connection per
 # req/s, see knee.sh) -> CPU snapshot -> Path Bridge metrics lines and pod facts (E: the program's
 # counters and the agents' lookups) -> restore the stock collector, remove arrivald.
+# During the warm-up and the load a reader on every app node samples the CPUs' effective frequency every 5 s
+# (scaling_cur_freq: APERF/MPERF over the interval since the last read) into freq-<node>.txt.
 # Writes $STAGE3/overhead/<cfg>-r<rate>-<rep>/ (meta.json, wrk.log, cpu-start.json, cpu-end.json).
 set -u
 cd "$(dirname "$0")/../.."
@@ -45,7 +49,8 @@ RD=$STAGE3/overhead/$CFG-r$RATE-$REP
 mkdir -p "$RD"
 rm -f "$RD/failed" "$RD/collected"
 log() { echo "$(date '+%F %T') $*" | tee -a "$RD/run.log"; }
-ours() { case "$CFG" in C|D|E) return 0 ;; esac; return 1; }    # our agent and the central
+ours() { case "$CFG" in C|D|E|F) return 0 ;; esac; return 1; }    # our image's agents and a central
+ARM=chosen; [ "$CFG" = F ] && ARM=tail
 restore() {
     if [ "$(kubectl get ds otelcol-pb-es-ctr -o jsonpath='{.spec.template.spec.containers[0].image}')" != "$STOCK_COLLECTOR_IMAGE" ]; then
         kubectl replace -f "$STAGE3/otelcol-ds.stock.yaml" >> "$RD/run.log" 2>&1
@@ -82,7 +87,8 @@ case "$CFG" in
     C) ENVS="OTEL_SAMPLE_RATIO- SLO_BUDGET_PORT- BRIDGE_KIND=pb" ;;
     D) ENVS="OTEL_SAMPLE_RATIO- SLO_BUDGET_PORT- BRIDGE_KIND=v" ;;
     E) ENVS="OTEL_SAMPLE_RATIO- SLO_BUDGET_PORT- BRIDGE_KIND=pb" ;;
-    *) echo "config A, B, C, D or E"; exit 2 ;;
+    F) ENVS="OTEL_SAMPLE_RATIO- SLO_BUDGET_PORT- BRIDGE_KIND=pb" ;;
+    *) echo "config A, B, C, D, E or F"; exit 2 ;;
 esac
 log "overhead run $CFG rate=$RATE rep=$REP env=[$ENVS] image=$IMG"
 [ "$(kubectl get ds otelcol-pb-es-ctr -o jsonpath='{.spec.template.spec.containers[0].image}')" = "$STOCK_COLLECTOR_IMAGE" ] \
@@ -114,7 +120,7 @@ log "$(tail -1 "$RD/reseed.log")"
 # 2. C / D / E: our agent (no tee, no shadow) and the central; E: arrivald ------------------------
 if ours; then
     # shellcheck disable=SC2086
-    python3 "$MOD/tools/campaign/render.py" --arm chosen --volume 0.12 --rate "$RATE" --seed "$REP" --image "$IMG" --no-tee \
+    python3 "$MOD/tools/campaign/render.py" --arm "$ARM" --volume 0.12 --rate "$RATE" --seed "$REP" --image "$IMG" --no-tee --tail-wait "$TAIL_WAIT" \
         --callgraph "$CALLGRAPH" $ARR > "$RD/manifests.yaml" || fail "render"
     kubectl apply -f "$RD/manifests.yaml" >> "$RD/run.log" 2>&1 || fail "apply"
     kubectl rollout status deploy/slobudget-central --timeout=180s >> "$RD/run.log" 2>&1 || fail "central did not come up"
@@ -166,6 +172,12 @@ restarts() {    # a kubectl error is no change: up to three tries
 }
 LOAD="-t2 -c$RATE -D exp"
 R0=$(restarts)
+FREQ=""
+for n in node-1 node-2 node-3; do      # the effective frequency, every 5 s (a few reads of sysfs; the session ends with the client)
+    ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$n" 'while true; do echo "$(date +%s.%N) $(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null | tr "\n" " ")"; sleep 5; done' \
+        > "$RD/freq-$n.txt" 2>/dev/null &
+    FREQ="$FREQ $!"
+done
 [ -n "$R0" ] || fail "kubectl get pods"
 # shellcheck disable=SC2086
 wrk $LOAD -d"${WARMUP}"s -s "$LUA" "$URL" -R"$RATE" > "$RD/wrk-warmup.log" 2>&1 &
@@ -184,6 +196,8 @@ log "load: wrk $LOAD -d${DUR}s -R$RATE"
 RANDOM_SEED=$REP wrk $LOAD -d"${DUR}"s -L -s "$LUA" "$URL" -R"$RATE" > "$RD/wrk.log" 2>&1
 T1=$(python3 -c "import time; print(round(time.time(), 3))")
 python3 "$MOD/tools/overhead/cpu_snapshot.py" "$RD/cpu-end.json" || fail "cpu snapshot"
+# shellcheck disable=SC2086
+kill $FREQ 2>/dev/null; wait $FREQ 2>/dev/null
 R1=$(restarts)
 [ "$R0" = "$R1" ] || fail "a container restarted or a pod changed during the load: $(diff <(echo "$R0") <(echo "$R1") | grep '^[<>]' | tr '\n' ' ')"
 log "load done: $(grep -E 'requests in|Non-2xx|Requests/sec' "$RD/wrk.log" | tr -s ' ' | tr '\n' ' ')"

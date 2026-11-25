@@ -154,3 +154,31 @@ def test_a_row_per_e_run(tmp_path, capsys, monkeypatch):
     assert tables.main() == 0
     out = capsys.readouterr().out
     assert "| E-r100-1 | **FLAG** 88.13 % | empty 404 | 71.43 % |" in out and "4 pods, packets 50, ids 10; 2,500 ns a run" in out
+
+
+def test_frequency_and_differences(tmp_path, capsys, monkeypatch):
+    t0 = NOW - 300
+
+    def run(cfg, rep, p99, app_ns, ghz=None, invalid=None):
+        rd = tmp_path / f"{cfg}-r100-{rep}"
+        rd.mkdir()
+        (rd / "collected").write_text("")
+        (rd / "meta.json").write_text(json.dumps({"config": cfg, "rate": 100, "rep": rep, "t0": t0, "t1": NOW}))
+        (rd / "wrk.log").write_text(f"  50.000%   10.00ms\n  99.000%  {p99:.2f}ms\n30000 requests in 5.00m\nRequests/sec:  100.00\n")
+        for name, t, ns in (("cpu-start.json", t0, 0), ("cpu-end.json", NOW, app_ns)):
+            (rd / name).write_text(json.dumps({"t": t, "containers": {"default/a-service-pb-es-ctr-x/a-service-pb-es-ctr": {"cpu_ns": ns, "t": t}}, "nodes": {}}))
+        if ghz:
+            for n in ("node-1", "node-2", "node-3"):
+                (rd / f"freq-{n}.txt").write_text("".join(f"{t0 + s} {ghz * 1e6:.0f} {ghz * 1e6 + 2e5:.0f}\n" for s in (-10, 5, 100, 200, 400)))
+        if invalid:
+            (rd / "INVALID").write_text(invalid)
+    run("B", 1, 13.0, 30e9, 2.3); run("B", 2, 14.0, 31e9, 2.3)
+    run("C", 1, 14.0, 36e9, 2.5); run("C", 2, 16.0, 36e9)
+    run("F", 1, 14.5, 33e9, 2.5); run("E", 1, 15.0, 37e9, 2.5, invalid="a test")
+    monkeypatch.setattr(sys, "argv", ["x", str(tmp_path)])
+    assert tables.main() == 0
+    out = capsys.readouterr().out
+    assert "| C - B | 100 | 2 | +0.00 (+0.00-+0.00) | +1.50 (+1.00-+2.00) |" in out and "| C - F | 100 | 1 | +0.00 | -0.50 |" in out and "| E - C |" not in out
+    b = [ln for ln in out.splitlines() if ln.startswith("| B: ")][0]
+    assert b.startswith("| B: SDK head sampling 12 % | 100 | 2 |") and b.endswith("| 2.40 (2.40-2.40) |")            # GHz: the mean over the CPUs, 2.3 and 2.5 GHz
+    assert "Left out as invalid: E-r100-1 (a test)" in out and "No frequency data" in out and "C-r100-2" in out.split("No frequency data")[1]

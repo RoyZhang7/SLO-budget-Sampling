@@ -13,7 +13,9 @@ Elasticsearch) and the three app nodes as a whole.  CPU comes from two kubelet s
 admitted per 5-s period over the spans offered at the rate (23 per request), the check that they keep the
 12 % of B (central.log, the cap gate's records); for E the program's own CPU from the kernel's run
 statistics (arrivald's counters; too small for the node's figure to show) and the share of the server
-spans with a parent whose arrival came from the program.  Then one row per E run: that share inside the load (under
+spans with a parent whose arrival came from the program; the app nodes' effective CPU frequency over the load
+(APERF/MPERF, mean over the CPUs of the three nodes; runs without it are listed).  Then the differences C - B,
+E - C and C - F, repeat by repeat, with their range; runs with an INVALID file are left out and listed.  Then one row per E run: that share inside the load (under
 97 %: FLAG), the misses by cause, and per node the program's counters and time per run.
 """
 from __future__ import annotations
@@ -31,7 +33,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import arrival_stats  # noqa: E402
 
 CONFIGS = {"A": "tracing off", "B": "SDK head sampling 12 %", "C": "record everything, our agent at 12 %",
-           "D": "C with the Path Bridge off", "E": "C with the eBPF arrival program attached"}
+           "D": "C with the Path Bridge off", "E": "C with the eBPF arrival program attached", "F": "record everything, tail sampling at 12 %"}
+DIFFS = (("C", "B"), ("E", "C"), ("C", "F"))      # what our agent costs over head sampling, the stamp over the agent, our agent over tail sampling
 APP_NODES = ("node-1", "node-2", "node-3")
 
 
@@ -145,6 +148,24 @@ def program(rd: str, t0: float, t1: float) -> tuple[float, float]:
     return (ns / 1e9 / (t1 - t0 - 5), ns / runs) if nodes == len(APP_NODES) else (float("nan"), float("nan"))
 
 
+def frequency(rd: str, t0: float, t1: float) -> float:
+    """GHz: the mean over the three app nodes of the mean over their CPUs and the samples inside the load (freq-<node>.txt); nan when a node has none."""
+    nodes = []
+    for p in sorted(glob.glob(os.path.join(rd, "freq-node-*.log")) + glob.glob(os.path.join(rd, "freq-node-*.txt"))):
+        vals = []
+        for ln in open(p, errors="replace"):
+            w = ln.split()
+            try:
+                t, f = float(w[0]), [float(x) for x in w[1:]]
+            except (ValueError, IndexError):
+                continue
+            if t0 <= t <= t1 and f:
+                vals.append(st.mean(f))
+        if vals:
+            nodes.append(st.mean(vals))
+    return st.mean(nodes) / 1e6 if len(nodes) == len(APP_NODES) else float("nan")
+
+
 def load(root: str) -> list[dict]:
     rows = []
     for mp in sorted(glob.glob(os.path.join(root, "*-r*-*", "meta.json"))):
@@ -152,6 +173,9 @@ def load(root: str) -> list[dict]:
         if not os.path.exists(os.path.join(rd, "collected")):
             continue
         m = json.load(open(mp))
+        if os.path.exists(os.path.join(rd, "INVALID")):
+            rows.append({"cfg": m["config"], "rate": m["rate"], "rep": m["rep"], "invalid": open(os.path.join(rd, "INVALID"), errors="replace").read().strip()})
+            continue
         w = wrk(os.path.join(rd, "wrk.log"))
         cpu, secs = cpu_by_group(rd)
         n = max(1, w["requests"])
@@ -160,7 +184,7 @@ def load(root: str) -> list[dict]:
                      "agent_cores": cpu.get("agent", 0.0) / secs, "central_cores": cpu.get("central", 0.0) / secs,
                      "backend_cores": cpu.get("backend", 0.0) / secs, "arrivald_cores": cpu.get("arrivald", 0.0) / secs,
                      "node_cores": cpu.get("node_cores", float("nan")),
-                     "kept_share": kept_share(rd, m), "arrival_share": arrival_share(rd),
+                     "kept_share": kept_share(rd, m), "arrival_share": arrival_share(rd), "ghz": frequency(rd, m["t0"], m["t1"]),
                      **dict(zip(("program_cores", "program_ns"), program(rd, m["t0"], m["t1"])))})
     return rows
 
@@ -180,11 +204,12 @@ def main() -> int:
     ap.add_argument("--md")
     a = ap.parse_args()
     rows = load(a.root)
+    invalid, rows = [r for r in rows if r.get("invalid")], [r for r in rows if not r.get("invalid")]
     cols = [("p50 ms", "p50"), ("p99 ms", "p99"), ("req/s", "rps"), ("app CPU ms/request", "app_ms_per_req"),
             ("stores CPU ms/request", "stores_ms_per_req"), ("agent cores", "agent_cores"),
             ("arrivald cores", "arrivald_cores"), ("central cores", "central_cores"), ("Jaeger + ES cores", "backend_cores"), ("app nodes, all cores", "node_cores"),
             ("arrival program, cores (E)", "program_cores"), ("ns per packet (E)", "program_ns"),
-            ("kept / offered spans (C to E)", "kept_share"), ("arrivals from the program (E)", "arrival_share")]
+            ("kept / offered spans (C to F)", "kept_share"), ("arrivals from the program (E)", "arrival_share"), ("CPU GHz, app nodes", "ghz")]
     lines = ["| config | rate | repeats | " + " | ".join(c for c, _ in cols) + " |", "|---" * (3 + len(cols)) + "|"]
     for rate in sorted({r["rate"] for r in rows}):
         for cfg in CONFIGS:
@@ -192,6 +217,21 @@ def main() -> int:
             if not rs:
                 continue
             lines.append(f"| {cfg}: {CONFIGS[cfg]} | {rate} | {len(rs)} | " + " | ".join(cell([r[k] for r in rs], "{:.3f}" if k == "kept_share" else "{:.4f}" if k in ("arrival_share", "program_cores") else "{:.2f}") for _, k in cols) + " |")
+    # the differences, repeat by repeat, with their range
+    lines += ["", "| difference | rate | repeats paired | " + " | ".join(c for c, _ in cols) + " |", "|---" * (3 + len(cols)) + "|"]
+    for rate in sorted({r["rate"] for r in rows}):
+        for x, y in DIFFS:
+            rx = {r["rep"]: r for r in rows if r["cfg"] == x and r["rate"] == rate}
+            ry = {r["rep"]: r for r in rows if r["cfg"] == y and r["rate"] == rate}
+            reps = sorted(set(rx) & set(ry))
+            if not reps:
+                continue
+            lines.append(f"| {x} - {y} | {rate} | {len(reps)} | " + " | ".join(cell([rx[p][k] - ry[p][k] for p in reps], "{:+.3f}" if k == "kept_share" else "{:+.4f}" if k in ("arrival_share", "program_cores") else "{:+.2f}") for _, k in cols) + " |")
+    if invalid:
+        lines += ["", "Left out as invalid: " + "; ".join(f"{r['cfg']}-r{r['rate']}-{r['rep']} ({r['invalid']})" for r in invalid)]
+    nofreq = [f"{r['cfg']}-r{r['rate']}-{r['rep']}" for r in rows if r["ghz"] != r["ghz"]]
+    if nofreq:
+        lines += ["", "No frequency data (the sampler came later, or a node's file is missing): " + ", ".join(nofreq)]
     stamped = []
     for mp in sorted(glob.glob(os.path.join(a.root, "E-r*-*", "meta.json"))):
         m = json.load(open(mp))
