@@ -30,7 +30,10 @@ edge: caller and callee service and host), so it needs nothing but the 100 % exp
 eBPF stamp has `slobudget.arrival_ns` in its 100 % export (attached in the tee, in front of the fork): `eval_run.py` compares the two per edge
 (`arrival-vs-estimate.json`, `arrival_estimate.py`), the check on the estimate.  The estimate takes the callee's healthy median wait
 for travel: it is later than the stamp by about that on every call of the edge, in the thresholds too; the report gives the difference
-around its healthy median.
+around its healthy median.  Table 5, over the window (the fault; bursty: the burst; steady: the run): per 5-s period the services (roots apart) with a
+true outlier and those of them with one of their true outliers kept, the mean of the ratio (`ws_services_covered`); the shares of the window's kept spans
+that are true outliers of the culprit, of other services, and everything else (`ws_kept_*`); and the culprit's true outliers, those kept and, for our
+arms, those kept as outliers per period next to N_need (`n_need_window`; no limit for threshold-only).
 
 ## Inputs (the campaign runner's run directory)
 

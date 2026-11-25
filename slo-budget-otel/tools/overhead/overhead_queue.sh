@@ -13,6 +13,7 @@ cd "$(dirname "$0")/../.."
 MOD=$(pwd)
 : "${STAGE3:=/storage/royno7/stage3}"; : "${CONFIGS:=A B C D}"
 KNEE=$1
+: "${RATES:=100 $KNEE}"       # RATES=<rate>: that rate only (once more, after a wider sweep)
 LOG=$STAGE3/overhead/queue.log
 mkdir -p "$STAGE3/overhead"
 log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
@@ -50,7 +51,7 @@ log "overhead queue start (knee $KNEE, configs $CONFIGS, image ${IMAGE_TAG:-the 
 declare -A lost
 row=0
 for rep in 1 2 3 4 5; do
-    for rate in 100 "$KNEE"; do
+    for rate in $RATES; do
         for cfg in $CONFIGS; do
             rd=$STAGE3/overhead/$cfg-r$rate-$rep
             [ -f "$rd/collected" ] && continue

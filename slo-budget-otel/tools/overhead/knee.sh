@@ -11,19 +11,21 @@
 # deviations of the Poisson count); it is printed last ("knee rate: N").  No such line, and exit 1,
 # when our agents or the central do not come up at a rate, or the first rate has no p99.
 #   tools/overhead/knee.sh        (log and wrk logs in $STAGE3/overhead/knee/)
+# A wider sweep stops at the first rate past the knee (UNTIL=1), in a directory of its own:
+#   UNTIL=1 RATES="100 350 400 450 500 ..." KNEE_DIR=knee2 tools/overhead/knee.sh
 set -u
 cd "$(dirname "$0")/../.."
 MOD=$(pwd)
 # shellcheck disable=SC1090
 source ~/bridges-env.sh 2>/dev/null || true
-: "${STAGE3:=/storage/royno7/stage3}"; : "${RATES:=100 150 200 250 300 350}"; : "${STEP:=120}"; : "${KNEE_X:=2}"
+: "${STAGE3:=/storage/royno7/stage3}"; : "${RATES:=100 150 200 250 300 350}"; : "${STEP:=120}"; : "${KNEE_X:=2}"; : "${UNTIL:=0}"; : "${KNEE_DIR:=knee}"
 : "${URL:=${WRK2API_URL:-http://10.10.1.1:22903}}"
 : "${LUA:=$HOME/blueprint-docc-mod/examples/dsb_sn/scripts/compose-post.lua}"
 : "${IMAGE_TAG:=20261121-224737}"; : "${CALLGRAPH:=$MOD/deploy/callgraph.stages.json}"
 IMG=10.10.1.1:30000/otelcol-slobudget:$IMAGE_TAG
 # shellcheck disable=SC1091
 source "$MOD/tools/campaign/faults.env"
-RD=$STAGE3/overhead/knee
+RD=$STAGE3/overhead/$KNEE_DIR
 mkdir -p "$RD"
 log() { echo "$(date '+%F %T') $*" | tee -a "$RD/run.log"; }
 restore() {
@@ -42,6 +44,21 @@ for w in $WORKLOADS; do kubectl set env "$w" OTEL_SAMPLE_RATIO- SLO_BUDGET_PORT-
 for w in $WORKLOADS; do kubectl rollout status "$w" --timeout=300s >> "$RD/run.log" 2>&1 || fail "rollout $w"; done
 bash "$MOD/tools/reseed.sh" > "$RD/reseed.log" 2>&1 || fail "reseed: $(tail -1 "$RD/reseed.log")"
 rm -f "$RD"/wrk-*.log
+# p99, whether it is past the knee: of rate $1 against the first rate
+past() {
+    python3 - "$RD" "$1" "${RATES%% *}" "$KNEE_X" "$STEP" <<'PY'
+import math, re, sys
+rd, r, r0, kx, step = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5])
+def stat(r):
+    t = open(f"{rd}/wrk-{r}.log", errors="replace").read()
+    p = {k: float(v) * {"ms": 1, "s": 1000, "us": 0.001}[u] for k, v, u in re.findall(r"^\s*(50\.000|99\.000)%\s+([0-9.]+)(ms|s|us)", t, re.M)}
+    m = re.search(r"Requests/sec:\s+([0-9.]+)", t)
+    return p.get("99.000"), float(m.group(1)) if m else 0.0
+(p99, got), (base, _) = stat(r), stat(r0)
+sys.exit(0 if p99 is None or base is None or p99 > kx * base or got < 0.99 * r - 3 * math.sqrt(r / step) else 1)
+PY
+}
+SWEPT=""
 for r in $RATES; do
     # agents and central new at every rate: the target is 12 % of the spans at this rate (an agent
     # ignores a restarted central until its version passes the agent's, so both restart)
@@ -57,9 +74,11 @@ for r in $RATES; do
     RANDOM_SEED=1 wrk -t2 -c"$r" -D exp -d"${STEP}"s -L -s "$LUA" "$URL" -R"$r" > "$RD/wrk-$r.log" 2>&1
     log "rate $r: $(grep -E '^ *(50.000|99.000)%|Requests/sec' "$RD/wrk-$r.log" | tr -s ' ' | tr '\n' ' ')"
     sleep 15
+    SWEPT="$SWEPT $r"
+    if [ "$UNTIL" = 1 ] && past "$r"; then log "past the knee at $r"; break; fi
 done
 restore
-python3 - "$RD" "$RATES" "$KNEE_X" "$STEP" <<'PY'
+python3 - "$RD" "$SWEPT" "$KNEE_X" "$STEP" <<'PY'
 import math, re, sys
 rd, rates, kx, step = sys.argv[1], [int(x) for x in sys.argv[2].split()], float(sys.argv[3]), float(sys.argv[4])
 def stat(r):

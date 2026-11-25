@@ -13,7 +13,8 @@ burst_phase.py), which the over-SLO share follows.  Tables: (1) competitors
 (chosen, head, tail, reservoir, canopy, hindsight / vaif when their runs exist), (2)
 ablations (chosen, threshold, keep-parent, and every arm-variant of run_one.sh's VARIANT), (3) the fault window under
 each truth (Stage 3: single culprit, own time, the culprit's node, duration), (4) the common truth of all arms
-(the runs evaluated with it), (5) reconstruction coverage.  The
+(the runs evaluated with it), (5) on it, the services covered per period of the window and where the kept spans went, (6)
+reconstruction coverage.  The
 Stage 2d series (run ids 2d-*, tools/eval/compare2d.py), invalid-*, smoke-* and pilot-* runs and runs with an
 INVALID file are left out.  Last, one row per run with the arrival stamp: the share of its server spans with a parent whose
 arrival the program gave (under 97 %: FLAG), the misses by cause, the lowest service, and per node the program's counters and time.
@@ -78,6 +79,19 @@ WS_COLUMNS = [
     ("evidence s", "evidence_ws_s", "{:.2f}", 1.0),
     ("over SLO with a culprit outlier", "over_slo_with_culprit_truth_ws", "{:.1f}%", 100.0),
     ("... kept", "over_slo_with_culprit_outlier_kept", "{:.1f}%", 100.0),
+]
+# where the kept spans of the window went, on the common truth
+VOLUME_COLUMNS = [
+    ("services with a true outlier, a period", "ws_services_with_an_outlier_per_period", "{:.1f}", 1.0),
+    ("... with one kept", "ws_services_covered_per_period", "{:.1f}", 1.0),
+    ("services covered", "ws_services_covered", "{:.2f}", 1.0),
+    ("kept: culprit's outliers", "ws_kept_culprit_outliers", "{:.1f}%", 100.0),
+    ("kept: other services' outliers", "ws_kept_other_outliers", "{:.1f}%", 100.0),
+    ("kept: ordinary spans", "ws_kept_ordinary", "{:.1f}%", 100.0),
+    ("culprit's outliers, a period", "ws_culprit_outliers_per_period", "{:.0f}", 1.0),
+    ("... kept", "ws_culprit_kept_per_period", "{:.1f}", 1.0),
+    ("... kept as outlier (ours)", "ws_culprit_kept_as_outlier_per_period", "{:.1f}", 1.0),
+    ("N_need (ours)", "n_need_window", "{:.0f}", 1.0),
 ]
 RECON_COLUMNS = [
     ("orphans/kept", "recon_orphans_frac_of_kept", "{:.0f}%", 100.0),
@@ -244,10 +258,12 @@ def main() -> int:
     rec = build(summaries, a.volume, a.scenarios, a.seeds, present, RECON_COLUMNS)
     with_ws = [s for s in summaries if s.get("recall_ws") is not None]
     ws = build(with_ws, a.volume, a.scenarios, a.seeds, [x for x in present if any(s.get("arm") == x for s in with_ws)], WS_COLUMNS) if with_ws else []
+    with_volume = [s for s in summaries if s.get("ws_kept_window") is not None]
+    vol = build(with_volume, a.volume, a.scenarios, a.seeds, [x for x in present if any(s.get("arm") == x for s in with_volume)], VOLUME_COLUMNS) if with_volume else []
     faulted = [sc for sc in a.scenarios if sc not in ("steady", "bursty")]
     flt = build(summaries, a.volume, faulted, a.seeds, present, FAULT_COLUMNS)
     if a.json:
-        print(json.dumps({"volume": a.volume, "competitors": comp, "ablations": abl, "fault": flt, "recon": rec, "common_truth": ws}, indent=1))
+        print(json.dumps({"volume": a.volume, "competitors": comp, "ablations": abl, "fault": flt, "recon": rec, "common_truth": ws, "common_truth_volume": vol}, indent=1))
         return 0
     v = f"collection volume target {a.volume:.0%}"
     print(markdown(comp, COLUMNS, f"Competitors, {v}"))
@@ -255,6 +271,8 @@ def main() -> int:
     print(markdown(flt, FAULT_COLUMNS, f"Fault window under each truth, {v}"))
     if ws:
         print(markdown(ws, WS_COLUMNS, f"Common truth of all arms: within-service latency on the estimated kernel receive time, {v} (window: the fault, bursty: the burst, steady: the run)"))
+    if vol:
+        print(markdown(vol, VOLUME_COLUMNS, f"Common truth: services covered in the window and where its kept spans went, {v} (ordinary: every kept span that is no true outlier of a service, client spans and roots too)"))
     stamped = [s for s in summaries if s.get("arrival") and abs(float(s["volume_frac"]) - a.volume) < 1e-6 and s.get("scenario") in a.scenarios]
     if stamped:
         print(f"### Arrival stamp, {v}\n")

@@ -280,6 +280,31 @@ def compute(meta: dict, t: SpanTable, kept: KeptSet, kidx: np.ndarray, cal, stat
         hs = SP & warm & (end_s < w0) if math.isfinite(w0) else SP & warm       # before the fault or the burst
         out["truth_rate_healthy_ws"] = _safe_div((truth_ws_nr & hs).sum(), (hs & nonroot).sum())
         out["truth_rate_healthy_own"] = _safe_div((truth_own & nonroot & hs).sum(), (hs & nonroot).sum())
+
+        # per period of the window: the services with a true outlier, and those of them with one kept
+        def services_by_period(m: np.ndarray) -> dict[int, int]:
+            cells = np.unique(k[m] * max(1, len(t.services)) + t.svc[m])
+            return dict(zip(*(x.tolist() for x in np.unique(cells // max(1, len(t.services)), return_counts=True))))
+        has_outlier, has_kept = services_by_period(tws & warm), services_by_period(tws & warm & kept_mask)
+        if has_outlier:
+            out["ws_services_with_an_outlier_per_period"] = _mean(list(has_outlier.values()))
+            out["ws_services_covered_per_period"] = _mean([has_kept.get(p, 0) for p in has_outlier])
+            out["ws_services_covered"] = _mean([has_kept.get(p, 0) / c for p, c in has_outlier.items()])
+        # where the volume of the window went
+        kept_w = kp & warm & window
+        is_culprit = t.svc == t.services.index(fault["culprit"]) if fault and fault.get("culprit") in t.services else np.zeros(n, dtype=bool)
+        out["ws_kept_window"] = int(kept_w.sum())
+        out["ws_kept_culprit_outliers"] = _safe_div((kept_w & truth_ws_nr & is_culprit).sum(), kept_w.sum()) if is_culprit.any() else math.nan
+        out["ws_kept_other_outliers"] = _safe_div((kept_w & truth_ws_nr & ~is_culprit).sum(), kept_w.sum())
+        out["ws_kept_ordinary"] = _safe_div((kept_w & ~truth_ws_nr).sum(), kept_w.sum())       # client spans and roots too
+        if is_culprit.any():
+            periods = max(1.0, (w1 - w0) / P)
+            out["ws_culprit_kept_per_period"] = float((kept_w & truth_ws_nr & is_culprit).sum()) / periods
+            out["ws_culprit_outliers_per_period"] = float((tws & is_culprit).sum()) / periods
+            if arm in CHOSEN_FAMILY:        # next to N_need, the kept outliers of a service and period that are kept whole
+                out["ws_culprit_kept_as_outlier_per_period"] = float((kept_w & truth_ws_nr & is_culprit & reason_in(FLAG_REASONS)).sum()) / periods
+                need = [float(h["n_need"]) for p, h in hist_by.items() if p * P >= w0 and (p + 1) * P <= w1 and h.get("n_need") is not None]
+                out["n_need_window"] = math.inf if any(x >= 1e300 for x in need) else _mean(need)
     n_svc_codes = max(1, len(t.services))
     nk = int(k.max()) + 1 if n and k.max() >= 0 else 1
     kc = np.clip(k, 0, nk - 1)

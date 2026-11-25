@@ -233,6 +233,31 @@ def test_the_drift_has_the_runs_measure(tmp_path):
     assert {"oracle_T_ms", "t_drift_pre"} <= differ and all(k.startswith(("t_drift", "ref_", "loss", "refusal")) or k == "oracle_T_ms" for k in differ), differ
 
 
+def test_services_covered_and_where_the_volume_went(tmp_path):
+    import fixture
+    from sloeval.evaluate import evaluate
+    run = fixture.make_run(str(tmp_path), arm="chosen")
+    r = evaluate(run, SIM, os.path.join(run, "callgraph.json"), recon_bin=None, do_recon=False)
+    # the fault: 150 traces in 3 periods (the last one's spans end in the fourth); c is the only service with true outliers, all but one kept
+    assert r["ws_services_with_an_outlier_per_period"] == 1.0 and r["ws_services_covered"] == 1.0 and r["ws_services_covered_per_period"] == 1.0
+    kept_c, kept_b, kept_a = 149, 50, 150
+    assert r["ws_kept_window"] == pytest.approx(kept_a + kept_b + kept_c, abs=2)
+    assert r["ws_kept_culprit_outliers"] == pytest.approx(149 / r["ws_kept_window"], abs=0.005) and r["ws_kept_other_outliers"] == 0.0
+    assert r["ws_kept_culprit_outliers"] + r["ws_kept_other_outliers"] + r["ws_kept_ordinary"] == pytest.approx(1.0)
+    assert r["ws_culprit_kept_per_period"] == pytest.approx(149 / 3, abs=0.4) and r["ws_culprit_kept_as_outlier_per_period"] == r["ws_culprit_kept_per_period"]
+    assert r["ws_culprit_outliers_per_period"] == pytest.approx(50, abs=0.4) and r["n_need_window"] == 10.0
+    head = evaluate(fixture.make_run(str(tmp_path), arm="head"), SIM, os.path.join(run, "callgraph.json"), recon_bin=None, do_recon=False)
+    assert "n_need_window" not in head and "ws_culprit_kept_as_outlier_per_period" not in head and head["ws_services_covered"] == 1.0
+    # no culprit: the shares of the others only
+    mp = os.path.join(run, "meta.json")
+    m = json.load(open(mp))
+    m["fault"]["culprit"], m["scenario"] = None, "late_everywhere"
+    json.dump(m, open(mp, "w"))
+    r = evaluate(run, SIM, os.path.join(run, "callgraph.json"), recon_bin=None, do_recon=False)
+    assert r["ws_kept_culprit_outliers"] != r["ws_kept_culprit_outliers"] and r["ws_kept_other_outliers"] > 0.4 and r["ws_services_covered"] == 1.0
+    assert "ws_culprit_kept_per_period" not in r
+
+
 def test_report_tool_without_a_stamp(tmp_path, capsys):
     sys.argv = ["x", str(tmp_path)]
     assert arrival_estimate.main() == 1 and "no arrival-vs-estimate.json" in capsys.readouterr().out
