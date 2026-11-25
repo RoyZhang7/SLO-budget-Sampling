@@ -48,12 +48,23 @@ type EventsDump struct {
 		Transit   []float64 `json:"transit"`
 		Own       []float64 `json:"own"`
 		Wait      []float64 `json:"wait"` // absent: no span has an arrival
+		Dropped   []int     `json:"dropped_before"` // absent: no in-service filter
 	} `json:"spans"`
+	// an in-service filter's count records, handed to the sampler at the period's end (before on_period_end)
+	CountRecords []CountRecord `json:"count_records"`
 	// the oracle table (route, class, service -> T) when the arm uses calib_source oracle
 	Oracle map[string]map[string]map[string]float64 `json:"oracle,omitempty"`
 }
 
 // DecisionsDump is what the Python replay decided.
+// CountRecord is a filter's report at a period's end: n ordinary spans of the service dropped since its last report.
+type CountRecord struct {
+	Period  int    `json:"period"`
+	Service string `json:"service"`
+	Host    string `json:"host"`
+	N       int    `json:"n"`
+}
+
 type DecisionsDump struct {
 	Keep    []bool    `json:"keep"`
 	P       []float64 `json:"p"`
@@ -81,7 +92,7 @@ func LoadEvents(path string) (*EventsDump, *Corpus, error) {
 	}
 	n := len(d.Spans.SpanID)
 	c := &Corpus{Name: d.Name, RoutesSLO: d.RoutesSLO, Hosts: d.Hosts, HostSkew: d.HostSkew, Period: d.Period, T0: d.T0,
-		Services: d.Services, Spans: make([]Span, n)}
+		Services: d.Services, Spans: make([]Span, n), CountRecords: d.CountRecords}
 	c.Graph = &CallGraph{Root: d.Graph.Root, Children: d.Graph.Children, Parallel: d.Graph.Parallel, Stages: d.Graph.Stages}
 	for i := 0; i < n; i++ {
 		c.Spans[i] = Span{Idx: i, SpanID: d.Spans.SpanID[i], TraceID: d.Spans.TraceID[i], ParentIdx: d.Spans.ParentIdx[i],
@@ -90,6 +101,9 @@ func LoadEvents(path string) (*EventsDump, *Corpus, error) {
 			ReqClass: d.Spans.ReqClass[i], NBytes: d.Spans.NBytes[i], Transit: d.Spans.Transit[i], Own: d.Spans.Own[i]}
 		if len(d.Spans.Wait) == n {
 			c.Spans[i].Wait = d.Spans.Wait[i]
+		}
+		if len(d.Spans.Dropped) == n {
+			c.Spans[i].DroppedBefore = d.Spans.Dropped[i]
 		}
 		if c.Spans[i].IsRoot {
 			c.Roots = append(c.Roots, i)

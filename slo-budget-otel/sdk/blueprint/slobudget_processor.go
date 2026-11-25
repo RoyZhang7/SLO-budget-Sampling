@@ -59,11 +59,16 @@ const (
 
 var sloKeys = [...]string{sloKeyBudget, sloKeyRoot, sloKeyClass, sloKeyRootHost}
 
-// sloAgentState is what the agent serves at /slobudget/sdk.
+// sloAgentState is what the agent serves at /slobudget/sdk.  BTable and PlanP are there for the in-service filter
+// (slo_filter_processor.go): the thresholds b per route, class and service, and the ordinary-span rate per service.
 type sloAgentState struct {
-	Version int     `json:"version"`
-	B       float64 `json:"b"`
-	Host    string  `json:"host"`
+	Version int                                      `json:"version"`
+	B       float64                                  `json:"b"`
+	Host    string                                   `json:"host"`
+	Period  int64                                    `json:"period"`
+	PeriodS float64                                  `json:"period_s"`
+	BTable  map[string]map[string]map[string]float64 `json:"btable"`
+	PlanP   map[string]float64                       `json:"plan_p"`
 }
 
 // SLOBudgetProcessor is the SDK-side budget issuer / baggage copier.
@@ -161,6 +166,7 @@ func (p *SLOBudgetProcessor) poll(fails *int) {
 			was := p.ok
 			p.st, p.ok = st, true
 			p.mu.Unlock()
+			sloFilterUpdate(st, time.Now())
 			if !was {
 				slog.Info("slobudget issuer: agent reachable", "host", st.Host, "B", st.B, "version", st.Version)
 			}

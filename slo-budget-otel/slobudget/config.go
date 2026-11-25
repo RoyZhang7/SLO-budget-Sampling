@@ -63,9 +63,14 @@ type Config struct {
 	// (slobudget.arrival_ns; without one the span's own start) and the handler's start.  The
 	// calibration is on the same measure, so agents and central must have the same setting.
 	OwnMeasure string `json:"own_measure" mapstructure:"own_measure"`
-	// PlanCoin / NNeedDecay: simulator exp16 switches; only the defaults (span, 0) are ported.
+	// PlanCoin: span (a random coin per ordinary span) or hash (a function of the span id, CoinU: the same coin in an
+	// in-service filter and here); NNeedDecay: only the default 0 is ported.
 	PlanCoin   string  `json:"plan_coin" mapstructure:"plan_coin"`
 	NNeedDecay float64 `json:"n_need_decay" mapstructure:"n_need_decay"`
+	// CoinSource: rng (every other draw, the budget's fraction, the outlier coin beyond N_need, the credit coin, from the
+	// seeded stream) or span (from the deciding span's id, SpanCoin: the in-service filter's setting, so that the same span
+	// gets the same decision whatever else the agent saw)
+	CoinSource string `json:"coin_source" mapstructure:"coin_source"`
 	// FreezeRelease k: a service frozen by the rate trigger is released at its k-th consecutive
 	// period below the trigger, so a fault whose detection rate dips for a period stays frozen
 	// (Stage 3 default 3; 1 is the Stage 2c rule, released at the first).
@@ -123,8 +128,14 @@ func (c *Config) Validate() error {
 	if c.OwnMeasure != "handler" && c.OutlierTrigger != "own" {
 		return fmt.Errorf("own_measure within_service is a measure of the own trigger")
 	}
-	if c.PlanCoin != "span" {
-		return fmt.Errorf("plan_coin %q is not ported to Go (only span)", c.PlanCoin)
+	if c.PlanCoin != "span" && c.PlanCoin != "hash" {
+		return fmt.Errorf("plan_coin %q is not ported to Go (span or hash)", c.PlanCoin)
+	}
+	if c.CoinSource == "" {
+		c.CoinSource = "rng"
+	}
+	if c.CoinSource != "rng" && c.CoinSource != "span" {
+		return fmt.Errorf("coin_source %q: rng or span", c.CoinSource)
 	}
 	if c.NNeedDecay != 0 {
 		return fmt.Errorf("n_need_decay %g is not ported to Go (only 0)", c.NNeedDecay)

@@ -33,9 +33,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import arrival_stats  # noqa: E402
 
 CONFIGS = {"A": "tracing off", "B": "SDK head sampling 12 %", "C": "record everything, our agent at 12 %",
-           "D": "C with the Path Bridge off", "E": "C with the eBPF arrival program attached", "F": "record everything, tail sampling at 12 %"}
-DIFFS = (("C", "B"), ("E", "C"), ("C", "F"))      # what our agent costs over head sampling, the stamp over the agent, our agent over tail sampling
+           "D": "C with the Path Bridge off", "E": "C with the eBPF arrival program attached", "F": "record everything, tail sampling at 12 %",
+           "G": "E with the in-service filter on"}
+DIFFS = (("C", "B"), ("E", "C"), ("C", "F"), ("G", "E"), ("G", "B"))      # what our agent costs over head sampling, the stamp over the agent, our agent over tail sampling, the filter over E and over head sampling
 APP_NODES = ("node-1", "node-2", "node-3")
+SHARE_KEYS = ("kept_share", "kept_target", "filter_exported", "filter_roots", "filter_plan", "filter_outliers", "filter_other")
 
 
 def wrk(path: str) -> dict:
@@ -127,6 +129,58 @@ def arrival_share(rd: str) -> float:
     return hit / total if total else float("nan")
 
 
+def filter_stats(rd: str) -> dict:
+    """G: what the services exported, from the last slobudget_filter_metrics line of every service pod (counts since the pod's
+    start: the pods roll at the config's env): shares of all spans seen (roots + server + client spans)."""
+    tot = {k: 0 for k in ("roots", "servers", "clients", "exported", "dropped", "outliers", "errors", "plan", "no_arrival", "no_threshold", "count_records")}
+    pods = 0
+    for p in glob.glob(os.path.join(rd, "pb", "*.log")):
+        last = None
+        for ln in open(p, errors="replace"):
+            if "slobudget_filter_metrics" in ln:
+                last = ln
+        if not last:
+            continue
+        pods += 1
+        for k in tot:
+            m = re.search(r"\b" + k + r"=(\d+)", last)
+            if m:
+                tot[k] += int(m.group(1))
+    seen = tot["roots"] + tot["servers"] + tot["clients"]
+    if not pods or seen == 0:
+        return {}
+    client_exported = tot["exported"] - tot["roots"] - (tot["outliers"] + tot["errors"] + tot["plan"] + tot["no_arrival"] + tot["no_threshold"])
+    return {"filter_exported": tot["exported"] / seen, "filter_roots": tot["roots"] / seen, "filter_plan": (tot["plan"] + max(client_exported, 0)) / seen,
+            "filter_outliers": (tot["outliers"] + tot["errors"]) / seen, "filter_other": (tot["no_arrival"] + tot["no_threshold"]) / seen,
+            "filter_pods": pods, "filter_count_records": tot["count_records"]}
+
+
+def kept_target(rd: str, m: dict) -> float:
+    """Mean admitted spans per full period inside the load over the volume target per period (C to G)."""
+    tgt = m.get("volume_target_spans_per_period")
+    if not tgt:
+        return float("nan")
+    return _kept_per_period(rd, m) / tgt
+
+
+def _kept_per_period(rd: str, m: dict) -> float:
+    p = os.path.join(rd, "central.log")
+    if not os.path.exists(p):
+        return float("nan")
+    adm = []
+    for ln in open(p, errors="replace"):
+        if "capgate period" not in ln or "{" not in ln:
+            continue
+        try:
+            g = json.loads(ln[ln.index("{"):])
+        except ValueError:
+            continue
+        per = g.get("period", -1)
+        if per * 5 >= m["t0"] + 5 and (per + 1) * 5 <= m["t1"]:
+            adm.append(float(g.get("admitted", 0)))
+    return st.mean(adm) if adm else float("nan")
+
+
 def program(rd: str, t0: float, t1: float) -> tuple[float, float]:
     """The arrival program on the three app nodes during the load (E): cores, and ns per packet it ran on (arrivald's counter lines).
     nan when a node's lines are missing."""
@@ -186,6 +240,13 @@ def load(root: str) -> list[dict]:
                      "node_cores": cpu.get("node_cores", float("nan")),
                      "kept_share": kept_share(rd, m), "arrival_share": arrival_share(rd), "ghz": frequency(rd, m["t0"], m["t1"]),
                      **dict(zip(("program_cores", "program_ns"), program(rd, m["t0"], m["t1"])))})
+        # CPU in cycles: the time times the effective frequency of the load (nan without frequency samples); ms x GHz = Mcycles
+        rows[-1]["app_mcycles_per_req"] = rows[-1]["app_ms_per_req"] * rows[-1]["ghz"]
+        rows[-1]["stores_mcycles_per_req"] = rows[-1]["stores_ms_per_req"] * rows[-1]["ghz"]
+        rows[-1]["kept_target"] = kept_target(rd, m)
+        fs = filter_stats(rd)
+        for k in ("filter_exported", "filter_roots", "filter_plan", "filter_outliers", "filter_other"):
+            rows[-1][k] = fs.get(k, float("nan"))
     return rows
 
 
@@ -205,18 +266,20 @@ def main() -> int:
     a = ap.parse_args()
     rows = load(a.root)
     invalid, rows = [r for r in rows if r.get("invalid")], [r for r in rows if not r.get("invalid")]
-    cols = [("p50 ms", "p50"), ("p99 ms", "p99"), ("req/s", "rps"), ("app CPU ms/request", "app_ms_per_req"),
-            ("stores CPU ms/request", "stores_ms_per_req"), ("agent cores", "agent_cores"),
+    cols = [("p50 ms", "p50"), ("p99 ms", "p99"), ("req/s", "rps"), ("app CPU ms/request", "app_ms_per_req"), ("app CPU Mcycles/request", "app_mcycles_per_req"),
+            ("stores CPU ms/request", "stores_ms_per_req"), ("stores CPU Mcycles/request", "stores_mcycles_per_req"), ("agent cores", "agent_cores"),
             ("arrivald cores", "arrivald_cores"), ("central cores", "central_cores"), ("Jaeger + ES cores", "backend_cores"), ("app nodes, all cores", "node_cores"),
             ("arrival program, cores (E)", "program_cores"), ("ns per packet (E)", "program_ns"),
-            ("kept / offered spans (C to F)", "kept_share"), ("arrivals from the program (E)", "arrival_share"), ("CPU GHz, app nodes", "ghz")]
+            ("kept / offered spans (C to G)", "kept_share"), ("kept / target (C to G)", "kept_target"),
+            ("exported / spans (G)", "filter_exported"), ("... roots", "filter_roots"), ("... plan-selected", "filter_plan"), ("... outliers + errors", "filter_outliers"),
+            ("... no arrival or threshold", "filter_other"), ("arrivals from the program (E, G)", "arrival_share"), ("CPU GHz, app nodes", "ghz")]
     lines = ["| config | rate | repeats | " + " | ".join(c for c, _ in cols) + " |", "|---" * (3 + len(cols)) + "|"]
     for rate in sorted({r["rate"] for r in rows}):
         for cfg in CONFIGS:
             rs = [r for r in rows if r["cfg"] == cfg and r["rate"] == rate]
             if not rs:
                 continue
-            lines.append(f"| {cfg}: {CONFIGS[cfg]} | {rate} | {len(rs)} | " + " | ".join(cell([r[k] for r in rs], "{:.3f}" if k == "kept_share" else "{:.4f}" if k in ("arrival_share", "program_cores") else "{:.2f}") for _, k in cols) + " |")
+            lines.append(f"| {cfg}: {CONFIGS[cfg]} | {rate} | {len(rs)} | " + " | ".join(cell([r[k] for r in rs], "{:.3f}" if k in SHARE_KEYS else "{:.4f}" if k in ("arrival_share", "program_cores") else "{:.2f}") for _, k in cols) + " |")
     # the differences, repeat by repeat, with their range
     lines += ["", "| difference | rate | repeats paired | " + " | ".join(c for c, _ in cols) + " |", "|---" * (3 + len(cols)) + "|"]
     for rate in sorted({r["rate"] for r in rows}):
@@ -226,20 +289,20 @@ def main() -> int:
             reps = sorted(set(rx) & set(ry))
             if not reps:
                 continue
-            lines.append(f"| {x} - {y} | {rate} | {len(reps)} | " + " | ".join(cell([rx[p][k] - ry[p][k] for p in reps], "{:+.3f}" if k == "kept_share" else "{:+.4f}" if k in ("arrival_share", "program_cores") else "{:+.2f}") for _, k in cols) + " |")
+            lines.append(f"| {x} - {y} | {rate} | {len(reps)} | " + " | ".join(cell([rx[p][k] - ry[p][k] for p in reps], "{:+.3f}" if k in SHARE_KEYS else "{:+.4f}" if k in ("arrival_share", "program_cores") else "{:+.2f}") for _, k in cols) + " |")
     if invalid:
         lines += ["", "Left out as invalid: " + "; ".join(f"{r['cfg']}-r{r['rate']}-{r['rep']} ({r['invalid']})" for r in invalid)]
     nofreq = [f"{r['cfg']}-r{r['rate']}-{r['rep']}" for r in rows if r["ghz"] != r["ghz"]]
     if nofreq:
         lines += ["", "No frequency data (the sampler came later, or a node's file is missing): " + ", ".join(nofreq)]
     stamped = []
-    for mp in sorted(glob.glob(os.path.join(a.root, "E-r*-*", "meta.json"))):
+    for mp in sorted(glob.glob(os.path.join(a.root, "E-r*-*", "meta.json")) + glob.glob(os.path.join(a.root, "G-r*-*", "meta.json"))):
         m = json.load(open(mp))
         s = arrival_stats.stats(os.path.dirname(mp), m["t0"], m["t1"]) if os.path.exists(os.path.join(os.path.dirname(mp), "collected")) else None
         if s:
             stamped.append(([os.path.basename(os.path.dirname(mp))], s))
     if stamped:
-        lines += ["", "E, the arrival stamp in the load:", ""] + arrival_stats.rows(stamped, ["run"])
+        lines += ["", "E and G, the arrival stamp in the load:", ""] + arrival_stats.rows(stamped, ["run"])
     text = "\n".join(lines) + "\n"
     if a.md:
         open(a.md, "w", encoding="utf-8").write(text)

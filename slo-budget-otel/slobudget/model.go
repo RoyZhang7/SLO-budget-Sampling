@@ -31,6 +31,28 @@ type Span struct {
 	Wait      float64 // seconds from the request's arrival at the pod to Start (0: no arrival known, or a later one)
 
 	ParentSpanID uint64 // the parent's span id (0 for a root): keep_parent forces it
+	// DroppedBefore: ordinary spans of the service an in-service filter dropped before this one; they count as seen.
+	DroppedBefore int
+}
+
+// CoinU is the plan coin's value for a span id, in [0, 1): a fixed mix of the id (splitmix64's finaliser), the same in
+// the Python sampler (coin_u) and in the SDK's filter, so that every stage that draws the coin for a span draws the same
+// one (plan_coin hash).
+// DrawSalt mixes a draw's number into the span id for SpanCoin (the Python DRAW_SALT).
+const DrawSalt = 0x9E3779B97F4A7C15
+
+// SpanCoin is the k-th draw (k >= 1) of the decision about a span as a function of the span id: CoinU of the id mixed with
+// the draw's number, never the plan coin's own value CoinU(id).  The Python span_coin.
+func SpanCoin(spanID uint64, draw int) float64 {
+	return CoinU(spanID ^ (uint64(draw) * DrawSalt))
+}
+
+func CoinU(spanID uint64) float64 {
+	z := spanID
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+	z ^= z >> 31
+	return float64(z>>11) / float64(uint64(1)<<53)
 }
 
 // CallGraph is the service-level call structure per route.
@@ -132,6 +154,8 @@ type Corpus struct {
 	Period    float64
 	T0        float64
 	Services  []string // sorted distinct services
+	// an in-service filter's count records (replay): handed to the sampler at the period's end, before OnPeriodEnd
+	CountRecords []CountRecord
 }
 
 // TEnd is the latest span end.

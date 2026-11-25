@@ -115,6 +115,30 @@ func TestStamp(t *testing.T) {
 	}
 }
 
+// A span that brings the program's stamp keeps it; one with a miss stamp is looked up again.
+func TestAnEarlierStampStays(t *testing.T) {
+	p, sink, put := started(t, &Config{Period: time.Hour}, nil)
+	base := time.Now().Add(-time.Second)
+	put(1, base.Add(-2*time.Millisecond))
+	td := ptrace.NewTraces()
+	span(td, 2, 1, ptrace.SpanKindServer, base)
+	td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes().PutInt(arrivalstamp.Attr, 12345)
+	td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes().PutStr(arrivalstamp.AttrSource, "ebpf")
+	span(td, 3, 1, ptrace.SpanKindServer, base)
+	td.ResourceSpans().At(1).ScopeSpans().At(0).Spans().At(0).Attributes().PutInt(arrivalstamp.Attr, 12345)
+	td.ResourceSpans().At(1).ScopeSpans().At(0).Spans().At(0).Attributes().PutStr(arrivalstamp.AttrSource, "start")
+	if err := p.ConsumeTraces(context.Background(), td); err != nil {
+		t.Fatal(err)
+	}
+	out := sink.AllTraces()[0]
+	if at, src := stampOf(out.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)); at != 12345 || src != "ebpf" {
+		t.Errorf("the earlier stamp was replaced: %d %s", at, src)
+	}
+	if at, src := stampOf(out.ResourceSpans().At(1).ScopeSpans().At(0).Spans().At(0)); at == 12345 || src != "ebpf" {
+		t.Errorf("a miss stamp was not looked up again: %d %s", at, src)
+	}
+}
+
 // The period line has the outcomes, and the table's absence is said at the start.
 func TestPeriodLine(t *testing.T) {
 	core, logs := observer.New(zap.InfoLevel)

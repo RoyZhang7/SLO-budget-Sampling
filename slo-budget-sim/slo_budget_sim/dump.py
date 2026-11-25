@@ -66,10 +66,14 @@ def events_dump(corpus: Corpus, cfg, v_star: float, cap: float, rng_seed: int, a
             "status_ok": [bool(s.status_ok) for s in spans], "depth": [s.depth for s in spans],
             "route": [s.route for s in spans], "req_class": [s.req_class for s in spans],
             "nbytes": [s.nbytes for s in spans], "transit": [s.transit for s in spans], "own": [s.own for s in spans],
+            "dropped_before": [s.dropped_before for s in spans],
         },
     }
     if any(s.wait for s in spans):
         out["spans"]["wait"] = [s.wait for s in spans]
+    if getattr(corpus, "count_records", None):
+        out["count_records"] = [{"period": int(per), "service": svc, "host": host, "n": int(n)}
+                                for per, recs in sorted(corpus.count_records.items()) for svc, host, n in recs]
     if oracle is not None and cfg.calib_source == "oracle":
         out["oracle"] = _oracle_table(oracle)
     return out

@@ -59,7 +59,8 @@ Pluggable parts (BudgetConfig):
                              duration exceeds (1 + m) T_i (or its status is not OK); spans between
                              T_i and (1 + m) T_i are ordinary (plan-sampled).  0 = the plain rule.
                              Pass 5 rule (exp14), the Stage 2c default 0.1
-  plan_coin       span       one plan coin per ordinary span (default)
+  plan_coin       span       one plan coin per ordinary span (default); hash: the coin is a function of the span id
+                             (coin_u), so an in-service filter and the agent draw the same one
                   trace      trace-consistent: an ordinary span is kept only if the trace's random
                              value (drawn once at the root, carried in baggage) is under the plan
                              rate, so a sampled request keeps its ordinary spans together (exp16)
@@ -96,8 +97,43 @@ from .ttable import PRIORS, Calibrator
 ROOT_POLICIES = ("pin", "on_demand", "record", "plan")
 OUTLIER_TRIGGERS = ("own", "duration")
 OWN_MEASURES = ("handler", "within_service")
-PLAN_COINS = ("span", "trace")
+PLAN_COINS = ("span", "trace", "hash")
+
+HASH_BITS = 53
+
+
+def coin_u(span_id: int) -> float:
+    """The plan coin's value for a span id, in [0, 1): a fixed mix of the id (splitmix64's finaliser), the same in the Go port
+    and in the SDK's filter, so that every stage that draws the coin for a span draws the same one (plan_coin: hash)."""
+    z = span_id & 0xFFFFFFFFFFFFFFFF
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+    z ^= z >> 31
+    return (z >> (64 - HASH_BITS)) / float(1 << HASH_BITS)
+
+
+DRAW_SALT = 0x9E3779B97F4A7C15
+
+
+def span_coin(span_id: int, draw: int) -> float:
+    """The k-th draw (k >= 1) of the decision about a span, as a function of the span id: coin_u of the id mixed with the draw's
+    number (never the plan coin's own value, coin_u(id)).  coin_source: span (the in-service filter's setting: the same decision
+    for the same span whatever else the agent saw).  The same in the Go port (SpanCoin)."""
+    return coin_u((span_id ^ ((draw * DRAW_SALT) & 0xFFFFFFFFFFFFFFFF)) & 0xFFFFFFFFFFFFFFFF)
+
+
+class SpanCoins:
+    """random() for a sampler with coin_source = span: the deciding span's own draws (see span_coin)."""
+
+    def __init__(self, owner):
+        self.owner = owner
+
+    def random(self) -> float:
+        o = self.owner
+        o._draw += 1
+        return span_coin(o._cur, o._draw)
 CALIB_SOURCES = ("kept", "plan", "frozen", "oracle")
+COIN_SOURCES = ("rng", "span")
 CREDIT_POLICIES = ("none", "credit", "reserve")
 
 
@@ -204,6 +240,8 @@ class BudgetConfig:
     own_margin: float = 0.1         # own trigger: outlier only when own > (1 + m) b_i (exp15)
     own_measure: str = "handler"    # handler | within_service  (own trigger and calibration; see module docstring)
     plan_coin: str = "span"         # span | trace  (trace-consistent plan coin, exp16)
+    coin_source: str = "rng"        # rng | span: every other draw (the budget's fraction, the outlier coin beyond N_need, the
+                                    # credit coin) from the seeded stream, or from the deciding span's id (the filter's setting)
     n_need_decay: float = 0.0       # 0: N_need counters reset every period; d > 0: multiplied by d instead (exp16)
     n_need_healthy: bool = False    # N_need and the frozen trigger count misses beyond the healthy over-T rate
     root_policy: str = "pin"        # pin | on_demand | record | plan  (see module docstring)
@@ -253,6 +291,8 @@ class BudgetConfig:
             raise ValueError("own_measure within_service is a measure of the own trigger")
         if self.plan_coin not in PLAN_COINS:
             raise ValueError(f"unknown plan_coin {self.plan_coin}; choose from {PLAN_COINS}")
+        if self.coin_source not in COIN_SOURCES:
+            raise ValueError(f"unknown coin_source {self.coin_source}; choose from {COIN_SOURCES}")
         if not 0.0 <= self.n_need_decay < 1.0:
             raise ValueError("n_need_decay must be in [0, 1)")
 
@@ -282,6 +322,9 @@ class BudgetSampler(Sampler):
     def start_run(self, ctx: RunContext) -> None:
         super().start_run(ctx)
         cfg, corpus = self.cfg, ctx.corpus
+        self._cur, self._draw = 0, 0
+        if cfg.coin_source == "span":
+            self.rng = SpanCoins(self)
         self.calibrated = cfg.calib_source != "oracle"
         self._within = cfg.own_measure == "within_service"
         self.cal = Calibrator(corpus.graph, corpus.routes_slo, q=cfg.calib_q,
@@ -359,6 +402,7 @@ class BudgetSampler(Sampler):
 
     # -- baggage -------------------------------------------------------------
     def on_root_start(self, span: Span, req: RequestState, t: float) -> None:
+        self._cur, self._draw = span.span_id, 0
         self._requests += 1
         req.flag = False
         req.credit_used = 0
@@ -566,16 +610,28 @@ class BudgetSampler(Sampler):
         if cfg.plan_coin == "trace":
             if p <= 0.0 or req.plan_u >= p:     # the trace's value: a sampled request keeps its ordinary spans together
                 return False, p, "plan_coin"
+        elif cfg.plan_coin == "hash":
+            if p <= 0.0 or (p < 1.0 and coin_u(span.span_id) >= p):
+                return False, p, "plan_coin"
         elif p <= 0.0 or (p < 1.0 and self.rng.random() >= p):
             return False, p, "plan_coin"
         return self._spend(span, req, p, "plan")
 
+    def on_count_record(self, service: str, host: str, n: int) -> None:
+        """An in-service filter's count record at a period's end: n ordinary spans of the service it dropped since its last
+        report; they count as seen by the service and its host (the plan rates and the host pools)."""
+        self._spans_svc[service] = self._spans_svc.get(service, 0) + n
+        self._spans_host[host] = self._spans_host.get(host, 0) + n
+        self._svc_host[service] = host
+
     def on_end(self, span: Span, req: RequestState, t: float) -> tuple[bool, float, str]:
-        self._spans_host[span.host] = self._spans_host.get(span.host, 0) + 1
+        self._cur, self._draw = span.span_id, 0
+        self._spans_host[span.host] = self._spans_host.get(span.host, 0) + 1 + span.dropped_before
         self._svc_host[span.service] = span.host
         if span.parent_idx < 0:
+            self._spans_svc[span.service] = self._spans_svc.get(span.service, 0) + span.dropped_before
             return self._decide_root(span, req)
-        self._spans_svc[span.service] = self._spans_svc.get(span.service, 0) + 1
+        self._spans_svc[span.service] = self._spans_svc.get(span.service, 0) + 1 + span.dropped_before
         return self._decide_span(span, req)
 
     # -- period boundary: calibration, refill, pools, plan -----------------------

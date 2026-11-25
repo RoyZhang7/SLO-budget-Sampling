@@ -49,7 +49,8 @@ RD=$STAGE3/overhead/$CFG-r$RATE-$REP
 mkdir -p "$RD"
 rm -f "$RD/failed" "$RD/collected"
 log() { echo "$(date '+%F %T') $*" | tee -a "$RD/run.log"; }
-ours() { case "$CFG" in C|D|E|F) return 0 ;; esac; return 1; }    # our image's agents and a central
+ours() { case "$CFG" in C|D|E|F|G) return 0 ;; esac; return 1; }    # our image's agents and a central
+stamped() { case "$CFG" in E|G) return 0 ;; esac; return 1; }     # the eBPF arrival program is attached
 ARM=chosen; [ "$CFG" = F ] && ARM=tail
 restore() {
     if [ "$(kubectl get ds otelcol-pb-es-ctr -o jsonpath='{.spec.template.spec.containers[0].image}')" != "$STOCK_COLLECTOR_IMAGE" ]; then
@@ -74,28 +75,30 @@ arrival_logs() {
         n=$(kubectl get pod "$p" -o jsonpath='{.spec.nodeName}')
         for _ in 1 2 3; do
             kubectl logs "$p" --since=12m 2>/dev/null | grep -E "slobudget arrival|arrival table" > "$RD/arrival-agent-$n.log"
+            [ "$CFG" = G ] && kubectl logs "$p" --since=12m > "$RD/agent-$n.log" 2>/dev/null
             [ -s "$RD/arrival-agent-$n.log" ] && break
             sleep 3
         done
     done
 }
-fail() { log "FAILED: $*"; echo "$*" > "$RD/failed"; [ "$CFG" = E ] && arrival_logs; restore; exit 1; }
+fail() { log "FAILED: $*"; echo "$*" > "$RD/failed"; stamped && arrival_logs; restore; exit 1; }
 # BRIDGE_KIND is explicit in every config: kubectl set env keeps the last value otherwise
 case "$CFG" in
-    A) ENVS="OTEL_SAMPLE_RATIO=0 SLO_BUDGET_PORT=off BRIDGE_KIND=pb" ;;
-    B) ENVS="OTEL_SAMPLE_RATIO=0.12 SLO_BUDGET_PORT=off BRIDGE_KIND=pb" ;;
-    C) ENVS="OTEL_SAMPLE_RATIO- SLO_BUDGET_PORT- BRIDGE_KIND=pb" ;;
-    D) ENVS="OTEL_SAMPLE_RATIO- SLO_BUDGET_PORT- BRIDGE_KIND=v" ;;
-    E) ENVS="OTEL_SAMPLE_RATIO- SLO_BUDGET_PORT- BRIDGE_KIND=pb" ;;
-    F) ENVS="OTEL_SAMPLE_RATIO- SLO_BUDGET_PORT- BRIDGE_KIND=pb" ;;
-    *) echo "config A, B, C, D, E or F"; exit 2 ;;
+    A) ENVS="OTEL_SAMPLE_RATIO=0 SLO_BUDGET_PORT=off BRIDGE_KIND=pb SLO_FILTER-" ;;
+    B) ENVS="OTEL_SAMPLE_RATIO=0.12 SLO_BUDGET_PORT=off BRIDGE_KIND=pb SLO_FILTER-" ;;
+    C) ENVS="OTEL_SAMPLE_RATIO- SLO_BUDGET_PORT- BRIDGE_KIND=pb SLO_FILTER-" ;;
+    D) ENVS="OTEL_SAMPLE_RATIO- SLO_BUDGET_PORT- BRIDGE_KIND=v SLO_FILTER-" ;;
+    E) ENVS="OTEL_SAMPLE_RATIO- SLO_BUDGET_PORT- BRIDGE_KIND=pb SLO_FILTER-" ;;
+    F) ENVS="OTEL_SAMPLE_RATIO- SLO_BUDGET_PORT- BRIDGE_KIND=pb SLO_FILTER-" ;;
+    G) ENVS="OTEL_SAMPLE_RATIO- SLO_BUDGET_PORT- BRIDGE_KIND=pb SLO_FILTER=on SLO_ARRIVAL_PIN=$ARRIVAL_PIN" ;;   # E with the in-service filter (the services' image must have it and the bpf mount)
+    *) echo "config A, B, C, D, E, F or G"; exit 2 ;;
 esac
 log "overhead run $CFG rate=$RATE rep=$REP env=[$ENVS] image=$IMG"
 [ "$(kubectl get ds otelcol-pb-es-ctr -o jsonpath='{.spec.template.spec.containers[0].image}')" = "$STOCK_COLLECTOR_IMAGE" ] \
     || fail "the stock collector is not in place"
 [ -z "$(kubectl get ds,pods -l app=slobudget-arrival --no-headers 2>/dev/null)" ] || fail "arrivald is still there (an earlier E run): kubectl delete ds/slobudget-arrival"
 ARR=""
-if [ "$CFG" = E ]; then
+if stamped; then
     ARR="--arrival $ARRIVAL_PIN${ARRIVAL_SLOTS:+ --arrival-slots $ARRIVAL_SLOTS}"
     docker run --rm --entrypoint /arrivald "$IMG" -version > "$RD/arrivald-version" 2>&1 || fail "no arrivald in $IMG: $(tail -1 "$RD/arrivald-version")"
     # the kernel's verifier (node-0 runs the app nodes' kernel); nothing is attached
@@ -127,7 +130,7 @@ if ours; then
     kubectl rollout status ds/otelcol-pb-es-ctr --timeout=300s >> "$RD/run.log" 2>&1 || fail "agents did not roll"
     sleep 15
 fi
-if [ "$CFG" = E ]; then
+if stamped; then
     kubectl rollout status ds/slobudget-arrival --timeout=120s >> "$RD/run.log" 2>&1 || fail "arrivald did not come up"
     python3 "$MOD/tools/overhead/arrival_check.py" >> "$RD/run.log" 2>&1 || fail "arrival: $(tail -1 "$RD/run.log")"
 fi
@@ -183,7 +186,7 @@ done
 wrk $LOAD -d"${WARMUP}"s -s "$LUA" "$URL" -R"$RATE" > "$RD/wrk-warmup.log" 2>&1 &
 WRK=$!
 BAD=""
-if [ "$CFG" = E ]; then     # while the warm-up load is on, so that the first snapshot follows the load at once in every configuration
+if stamped; then     # while the warm-up load is on, so that the first snapshot follows the load at once in every configuration
     sleep $((WARMUP > 20 ? WARMUP - 12 : 8))
     python3 "$MOD/tools/overhead/arrival_check.py" --traffic --wait 5 >> "$RD/run.log" 2>&1 || BAD="arrival, in the warm-up: $(tail -1 "$RD/run.log")"
 fi
@@ -203,7 +206,7 @@ R1=$(restarts)
 log "load done: $(grep -E 'requests in|Non-2xx|Requests/sec' "$RD/wrk.log" | tr -s ' ' | tr '\n' ' ')"
 DONE=$(sed -n 's/^ *\([0-9]*\) requests in .*/\1/p' "$RD/wrk.log" | head -1)
 [ "${DONE:-0}" -ge $((RATE * DUR * 95 / 100)) ] || fail "wrk completed ${DONE:-no} requests, $((RATE * DUR)) expected: $(tail -2 "$RD/wrk.log" | tr '\n' ' ')"
-if [ "$CFG" = E ]; then     # still there, and it answered to the end
+if stamped; then     # still there, and it answered to the end
     python3 "$MOD/tools/overhead/arrival_check.py" --traffic --wait 5 >> "$RD/run.log" 2>&1 || fail "arrival, after the load: $(tail -1 "$RD/run.log")"
     arrival_logs
     [ "$(grep -l "slobudget arrival" "$RD"/arrival-agent-*.log | wc -l)" = 3 ] || fail "arrival: the agents' period lines of 3 nodes are not there: $(grep -l "slobudget arrival" "$RD"/arrival-agent-*.log | tr '\n' ' ')"
@@ -212,7 +215,7 @@ fi
 # 4. collect: the span processor's metrics lines (the Path Bridge's, or the vanilla one's in D), placement, image digests ----------------------------
 mkdir -p "$RD/pb"
 for p in $(kubectl get pods -o name | grep -- '-service-pb-es-ctr' | grep -v tracepressure); do
-    kubectl logs "$p" --since=7m 2>/dev/null | grep -E "(pb|vanilla)_processor_metrics" > "$RD/pb/$(basename "$p").log"
+    kubectl logs "$p" --since=7m 2>/dev/null | grep -E "(pb|vanilla)_processor_metrics|slobudget_filter_metrics|slobudget filter" > "$RD/pb/$(basename "$p").log"
 done
 PLACEMENT=$(kubectl get pods -o jsonpath='{range .items[*]}{.metadata.name}={.spec.nodeName}{" "}{end}')
 AGENT_IMAGES=$(kubectl get pods -l io.kompose.service=otelcol-pb-es-ctr -o jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.name}={.imageID}{" "}{end}{end}')
@@ -228,10 +231,10 @@ try:
 except (OSError, ValueError):
     src = {}
 meta = {"config": "$CFG", "rate": $RATE, "rep": $REP, "dur_s": $DUR, "t0": $T0, "t1": $T1, "load": "wrk $LOAD", "app_env": "$APP_ENV".split(),
-        "volume_target_spans_per_period": round(0.12 * 11500 * ($RATE / 100)) if "$CFG" in ("C", "D", "E") else None,
-        "arrival_pin": "$ARRIVAL_PIN" if "$CFG" == "E" else None, "callgraph": os.path.basename("$CALLGRAPH") if "$CFG" in ("C", "D", "E") else None,
+        "volume_target_spans_per_period": round(0.12 * 11500 * ($RATE / 100)) if "$CFG" in ("C", "D", "E", "G") else None,
+        "arrival_pin": "$ARRIVAL_PIN" if "$CFG" in ("E", "G") else None, "callgraph": os.path.basename("$CALLGRAPH") if "$CFG" in ("C", "D", "E", "G") else None,
         "placement": dict(x.split("=", 1) for x in "$PLACEMENT".split() if "=" in x),
-        "images": {"collector": "$IMG" if "$CFG" in ("C", "D", "E") else "$STOCK_COLLECTOR_IMAGE", "agent_containers": "$AGENT_IMAGES".split(),
+        "images": {"collector": "$IMG" if "$CFG" in ("C", "D", "E", "G") else "$STOCK_COLLECTOR_IMAGE", "agent_containers": "$AGENT_IMAGES".split(),
                    "app_digest": "$APP_IMAGEID".rpartition("@")[2] or None,
                    "source_commit": src.get("commit"), "source_tree": src.get("tree"), "source_dirty": src.get("dirty")}}
 json.dump(meta, open(os.path.join(rd, "meta.json"), "w"), indent=1)

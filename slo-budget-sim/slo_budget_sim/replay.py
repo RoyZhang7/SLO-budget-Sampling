@@ -149,6 +149,10 @@ def replay(corpus: Corpus, sampler: Sampler, v_star: float, cap: float, seed: in
         t_end = t0 + (per + 1) * period_len
         for idx, p, reason in late:
             admit(idx, p, reason, per, t_end)
+        take = getattr(sampler, "on_count_record", None)
+        if take is not None:
+            for svc, host, n in getattr(corpus, "count_records", {}).get(per, ()):
+                take(svc, host, n)
         sampler.on_period_end(per, cost_in_period)
         periods.append(st)
         cost_in_period = 0.0

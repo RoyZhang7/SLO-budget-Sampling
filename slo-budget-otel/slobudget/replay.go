@@ -94,6 +94,11 @@ func Replay(c *Corpus, cfg Config, vStar, cap float64, seed uint64, oracle *Cali
 		res.Decisions[idx] = Decision{true, p, reason}
 	}
 	finalize := func(per int) {
+		for _, r := range c.CountRecords {
+			if r.Period == per {
+				s.CountDropped(r.Service, r.Host, r.N)
+			}
+		}
 		s.OnPeriodEnd(per, costInPeriod)
 		res.Periods = append(res.Periods, st)
 		costInPeriod = 0.0

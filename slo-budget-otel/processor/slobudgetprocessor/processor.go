@@ -42,6 +42,16 @@ const (
 	// it comes from: attached here (arrival_table) or already there (the stamp in the tee)
 	AttrArrival       = arrivalstamp.Attr
 	AttrArrivalSource = arrivalstamp.AttrSource
+	// the in-service filter's stamps on an exported server span (sdk/filter): the within-service latency and the
+	// downstream time it computed from the span's own client spans (us), and the ordinary spans of its service it
+	// dropped since the service's last exported span; with them the span needs no hold for its client spans
+	AttrWithinUS      = "slobudget.ws_us"
+	AttrDownstreamUS  = "slobudget.downstream_us"
+	AttrDroppedBefore = "slobudget.dropped_before"
+	// the filter's period-end count record: a span of its own that carries dropped_before for the period; the agent
+	// counts it into the service's spans and drops it
+	AttrCountRecord = "slobudget.count_record"
+	AttrCountPeriod = "slobudget.count_period"
 )
 
 type interval struct{ start, end float64 }
@@ -96,6 +106,7 @@ type agent struct {
 	wg       sync.WaitGroup
 	httpc    *http.Client
 	lastStat slobudget.AgentStats
+	last     slobudget.CentralUpdate // the newest update from the central (the SDK's poll serves its tables)
 
 	// keep_parent ablation (sampler.keep_parent): span ids forced here (locally or by a
 	// peer's force-notice), span ids this agent broadcast, and recently decided span ids
@@ -123,6 +134,7 @@ type decidedSpan struct {
 type agentCounters struct {
 	notices, rootsHeld, rootsPinned, clientSpans, refusedPool, refusedBudget int
 	sdkPolls, budgetProp, requestsNew                                        int
+	countRecords, lateCountRecords                                           int // the filter's period-end records; late: for a period already closed
 	// keep_parent: kept because forced, forced but refused (budget / pool), forces that
 	// arrived after the span was decided (dropped / kept anyway), forces never used
 	forcedKept, forcedRefused, forceLate, forceLateKept, forcedExpired int
@@ -274,6 +286,18 @@ func (a *agent) request(tid pcommon.TraceID, route, cls string, now time.Time) *
 // moved to the hold queue and return false.
 func (a *agent) decide(rs ptrace.ResourceSpans, ss ptrace.ScopeSpans, span ptrace.Span, svc string, now time.Time) bool {
 	attrs := span.Attributes()
+	if v, ok := attrs.Get(AttrCountRecord); ok && v.Bool() { // the filter's period-end record: counted, never kept
+		n := 0
+		if d, ok := attrs.Get(AttrDroppedBefore); ok {
+			n = int(d.Int())
+		}
+		a.s.CountDropped(svc, a.host, n)
+		a.stats.countRecords++
+		if p, ok := attrs.Get(AttrCountPeriod); ok && p.Int() < a.period {
+			a.stats.lateCountRecords++
+		}
+		return false
+	}
 	route, cls := a.cfg.DefaultRoute, a.cfg.DefaultClass
 	if v, ok := attrs.Get(AttrRoot); ok {
 		route = v.AsString()
@@ -344,8 +368,17 @@ func (a *agent) decide(rs ptrace.ResourceSpans, ss ptrace.ScopeSpans, span ptrac
 			return d.Keep
 		}
 	}
-	// own time of a server span = duration minus the union of its client spans (locally known)
+	// own time of a server span = duration minus the union of its client spans (locally known); a span the
+	// in-service filter stamped brings its downstream time, so its client spans need not be waited for
 	sp.Own = sp.Duration - unionLength(req.clients[span.SpanID()])
+	stamped := false
+	if v, ok := attrs.Get(AttrDownstreamUS); ok && span.Kind() == ptrace.SpanKindServer {
+		sp.Own = sp.Duration - float64(v.Int())/1e6
+		stamped = true
+	}
+	if v, ok := attrs.Get(AttrDroppedBefore); ok {
+		sp.DroppedBefore = int(v.Int())
+	}
 	if sp.Own < 0 {
 		sp.Own = 0
 	}
@@ -354,7 +387,7 @@ func (a *agent) decide(rs ptrace.ResourceSpans, ss ptrace.ScopeSpans, span ptrac
 		a.holdRoot(rs, ss, span, sp, req, now)
 		return false
 	}
-	if a.cfg.ServerHold > 0 {
+	if a.cfg.ServerHold > 0 && !stamped {
 		a.holdServer(rs, ss, span, sp, req, now)
 		return false
 	}
@@ -767,6 +800,7 @@ func (a *agent) periodLoop(ctx context.Context) {
 				zap.Int("roots_held", st.RootsHeld), zap.Int("roots_pinned", st.RootsPinned), zap.Int("notices_sent", sent),
 				zap.Int("notices_recv", recv), zap.Int("notices_unicast", uni), zap.Int("refused_pool", st.RefusedPool), zap.Int("refused_budget", st.RefusedBudget),
 				zap.Int("requests_new", st.RequestsSeen), zap.Int("budget_propagated", st.BudgetPropagated), zap.Int("sdk_polls", st.SDKPolls),
+				zap.Int("count_records", a.stats.countRecords), zap.Int("late_count_records", a.stats.lateCountRecords),
 				zap.Int("version", st.Version), zap.Float64("B", a.s.B), zap.Float64("n_need", a.s.NNeed),
 				zap.Int("server_held", kp.srvHeld), zap.Int("server_late_clients", kp.srvLateClients),
 				zap.Float64("server_hold_ms_mean", holdMs(kp)), zap.Int("server_held_peak", kp.srvHeldPeak),
@@ -796,11 +830,14 @@ func (a *agent) periodLoop(ctx context.Context) {
 func (a *agent) handleSDK(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	out := struct {
-		Version int     `json:"version"`
-		B       float64 `json:"b"`
-		Host    string  `json:"host"`
-		Period  float64 `json:"period_s"`
-	}{a.version, a.s.B, a.host, a.cfg.Period.Seconds()}
+		Version int                                      `json:"version"`
+		B       float64                                  `json:"b"`
+		Host    string                                   `json:"host"`
+		Period  float64                                  `json:"period_s"`
+		Per     int64                                    `json:"period"`            // the update's period
+		BTable  map[string]map[string]map[string]float64 `json:"btable,omitempty"`  // route -> class -> service -> b (s): the in-service filter's thresholds
+		PlanP   map[string]float64                       `json:"plan_p,omitempty"`  // service -> ordinary-span rate: its plan coin's rate
+	}{a.version, a.s.B, a.host, a.cfg.Period.Seconds(), a.last.Period, a.last.BTable, a.last.PlanP}
 	a.stats.sdkPolls++
 	a.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
@@ -846,6 +883,7 @@ func (a *agent) pullConfig(ctx context.Context, initial bool) {
 					a.s.ApplyCentral(&u, a.host)
 					a.notices.setPeers(u.Peers)
 					a.version = u.Version
+					a.last = u
 				}
 				a.mu.Unlock()
 				if newer {

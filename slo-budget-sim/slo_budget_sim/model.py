@@ -24,6 +24,7 @@ class Span:
     own: float = 0.0        # own (self) time, when known (generator / complete traces)
     children: list = field(default_factory=list)   # child span indexes
     wait: float = 0.0       # from the request's arrival at the pod to this span's start (0: no arrival known, or a later one)
+    dropped_before: int = 0  # ordinary spans of the service an in-service filter dropped before this one (they count as seen)
 
     @property
     def end(self) -> float:
@@ -119,6 +120,8 @@ class Corpus:
     t0: float
     fault: FaultTruth | None = None
     meta: dict = field(default_factory=dict)
+    # an in-service filter's count records: period -> [(service, host, dropped)], handed to the sampler at that period's end
+    count_records: dict[int, list[tuple[str, str, int]]] = field(default_factory=dict)
 
     @property
     def t_end(self) -> float:

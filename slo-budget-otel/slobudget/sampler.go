@@ -45,7 +45,7 @@ type Sampler struct {
 	Cfg    Config
 	Cal    *Calibrator // the per-period calibration (nil only when calib_source is oracle)
 	Oracle *Calibrator // the ground-truth table (tests, calib_source oracle)
-	rng    *PyRandom
+	rng    coins // the seeded stream (PyRandom), or the deciding span's own draws (coin_source: span)
 	g      func(float64) float64
 
 	calibrated  bool
@@ -93,6 +93,9 @@ func NewSampler(cfg Config, graph *CallGraph, routesSLO map[string]float64, host
 	}
 	g, _ := growth(cfg.PRule)
 	s := &Sampler{Cfg: cfg, g: g, rng: NewPyRandom(seed), VStar: vStar, Oracle: oracle}
+	if cfg.CoinSource == "span" {
+		s.rng = &spanCoins{}
+	}
 	s.calibrated = cfg.CalibSource != "oracle"
 	s.within = cfg.OwnMeasure == "within_service"
 	prior := "none"
@@ -187,8 +190,37 @@ func (s *Sampler) setPools() {
 	}
 }
 
+// coins is random(): the seeded stream, or the deciding span's own draws.
+type coins interface {
+	Random() float64
+	deciding(spanID uint64)
+}
+
+func (r *PyRandom) deciding(uint64) {}
+
+// spanCoins is SpanCoins: random() = SpanCoin(the deciding span, the draw's number).
+type spanCoins struct {
+	cur  uint64
+	draw int
+}
+
+func (c *spanCoins) deciding(spanID uint64) { c.cur, c.draw = spanID, 0 }
+func (c *spanCoins) Random() float64 {
+	c.draw++
+	return SpanCoin(c.cur, c.draw)
+}
+
+// CountDropped is on_count_record: an in-service filter's count record at a period's end, n ordinary spans of the service
+// it dropped since its last report; they count as seen by the service and its host (the plan rates and the host pools).
+func (s *Sampler) CountDropped(service, host string, n int) {
+	s.spansSvc.set(service, s.spansSvcGet(service)+float64(n))
+	s.spansHost[host] += n
+	s.svcHost[service] = host
+}
+
 // OnRootStart is on_root_start: issue the integer budget (stochastic rounding of B).
 func (s *Sampler) OnRootStart(sp *Span, req *RequestState) {
+	s.rng.deciding(sp.SpanID)
 	s.requests++
 	req.Flag = false
 	if s.Cfg.Unbounded {
@@ -321,6 +353,9 @@ func (s *Sampler) spansSvcGet(svc string) float64 {
 	return v
 }
 
+// SpansSvc is the spans of a service seen this period (tests).
+func (s *Sampler) SpansSvc(svc string) (float64, bool) { return s.spansSvc.get(svc) }
+
 // outlierTest is _outlier_test: is the span an outlier, and by how much does it miss its
 // threshold (>= 0)?
 func (s *Sampler) outlierTest(sp *Span) (outlier bool, miss float64) {
@@ -376,7 +411,11 @@ func (s *Sampler) decideSpan(sp *Span, req *RequestState) Decision {
 	if !ok {
 		p = s.Cfg.InitialPlanP
 	}
-	if p <= 0.0 || (p < 1.0 && s.rng.Random() >= p) {
+	if s.Cfg.PlanCoin == "hash" {
+		if p <= 0.0 || (p < 1.0 && CoinU(sp.SpanID) >= p) {
+			return Decision{false, p, "plan_coin"}
+		}
+	} else if p <= 0.0 || (p < 1.0 && s.rng.Random() >= p) {
 		return Decision{false, p, "plan_coin"}
 	}
 	return s.spend(sp, req, p, "plan")
@@ -384,12 +423,14 @@ func (s *Sampler) decideSpan(sp *Span, req *RequestState) Decision {
 
 // OnEnd is on_end: the decision for one finished span.
 func (s *Sampler) OnEnd(sp *Span, req *RequestState) Decision {
-	s.spansHost[sp.Host]++
+	s.rng.deciding(sp.SpanID)
+	s.spansHost[sp.Host] += 1 + sp.DroppedBefore
 	s.svcHost[sp.Service] = sp.Host
 	if sp.IsRoot {
+		s.spansSvc.set(sp.Service, s.spansSvcGet(sp.Service)+float64(sp.DroppedBefore))
 		return s.decideRoot(sp, req)
 	}
-	s.spansSvc.set(sp.Service, s.spansSvcGet(sp.Service)+1)
+	s.spansSvc.set(sp.Service, s.spansSvcGet(sp.Service)+1+float64(sp.DroppedBefore))
 	return s.decideSpan(sp, req)
 }
 

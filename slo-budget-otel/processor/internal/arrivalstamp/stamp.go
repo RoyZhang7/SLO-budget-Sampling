@@ -94,8 +94,13 @@ func (s *Stamper) swap(t *arrival.Table, c *arrival.Counters, id string) {
 func (s *Stamper) Close() { s.swap(nil, nil, "") }
 
 // Stamp attaches the arrival of a server span's request.  The lookup is made when the span is
-// handed over: the table keeps an id only until its slot is taken.
+// handed over: the table keeps an id only until its slot is taken.  A span that brings the
+// program's stamp already (the tee in front, or the service itself) keeps it: that lookup was
+// earlier, so it saw the slot before anyone could take it.
 func (s *Stamper) Stamp(span ptrace.Span) {
+	if v, ok := span.Attributes().Get(AttrSource); ok && v.Str() == FromEBPF {
+		return
+	}
 	s.mu.Lock()
 	at, cause := s.res.Arrival(id64(span.ParentSpanID()), int64(span.StartTimestamp()))
 	s.mu.Unlock()
