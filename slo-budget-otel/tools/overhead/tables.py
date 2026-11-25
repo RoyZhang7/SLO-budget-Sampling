@@ -13,7 +13,8 @@ Elasticsearch) and the three app nodes as a whole.  CPU comes from two kubelet s
 admitted per 5-s period over the spans offered at the rate (23 per request), the check that they keep the
 12 % of B (central.log, the cap gate's records); for E the program's own CPU from the kernel's run
 statistics (arrivald's counters; too small for the node's figure to show) and the share of the server
-spans with a parent whose arrival came from the program.
+spans with a parent whose arrival came from the program.  Then one row per E run: that share inside the load (under
+97 %: FLAG), the misses by cause, and per node the program's counters and time per run.
 """
 from __future__ import annotations
 
@@ -24,6 +25,10 @@ import json
 import os
 import re
 import statistics as st
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import arrival_stats  # noqa: E402
 
 CONFIGS = {"A": "tracing off", "B": "SDK head sampling 12 %", "C": "record everything, our agent at 12 %",
            "D": "C with the Path Bridge off", "E": "C with the eBPF arrival program attached"}
@@ -187,6 +192,14 @@ def main() -> int:
             if not rs:
                 continue
             lines.append(f"| {cfg}: {CONFIGS[cfg]} | {rate} | {len(rs)} | " + " | ".join(cell([r[k] for r in rs], "{:.3f}" if k == "kept_share" else "{:.4f}" if k in ("arrival_share", "program_cores") else "{:.2f}") for _, k in cols) + " |")
+    stamped = []
+    for mp in sorted(glob.glob(os.path.join(a.root, "E-r*-*", "meta.json"))):
+        m = json.load(open(mp))
+        s = arrival_stats.stats(os.path.dirname(mp), m["t0"], m["t1"]) if os.path.exists(os.path.join(os.path.dirname(mp), "collected")) else None
+        if s:
+            stamped.append(([os.path.basename(os.path.dirname(mp))], s))
+    if stamped:
+        lines += ["", "E, the arrival stamp in the load:", ""] + arrival_stats.rows(stamped, ["run"])
     text = "\n".join(lines) + "\n"
     if a.md:
         open(a.md, "w", encoding="utf-8").write(text)

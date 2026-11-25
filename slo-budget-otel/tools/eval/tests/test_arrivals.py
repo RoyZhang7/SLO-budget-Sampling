@@ -209,6 +209,30 @@ def test_the_drift_has_the_centrals_graph(tmp_path, monkeypatch):
     assert plain["ws_callgraph"] == staged["ws_callgraph"] == "callgraph.stages.json" and staged["truth_callgraph"] == "callgraph.json"
 
 
+def test_the_drift_has_the_runs_measure(tmp_path):
+    """A run whose central counted from the arrivals: the drift's table and the split of the lost outliers count from them too, and nothing else does."""
+    import fixture
+    from sloeval.evaluate import evaluate
+    run = fixture.make_run(str(tmp_path), arm="chosen")
+    cg = os.path.join(run, "callgraph.json")
+    shadow, lines = os.path.join(run, "shadow.jsonl"), []
+    for ln in open(shadow, encoding="utf-8"):
+        d = json.loads(ln)
+        for rs in d["resourceSpans"]:
+            for sp in rs["scopeSpans"][0]["spans"]:
+                if sp["kind"] == 2 and sp["parentSpanId"]:
+                    sp["attributes"] += attrs(slobudget__arrival_ns=int(sp["startTimeUnixNano"]) - 700_000, slobudget__arrival_source="ebpf")
+        lines.append(json.dumps(d))
+    open(shadow, "w", encoding="utf-8").write(chr(10).join(lines))
+    plain = evaluate(run, SIM, cg, recon_bin=None, do_recon=False)
+    mp = os.path.join(run, "meta.json")
+    m = json.load(open(mp))
+    json.dump({**m, "sampler_env": {"own_measure": "within_service"}}, open(mp, "w"))
+    within = evaluate(run, SIM, cg, recon_bin=None, do_recon=False)
+    differ = {k for k in plain if plain[k] != within[k] and not (plain[k] != plain[k] and within[k] != within[k]) and k not in ("timing", "peak_rss_mb")}
+    assert {"oracle_T_ms", "t_drift_pre"} <= differ and all(k.startswith(("t_drift", "ref_", "loss", "refusal")) or k == "oracle_T_ms" for k in differ), differ
+
+
 def test_report_tool_without_a_stamp(tmp_path, capsys):
     sys.argv = ["x", str(tmp_path)]
     assert arrival_estimate.main() == 1 and "no arrival-vs-estimate.json" in capsys.readouterr().out

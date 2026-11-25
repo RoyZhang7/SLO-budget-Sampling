@@ -11,7 +11,9 @@ responses, the collectors' restarts, the fault or burst record, the agents' upda
 family), and the admitted volume against the target, taken from the central's exporter counters
 (start and end scrapes; they match the evaluation's vol_ratio within 1 % on 171 runs of every arm).
 The full check repeats all of it with the volume from the evaluation, plus the evaluation's shadow
-size and the export's against what the central admitted.  A crash of the pre-check itself is a note, not a problem: the full check still runs.
+size and the export's against what the central admitted.  A run with the arrival stamp: the share of the server spans with a
+parent whose arrival the program gave (a run under 97 % is a problem), with the misses by cause and the program's counters
+and time per run, per node, as notes.  A crash of the pre-check itself is a note, not a problem: the full check still runs.
 """
 from __future__ import annotations
 
@@ -21,13 +23,15 @@ import re
 import sys
 from datetime import datetime, timezone
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "overhead"))
+import arrival_stats  # noqa: E402
+
 SLOBUDGET_ARMS = ("chosen", "threshold", "keep-parent")
 VOLUME_SCENARIOS = ("steady", "saturated", "noisy_neighbour", "cascade", "cold_start")
 VOLUME_RANGE = (0.6, 1.3)
-ARRIVAL_HIT = 0.95
+ARRIVAL_HIT = 0.95              # a node's
 EXPORT_MIN = 0.9                # of the spans the central admitted in the load's periods
 CLOCK_STEP = 0.001              # s
-ARRIVAL_MISSES = ("no_table", "empty", "not_stored", "overwritten", "torn", "late")
 SENT_SPANS = re.compile(r"^otelcol_exporter_sent_spans_total\{([^}]*)\}\s+([0-9.eE+-]+)")
 
 
@@ -67,40 +71,33 @@ def central_checks(rd: str, meta: dict) -> list:
 
 
 def arrival_checks(rd: str, meta: dict) -> list:
-    """A run with the arrival stamp: on every node, at least ARRIVAL_HIT of the load's lookups with a parent were
-    answered by the program, its counters have no errors, and (own_measure within_service) the node's wall clock did
+    """A run with the arrival stamp: of the load's lookups with a parent at least HIT_FLAG were answered by the program, and at least
+    ARRIVAL_HIT on every node; its counters have no errors, and (own_measure within_service) the node's wall clock did
     not step: arrivals of up to a second after a step are off by it.  The tee stamps, without a tee the agent."""
-    probs, agents = [], 0
-    t0, t1 = float(meta["t0"]), float(meta["t1"])
-    prefix = "tee-" if meta.get("tee") else "agent-"
-    for fn in sorted(os.listdir(rd)):
-        if not (fn.startswith(prefix) and fn.endswith(".log")):
-            continue
-        agents += 1
-        hit = miss = err = 0
-        step = 0.0
-        for ln in open(os.path.join(rd, fn), errors="replace"):
-            if "slobudget arrival" not in ln or "{" not in ln:
-                continue
-            try:
-                ts = datetime.strptime(ln.split(None, 1)[0], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc).timestamp()
-                d = json.loads(ln[ln.index("{"):])
-            except ValueError:
-                continue
-            if t0 <= ts <= t1 + 5:
-                hit += d.get("hit", 0)
-                miss += sum(d.get(k, 0) for k in ARRIVAL_MISSES)
-                err += d.get("bpf_errors", 0)
-                step = max(step, abs(d.get("clock_step", 0.0)))
-        if hit + miss == 0 or hit < ARRIVAL_HIT * (hit + miss):
-            probs.append(f"{fn}: {hit} of {hit + miss} arrival lookups answered by the program")
-        if err:
-            probs.append(f"{fn}: the arrival program counted {err} errors")
-        if step > CLOCK_STEP and (meta.get("sampler_env") or {}).get("own_measure") == "within_service":
-            probs.append(f"{fn}: the wall clock stepped by {1e3 * step:.1f} ms during the load")
-    if not agents:
-        probs.append("no logs of the stamp: the arrivals were not checked")
+    s = arrival_stats.stats(rd, float(meta["t0"]), float(meta["t1"]))
+    if s is None:
+        return ["no logs of the stamp: the arrivals were not checked"]
+    probs = []
+    prefix = "tee" if meta.get("tee") else "agent"
+    for node, n in sorted(s["nodes"].items()):
+        x = n["lookups"]
+        if x["looked_up"] == 0 or x["hit"] < ARRIVAL_HIT * x["looked_up"]:
+            probs.append(f"{prefix}-{node}.log: {x['hit']} of {x['looked_up']} arrival lookups answered by the program")
+        if x["bpf_errors"]:
+            probs.append(f"{prefix}-{node}.log: the arrival program counted {x['bpf_errors']} errors")
+        if x["clock_step_s"] > CLOCK_STEP and (meta.get("sampler_env") or {}).get("own_measure") == "within_service":
+            probs.append(f"{prefix}-{node}.log: the wall clock stepped by {1e3 * x['clock_step_s']:.1f} ms during the load")
+    if s["flagged"] and s["looked_up"]:
+        probs.append(f"arrival hit rate {arrival_stats.pct(s['hit_rate'])} of {s['looked_up']} server spans with a parent, under {arrival_stats.pct(arrival_stats.HIT_FLAG, 0)}")
     return probs
+
+
+def arrival_notes(rd: str, meta: dict) -> list:
+    """the numbers behind it, per node"""
+    if not meta.get("arrival_pin"):
+        return []
+    s = arrival_stats.stats(rd, float(meta["t0"]), float(meta["t1"]))
+    return arrival_stats.lines(s) if s else []
 
 
 def run_checks(rd: str, meta: dict) -> list:
@@ -191,6 +188,7 @@ def pre_check(rd: str) -> tuple[list, list]:
         probs += central_checks(rd, meta)
     if meta.get("arrival_pin"):
         probs += arrival_checks(rd, meta)
+        notes += arrival_notes(rd, meta)
     return probs, notes
 
 
@@ -215,6 +213,10 @@ def main() -> int:
             probs, notes = [], [f"the pre-check failed and was ignored: {type(e).__name__}: {e}"]
     else:
         probs, notes = full_check(sys.argv[1]), []
+        try:
+            notes = arrival_notes(sys.argv[1], load_meta(sys.argv[1]))
+        except (OSError, ValueError, KeyError):
+            pass
     print("OK" if not probs else "\n".join(probs))
     for n in notes:
         print("note: " + n)

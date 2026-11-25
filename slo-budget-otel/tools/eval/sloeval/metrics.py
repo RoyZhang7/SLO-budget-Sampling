@@ -77,7 +77,7 @@ def _fmt_top(pairs, k=5, fmt="{:.2f}") -> str:
 
 
 def compute(meta: dict, t: SpanTable, kept: KeptSet, kidx: np.ndarray, cal, status: dict | None,
-            gate: list[dict], cpu: dict, buffers: dict, recon: dict | None, ws=None, cal_run=None) -> dict:
+            gate: list[dict], cpu: dict, buffers: dict, recon: dict | None, ws=None, cal_run=None, run_wait=None) -> dict:
     P = float(meta["period_s"])
     t0, t1 = float(meta["t0"]), float(meta["t1"])
     margin = float(meta.get("margin", 0.1))
@@ -187,7 +187,7 @@ def compute(meta: dict, t: SpanTable, kept: KeptSet, kidx: np.ndarray, cal, stat
     rr = np.bincount(t.route[t.is_root & pop], minlength=max(1, len(t.routes)))
     main_route = t.routes[int(np.argmax(rr))] if rr.sum() else (next(iter(slo_s)) if slo_s else "compose_post")
     out["route"] = main_route
-    oracle_rl = route_level_table(cal_run or cal, main_route)       # the drift compares it with the central's table: the central's call graph
+    oracle_rl = route_level_table(cal_run or cal, main_route)       # the drift compares it with the central's table: the central's call graph and measure
     out["oracle_T_ms"] = {s: round(v * 1000, 3) for s, v in sorted(oracle_rl.items())}
 
     # volume and spend (cap gate) ---------------------------------------------------------------
@@ -368,7 +368,8 @@ def compute(meta: dict, t: SpanTable, kept: KeptSet, kidx: np.ndarray, cal, stat
     def drop_group(idx: np.ndarray) -> np.ndarray:
         if arm in CHOSEN_FAMILY:
             tu = T_used[idx]
-            nf = np.isnan(tu) | (dur[idx] <= (1.0 + margin) * np.nan_to_num(tu, nan=np.inf))
+            d = dur[idx] if run_wait is None else dur[idx] + run_wait[idx] / 1e9        # the run's table is on its own measure
+            nf = np.isnan(tu) | (d <= (1.0 + margin) * np.nan_to_num(tu, nan=np.inf))
             return np.where(nf, "not_flagged", "refused")
         return np.full(len(idx), "arm", dtype=object)
 

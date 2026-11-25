@@ -14,8 +14,9 @@ burst_phase.py), which the over-SLO share follows.  Tables: (1) competitors
 ablations (chosen, threshold, keep-parent, and every arm-variant of run_one.sh's VARIANT), (3) the fault window under
 each truth (Stage 3: single culprit, own time, the culprit's node, duration), (4) the common truth of all arms
 (the runs evaluated with it), (5) reconstruction coverage.  The
-Stage 2d series (run ids 2d-*, tools/eval/compare2d.py), invalid-* and smoke-* runs and runs with an
-INVALID file are left out.
+Stage 2d series (run ids 2d-*, tools/eval/compare2d.py), invalid-*, smoke-* and pilot-* runs and runs with an
+INVALID file are left out.  Last, one row per run with the arrival stamp: the share of its server spans with a parent whose
+arrival the program gave (under 97 %: FLAG), the misses by cause, the lowest service, and per node the program's counters and time.
 """
 from __future__ import annotations
 
@@ -24,6 +25,10 @@ import glob
 import json
 import math
 import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "overhead"))
+import arrival_stats  # noqa: E402
 
 SCENARIOS = ("steady", "saturated", "noisy_neighbour", "cascade", "bursty", "cold_start", "late_everywhere")
 SCENARIO_LABELS = {"noisy_neighbour": "noisy-neighbour"}
@@ -85,11 +90,20 @@ RECON_COLUMNS = [
 ]
 
 
+def lowest_service(s: dict) -> str:
+    """of the 100 % export: the service with the smallest share of its requests stamped by the program"""
+    svc = (s.get("arrival_estimate_vs_stamp") or {}).get("services") or {}
+    if not svc:
+        return "-"
+    n, x = min(svc.items(), key=lambda kv: kv[1]["stamped"] / max(1, kv[1]["calls"]))
+    return f"{n} {100 * x['stamped'] / max(1, x['calls']):.2f} % of {x['calls']:,}"
+
+
 def load(root: str) -> list[dict]:
     out = []
     for p in sorted(glob.glob(os.path.join(root, "*", "summary.json"))):
         name = os.path.basename(os.path.dirname(p))
-        if name.startswith(("2d-", "invalid-", "smoke-")) or os.path.exists(os.path.join(os.path.dirname(p), "INVALID")):
+        if name.startswith(("2d-", "invalid-", "smoke-", "pilot-")) or os.path.exists(os.path.join(os.path.dirname(p), "INVALID")):
             continue
         with open(p, encoding="utf-8") as f:
             s = json.load(f)
@@ -241,6 +255,10 @@ def main() -> int:
     print(markdown(flt, FAULT_COLUMNS, f"Fault window under each truth, {v}"))
     if ws:
         print(markdown(ws, WS_COLUMNS, f"Common truth of all arms: within-service latency on the estimated kernel receive time, {v} (window: the fault, bursty: the burst, steady: the run)"))
+    stamped = [s for s in summaries if s.get("arrival") and abs(float(s["volume_frac"]) - a.volume) < 1e-6 and s.get("scenario") in a.scenarios]
+    if stamped:
+        print(f"### Arrival stamp, {v}\n")
+        print("\n".join(arrival_stats.rows([([os.path.basename(s["_dir"]), lowest_service(s)], s["arrival"]) for s in stamped], ["run", "lowest service"])) + "\n")
     print(markdown(rec, RECON_COLUMNS, f"Reconstruction coverage, {v}", extra=("hole length 1/2/3/4+", "hole_dist")))
     return 0
 

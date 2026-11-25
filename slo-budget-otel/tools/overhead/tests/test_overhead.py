@@ -134,3 +134,23 @@ def test_node_cpu_over_its_own_interval(tmp_path):
     assert groups == {"arrivald": 2.0, "node_cores": pytest.approx(3 * 20 / 16)} and secs == 20.0
     (tmp_path / "cpu-start.json").write_text(json.dumps({"t": 10.0, "containers": {}}))         # a snapshot from before the nodes were taken
     assert tables.cpu_by_group(str(tmp_path))[0] == {}
+
+
+def test_a_row_per_e_run(tmp_path, capsys, monkeypatch):
+    t0 = NOW - 300
+    rd = tmp_path / "E-r100-1"
+    rd.mkdir()
+    (rd / "collected").write_text("")
+    (rd / "meta.json").write_text(json.dumps({"config": "E", "rate": 100, "rep": 1, "t0": t0, "t1": NOW}))
+    (rd / "wrk.log").write_text("  50.000%   10.00ms\n  99.000%  20.00ms\n30000 requests in 5.00m\nRequests/sec:  100.00\n")
+    for name, t in (("cpu-start.json", t0), ("cpu-end.json", NOW)):
+        (rd / name).write_text(json.dumps({"t": t, "containers": {}, "nodes": {}}))
+    iso = lambda t: datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    for n in (1, 2, 3):
+        bad = 400 if n == 3 else 2
+        (rd / f"arrival-agent-node-{n}.log").write_text(f'{iso(t0 - 20)}\tinfo\tx\tslobudget arrival\t{{"hit": 0, "empty": 999}}\n{iso(t0 + 9)}\tinfo\tx\tslobudget arrival\t{{"hit": 1000, "empty": {bad}}}\n')
+        (rd / f"arrival-node-{n}.log").write_text(line(4, 200, packets=50, run_ns=100_000, runs=40) + "\n")
+    monkeypatch.setattr(sys, "argv", ["x", str(tmp_path)])
+    assert tables.main() == 0
+    out = capsys.readouterr().out
+    assert "| E-r100-1 | **FLAG** 88.13 % | empty 404 | 71.43 % |" in out and "4 pods, packets 50, ids 10; 2,500 ns a run" in out

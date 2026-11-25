@@ -85,7 +85,7 @@ def stamped_wait(t: SpanTable) -> np.ndarray:
     return np.maximum(w, 0)
 
 
-class _Shifted:
+class Shifted:
     """A table of the same spans, counted from their arrivals: what build_oracle reads (duration and own time with the wait)."""
 
     def __init__(self, t: SpanTable, wait: np.ndarray, own: np.ndarray):
@@ -97,7 +97,7 @@ class _Shifted:
 def within_service(t: SpanTable, wait: np.ndarray, own: np.ndarray, mask: np.ndarray, graph, Calibrator, routes_slo):
     """(within-service latency in s, its oracle share b in s) per span: the calibration on the same measure, from the healthy spans."""
     from .oracle import build_oracle, lookup_arrays
-    s = _Shifted(t, wait, own)
+    s = Shifted(t, wait, own)
     cal = build_oracle(s, mask, graph, Calibrator, routes_slo)
     _, B = lookup_arrays(s, cal)
     return (own + wait) / 1e9, B
@@ -152,7 +152,10 @@ def compare(t: SpanTable, meta: dict, healthy: np.ndarray, own: np.ndarray, grap
     out = {"run_id": meta["run_id"], "scenario": meta["scenario"], "culprit": f.get("culprit"), "window": "fault" if meta.get("fault") else "burst" if f else None,
            "server_spans": int((t.kind == SERVER).sum()), "server_spans_with_the_attribute": int(((t.kind == SERVER) & (t.arrival > 0)).sum()),
            "calls": int(len(k.v)), "stamped_by_the_program": int(hit.sum()), "share_stamped": float(hit.mean()) if len(hit) else None,
-           "edges": {}, "all": {"healthy": part(h), "window": part(window)}}
+           "edges": {}, "services": {}, "all": {"healthy": part(h), "window": part(window)}}
+    for i in np.unique(t.svc[k.v]).tolist():            # a service is one pod here, the root's apart
+        m = t.svc[k.v] == i
+        out["services"][t.services[i]] = {"calls": int(m.sum()), "stamped": int((m & hit).sum())}
     for e, name in enumerate(k.names):
         m = k.edge == e
         out["edges"][name] = {"median_gap_ms": float(med[e]) / 1e6 if np.isfinite(med[e]) else None, "healthy": part(m & h), "window": part(m & window)}

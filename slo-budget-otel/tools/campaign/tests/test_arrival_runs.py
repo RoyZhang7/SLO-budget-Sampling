@@ -37,7 +37,32 @@ def test_arrivals_of_the_load_only(tmp_path):
                                        ([line(T0 + 5, hit=1000, bpf_errors=2)], "2 errors"), ([line(T0 + 5, hit=10, no_table=990)], "10 of 1000")])
 def test_what_is_missing(tmp_path, bad, says):
     probs = sanity.arrival_checks(*run_dir(tmp_path, {"node-1": GOOD, "node-2": bad}))
-    assert len(probs) == 1 and probs[0].startswith("agent-node-2.log") and says in probs[0]
+    assert probs[0].startswith("agent-node-2.log") and says in probs[0]
+    assert len(probs) == 1 or len(probs) == 2 and "under 97 %" in probs[1]
+
+
+def test_a_run_under_97_percent_is_a_problem(tmp_path):
+    half = [line(T0 + 5, hit=960, empty=40), line(T0 + 10, hit=960, not_stored=30, late=10)]         # every node over 95 %
+    probs = sanity.arrival_checks(*run_dir(tmp_path, {"node-1": half, "node-2": half}))
+    assert probs == ["arrival hit rate 96.00 % of 4000 server spans with a parent, under 97 %"]
+    fine = [line(T0 + 5, hit=971, empty=29)]
+    assert sanity.arrival_checks(*run_dir(tmp_path, {"node-1": fine, "node-2": fine})) == []
+
+
+def test_the_numbers_are_notes(tmp_path):
+    def counters(t, **kw):
+        ts = datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "123Z"
+        return json.dumps({"time": ts, "msg": "counters", "interfaces": 4, "packets": 100, "ids": 80, "no_id": 19, "cut": 1, "runs": 300, "run_ns": 600_000, **kw}) + "\n"
+    rd, meta = run_dir(tmp_path, {"node-1": GOOD}, tee=True)
+    (tmp_path / "arrival-node-1.log").write_text("not json\n" + counters(T0 - 30, packets=9999) + "".join(counters(T0 + s) for s in (3, 8, 13)) + counters(T0 + 602) + counters(T0 + 700, ids=9999))
+    notes = sanity.arrival_notes(rd, meta)
+    assert notes[0].startswith("arrival stamp: 99.55 % of the 1,979 server spans with a parent") and "misses: empty 5, not_stored 3, overwritten 1" in notes[0]
+    assert notes[1].startswith("arrival stamp, node-1: 99.55 %") and "4 pods, packets 400, ids 320, no_id 76, cut 4; 2,000 ns a run" in notes[1]
+    assert sanity.arrival_notes(rd, {**meta, "arrival_pin": None}) == []
+    s = sanity.arrival_stats.stats(rd, T0, T0 + 600)
+    assert s["nodes"]["node-1"]["program"]["runs"] == 600 and not s["flagged"]       # the lines wholly inside the load
+    row = sanity.arrival_stats.rows([(["x"], s)], ["run"])
+    assert len(row) == 3 and row[2].startswith("| x | 99.55 % | empty 5")
 
 
 def test_no_logs(tmp_path):
@@ -94,7 +119,12 @@ def test_queue_lines():
     for ln in lines:            # nothing can land in a run of the campaign: v<pct>-<scenario>-<arm>-s<seed>
         arm, sc, vol, seed = ln.split()[:4]
         assert f"v{round(float(vol) * 100)}-{sc}-{arm}-s{seed}" not in ids and "VARIANT=" in ln and "CALLGRAPH=deploy/callgraph.stages.json" in ln
-    assert all("ARRIVAL=1 OWN_MEASURE=within_service" in ln for ln in j["a"] + j["c"]) and not any("ARRIVAL" in ln or "OWN_MEASURE" in ln for ln in j["b"])
+    assert all("ARRIVAL=1 OWN_MEASURE=within_service" in ln for ln in j["a"] + j["c"])
+    # b is a's 12 % runs without the measure, and nothing else: the program and the lookup stay
+    a12 = {tuple(ln.split()) for ln in j["a"] if ln.split()[2] == "0.12"}
+    for ln in j["b"]:
+        w = ln.replace("ARRIVAL=1 VARIANT=handler", "ARRIVAL=1 OWN_MEASURE=within_service VARIANT=ebpf").replace("-handler-s", "-ebpf-s").split()
+        assert "OWN_MEASURE" not in ln and tuple(w) in a12
     # c is a's 12 % runs with the arm threshold (no budget, no pool, no N_need) and nothing else changed
     a12 = {tuple(ln.split()[1:]) for ln in j["a"] if ln.split()[2] == "0.12"}
     for ln in j["c"]:

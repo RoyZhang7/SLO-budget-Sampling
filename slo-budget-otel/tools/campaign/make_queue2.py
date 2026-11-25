@@ -2,7 +2,8 @@
 """Print the queue lines of the runs after the overhead experiment (decisions of 2026-11-24), in this order:
 
 a. our arm with the eBPF arrival stamp (own_measure within_service), all scenarios, 25 / 12 / 5 %;
-b. our arm on the handler's own time with the call-graph fix, 12 % only;
+b. a on the handler's own time, 12 % only: the program attached and the lookup on as in a, only the outlier test (agents and central)
+   does not read the arrival;
 c. threshold-only, 12 % only: a without the budget, the pool and N_need (the arm `threshold`), everything else the same.
 
 noisy_neighbour is at 12 % only (a, b and c); the other scenarios are the campaign's.
@@ -29,7 +30,7 @@ def jobs(tag: str) -> dict[str, list[str]]:
                 out["a"].append(f"chosen {sc} {vol} {seed} IMAGE_TAG={tag} {cg} ARRIVAL=1 OWN_MEASURE=within_service VARIANT=ebpf RUN_ID=v{round(vol * 100)}-{sc}-ebpf-s{seed}")
     for seed in SEEDS:
         for sc in AT_12:
-            out["b"].append(f"chosen {sc} 0.12 {seed} IMAGE_TAG={tag} {cg} VARIANT=callgraph RUN_ID=v12-{sc}-callgraph-s{seed}")
+            out["b"].append(f"chosen {sc} 0.12 {seed} IMAGE_TAG={tag} {cg} ARRIVAL=1 VARIANT=handler RUN_ID=v12-{sc}-handler-s{seed}")
     for seed in SEEDS:
         for sc in AT_12:
             out["c"].append(f"threshold {sc} 0.12 {seed} IMAGE_TAG={tag} {cg} ARRIVAL=1 OWN_MEASURE=within_service VARIANT=ebpf RUN_ID=v12-{sc}-threshold-ebpf-s{seed}")

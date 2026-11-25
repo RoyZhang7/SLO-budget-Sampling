@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import time
 
 try:
@@ -17,6 +18,9 @@ from . import arrivals, runinfo
 from .metrics import CHOSEN_FAMILY, compute
 from .oracle import build_oracle, import_sim, load_callgraph
 from .spans import SERVER, join, own_client, read_export, read_shadow
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "overhead"))
+import arrival_stats  # noqa: E402
 
 WS_CALLGRAPH = "callgraph.stages.json"      # the common truth's call graph (deploy/): the staged one, for every arm
 
@@ -162,17 +166,25 @@ def evaluate(run_dir: str, sim_path: str, callgraph: str, recon_bin: str | None 
     healthy = healthy_mask(meta, t)
     ws = arrivals.within_service(t, arrivals.estimated_wait(t, meta, healthy), own, healthy, ws_graph, Calibrator, routes_slo)
     run_cg = runinfo.central_callgraph(meta)
-    cal_run = None
-    if os.path.basename(run_cg) != os.path.basename(callgraph) and ws_graph is not graph:       # the central had another graph of the same application
-        cal_run = build_oracle(t, healthy, load_callgraph(run_cg, CallGraph), Calibrator, routes_slo)
-    out = compute(meta, t, kept, kidx, cal, status, gate, cpu, buffers, recon, ws, cal_run)
+    cal_run = run_wait = None
+    within = (meta.get("sampler_env") or {}).get("own_measure") == "within_service"             # the run's table counts from the arrivals
+    if within:
+        run_wait = arrivals.stamped_wait(t)
+    if within or os.path.basename(run_cg) != os.path.basename(callgraph) and ws_graph is not graph:     # or the central had another graph of the same application
+        other = load_callgraph(run_cg, CallGraph) if ws_graph is not graph else graph
+        cal_run = build_oracle(arrivals.Shifted(t, run_wait, own) if within else t, healthy, other, Calibrator, routes_slo)
+    out = compute(meta, t, kept, kidx, cal, status, gate, cpu, buffers, recon, ws, cal_run, run_wait)
     out["truth_callgraph"] = os.path.basename(callgraph)        # of T, b and every truth but the common one
     out["ws_callgraph"] = WS_CALLGRAPH if ws_graph is not graph else out["truth_callgraph"]
     if (t.arrival > 0).any():       # a run with the stamp: the estimate against it
         cmp = arrivals.compare(t, meta, healthy, own, ws_graph, Calibrator, routes_slo)
-        out["arrival_estimate_vs_stamp"] = {**{q: cmp[q] for q in ("share_stamped", "calls", "server_spans", "server_spans_with_the_attribute")}, **cmp["all"]}
+        out["arrival_estimate_vs_stamp"] = {**{q: cmp[q] for q in ("share_stamped", "calls", "server_spans", "server_spans_with_the_attribute", "services")}, **cmp["all"]}
         with open(os.path.join(run_dir, "arrival-vs-estimate.json"), "w", encoding="utf-8") as f:
             json.dump(cmp, f, indent=1)
+    stamp = arrival_stats.stats(run_dir, s0, s1) if meta.get("arrival_pin") else None
+    if stamp:
+        out["arrival"] = stamp
+        out["arrival_hit_rate"], out["arrival_flagged"] = stamp["hit_rate"], stamp["flagged"]
     timing["metrics_s"] = round(time.time() - tic, 1)
     out["spans_per_trace"] = round(spt, 2)
     out.update(hold_cost(run_dir, t, pop_tr))

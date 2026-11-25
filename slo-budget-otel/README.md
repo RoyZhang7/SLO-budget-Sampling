@@ -301,8 +301,9 @@ on node-0 as the deploy user; nothing needs root.
    central), `CALLGRAPH=deploy/callgraph.stages.json`, and a `VARIANT` and `RUN_ID` of their own, so that every
    table keeps them apart from the plain arm (`make_queue2.py` prints the lines; `#hold` in front unless `--go`).
    A run fails unless the program is at every service pod before the load and the ids arrived in it
-   (`arrival_check.py`); `sanity.py` also wants at least 95 % of every node's lookups answered by the program, no
-   errors in its counters and no step of the wall clock.
+   (`arrival_check.py`); `sanity.py` also wants at least 97 % of the run's lookups (95 % of every node's) answered by
+   the program, no errors in its counters and no step of the wall clock, and notes the misses by cause and, per node,
+   the program's counters and time per run (`tools/overhead/arrival_stats.py`; also in `tables.py`, a row a run).
 
 What a fresh CloudLab instantiation would miss without step 2 and 3: the app
 images' issuer (the agent then self-issues budgets, the fallback) and our

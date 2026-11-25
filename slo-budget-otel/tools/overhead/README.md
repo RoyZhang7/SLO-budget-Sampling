@@ -81,7 +81,9 @@ the connections in the order they ask.
    and achieved req/s, app-pod CPU per request (traced services; the data stores apart), agent
    DaemonSet cores, `arrivald`'s (E), the central's cores (C to E), Jaeger + Elasticsearch cores and the
    app nodes' cores as a whole; for C to E the share of the offered spans the central admitted (the check
-   that they keep B's 12 %), for E the share of arrivals that came from the program.
+   that they keep B's 12 %), for E the share of arrivals that came from the program; and one row per E run with that
+   share inside the load (under 97 %: FLAG), the misses by cause, and per node (one program, one set of counters) the
+   program's counters and time per run (`arrival_stats.py`).
 
 CPU comes from the kubelet summary API (`cpu_snapshot.py`: cumulative usageCoreNanoSeconds per
 container and per node, each with the time it was sampled) before and after each load.  Cluster time:
