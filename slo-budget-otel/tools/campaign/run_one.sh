@@ -39,8 +39,15 @@ case "$CALLGRAPH" in /*) ;; *) CALLGRAPH=$MOD/$CALLGRAPH ;; esac
 IMG=10.10.1.1:30000/otelcol-slobudget:$IMAGE_TAG
 # shellcheck disable=SC1091
 source "$MOD/tools/campaign/faults.env"
-if [ "$ARRIVAL" = 1 ] || [ -n "$VARIANT${OWN_MEASURE:-}" ] || [ "$(basename "$CALLGRAPH")" != callgraph.json ]; then   # not a plain arm: a label and a directory of its own
-    { [ -n "$VARIANT" ] && [ -n "${RUN_ID:-}" ]; } || { echo "ARRIVAL, OWN_MEASURE, CALLGRAPH and VARIANT need a VARIANT and a RUN_ID of their own"; exit 2; }
+# the late_everywhere fault from the queue line (2026-11-26, the overshoot runs): LATE_MODE=spin LATE_LEVEL=7 override faults.env;
+# LATE_MODE=burn takes its threads from LATE_LEVEL too and its per-pod CPU quota from LATE_LIMIT (quota_us/period_us, e.g.
+# 62000/10000 = 6.2 CPUs, the calibration's 83.7 % over-SLO setting); fault.json records the mode, the level and the limit
+[ -n "${LATE_MODE:-}" ] && LATE_EVERYWHERE_MODE=$LATE_MODE
+[ -n "${LATE_LEVEL:-}" ] && { FAULT_LEVEL_ALL=$LATE_LEVEL; BURN_THREADS_ALL=$LATE_LEVEL; }
+[ -n "${LATE_LIMIT:-}" ] && BURN_LIMIT_ALL=$LATE_LIMIT
+if [ "$ARRIVAL" = 1 ] || [ -n "$VARIANT${OWN_MEASURE:-}${LATE_MODE:-}${LATE_LEVEL:-}${LATE_LIMIT:-}${EXPECT_BRIDGE_KIND:-}${PERIOD_DETAIL_LOG:-}${TABLE_SMOOTH:-}" ] \
+        || [ "$(basename "$CALLGRAPH")" != callgraph.json ]; then   # not a plain arm: a label and a directory of its own
+    { [ -n "$VARIANT" ] && [ -n "${RUN_ID:-}" ]; } || { echo "ARRIVAL, OWN_MEASURE, CALLGRAPH, LATE_*, EXPECT_BRIDGE_KIND, PERIOD_DETAIL_LOG, TABLE_SMOOTH and VARIANT need a VARIANT and a RUN_ID of their own"; exit 2; }
 fi
 # the overhead experiment has the cluster (a job can be appended while its runs are on): wait
 while pgrep -f '^([^ ]*/)?bash [^ ]*tools/overhead/(run_overhead|overhead_queue|knee|live_check)\.sh' > /dev/null; do sleep 30; done
@@ -120,10 +127,11 @@ for x in json.load(sys.stdin)['items']:
     n = x['metadata']['name']
     if '-service-pb-es-ctr' in n and 'tracepressure' not in n:
         e = {v['name']: v.get('value') for v in x['spec']['template']['spec']['containers'][0].get('env') or []}
-        if e.get('BRIDGE_KIND', 'pb') != 'pb' or 'OTEL_SAMPLE_RATIO' in e or 'SLO_BUDGET_PORT' in e:
+        if e.get('BRIDGE_KIND', 'pb') != '${EXPECT_BRIDGE_KIND:-pb}' or 'OTEL_SAMPLE_RATIO' in e or 'SLO_BUDGET_PORT' in e:
             print(n, end=' ')
 ") || fail "kubectl get deploy,ds"
-[ -z "$BADENV" ] || fail "the services' env is not the campaign's (an overhead run's?): $BADENV"
+# EXPECT_BRIDGE_KIND=<kind> (the bridge-kind runs, 2026-11-26): the services must carry that BRIDGE_KIND instead of the campaign's pb
+[ -z "$BADENV" ] || fail "the services' env is not the expected one (BRIDGE_KIND=${EXPECT_BRIDGE_KIND:-pb}, no OTEL_SAMPLE_RATIO / SLO_BUDGET_PORT): $BADENV"
 if [ "$ARRIVAL" = 1 ]; then
     docker run --rm --entrypoint /arrivald "$IMG" -version > "$RD/arrivald-version" 2>&1 || arrival_fail "no arrivald in $IMG: $(tail -1 "$RD/arrivald-version")"
 fi

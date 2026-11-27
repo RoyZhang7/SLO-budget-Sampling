@@ -14,7 +14,7 @@
 //   - at each period's end the service sends the dropped spans still uncounted as a count record (a span of its own with
 //     slobudget.count_record, the period and slobudget.dropped_before; the agent counts it and drops it), so that a quiet
 //     service's drops reach the agent in their period;
-//   - the plan coin is compared with the rate times a headroom of 1.05 (the agent applies the exact rate with the same
+//   - the plan coin is compared with the rate times a headroom of 1.10 (the agent applies the exact rate with the same
 //     coin, so the kept set does not change; the headroom covers a rate that rose since the filter's table).
 //
 // With the filter on, every draw of the agent is a function of the span id too (slobudget coin_source: span).
@@ -40,7 +40,7 @@ const (
 	CountSpanName    = "slobudget.count"          // the record's span name
 
 	// RateHeadroom: the plan coin passes under rate x headroom (the agent decides at the exact rate with the same coin).
-	RateHeadroom = 1.05
+	RateHeadroom = 1.10 // 2026-11-26: raised from 1.05 (the proof on the 100 % exports still dropped kept spans at 1.05)
 )
 
 // Poll is what the agent serves at /slobudget/sdk when the filter is on (a superset of the issuer's).
@@ -48,8 +48,8 @@ type Poll struct {
 	Version int                                      `json:"version"`
 	Period  int64                                    `json:"period"`
 	PeriodS float64                                  `json:"period_s"` // the period length, s (the count records' clock)
-	BTable  map[string]map[string]map[string]float64 `json:"btable"` // route -> class -> service -> b (s)
-	PlanP   map[string]float64                       `json:"plan_p"` // service -> ordinary-span rate
+	BTable  map[string]map[string]map[string]float64 `json:"btable"`   // route -> class -> service -> b (s)
+	PlanP   map[string]float64                       `json:"plan_p"`   // service -> ordinary-span rate
 }
 
 // Interval is a client span's [start, end) in unix ns.
@@ -108,8 +108,8 @@ type CountRecord struct {
 // Stats counts the filter's outcomes.
 type Stats struct {
 	Roots, Clients, ClientsDropped, Servers, Exported, Errors, Outliers, Plan, NoArrival, NoThreshold, Dropped int64
-	CountRecords int64         // period-end records sent
-	Staleness    time.Duration // the newest version's age at the last decision
+	CountRecords                                                                                               int64         // period-end records sent
+	Staleness                                                                                                  time.Duration // the newest version's age at the last decision
 }
 
 // Decision says whether to export a server span and what to stamp on it.

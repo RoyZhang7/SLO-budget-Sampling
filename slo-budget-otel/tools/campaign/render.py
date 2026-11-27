@@ -80,6 +80,9 @@ def sampler_overrides(arm: str) -> str:
     # handler (default) | within_service (the own time counts from the request's arrival; needs --arrival)
     if os.environ.get("OWN_MEASURE"):
         lines += [f"own_measure: {os.environ['OWN_MEASURE']}"]
+    # threshold smoothing K (table_smooth): unset = the image's default (6 from 2026-11-26 on; earlier images had none, K = 1)
+    if os.environ.get("TABLE_SMOOTH"):
+        lines += [f"table_smooth: {int(os.environ['TABLE_SMOOTH'])}"]
     return "".join(ln + "\n" for ln in lines)
 
 
@@ -103,6 +106,10 @@ def agent_config(arm: str, frac: float, v_star: float, seed: int, port: int, sha
 """
         # Stage 2d: hold each non-root server span until its CLIENT children are in (own time)
         sb += f"  server_hold: {os.environ.get('SERVER_HOLD', '200ms')}\n"
+        # the cheap per-service detail log (live b, N_need coin drops, host pool left) with PERIOD_DETAIL_LOG=1 (2026-11-26); the
+        # key is left out otherwise, so that an image built before it existed (it rejects unknown keys) still takes the config
+        if os.environ.get("PERIOD_DETAIL_LOG") == "1":
+            sb += "  period_detail_log: true\n"
         if arm == "keep-parent":
             sb += "  keep_parent_anchor: true\n"
         if arrival:

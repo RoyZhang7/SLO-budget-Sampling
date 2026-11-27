@@ -253,6 +253,7 @@ class Calibrator:
         # a frozen service whose samples were purged still needs its keys rebuilt
         keys |= {(r, c) for (r, c, _) in self.L}
         table, btab, Ltab, Otab = {}, {}, {}, {}
+        held_keys: set = set()          # the keys of frozen services that kept their b: published as held, not smoothed
         empty = ([], [], [])
         for route, cls in keys:
             if route not in self.routes_slo or route not in self.graph.root:
@@ -291,6 +292,7 @@ class Calibrator:
             for svc, Tv in Tsplit.items():
                 table[(route, cls, svc)] = Tv
                 btab[(route, cls, svc)] = bsplit[svc]
+            held_keys |= {(route, cls, svc) for svc in held_b}
             for svc in L:
                 Ltab[(route, cls, svc)] = L[svc]
                 Otab[(route, cls, svc)] = O[svc]
@@ -302,6 +304,9 @@ class Calibrator:
         else:
             self.b = {}
             for key in btab:
+                if key in held_keys:
+                    self.b[key] = btab[key]                 # the freeze is kept: a frozen service's b does not move
+                    continue
                 vals = [h[key] for h in self._braw if key in h]
                 self.b[key] = sum(vals) / len(vals)
         self.calibrated.update((r, s) for (r, _, s) in table)

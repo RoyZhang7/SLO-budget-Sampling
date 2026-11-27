@@ -10,6 +10,7 @@ PY=~/slo-budget-sim/.venv/bin/python3                      # has numpy; the tool
 $PY tools/eval/eval_run.py /storage/royno7/stage3/runs/<run_id> [--sim ~/slo-budget-sim] \
     [--callgraph deploy/callgraph.json] [--recon ~/bin/recon | --no-recon] [--out FILE] [--print]
 $PY tools/eval/tables.py /storage/royno7/stage3/runs --volume 0.12 [--scenarios steady saturated] [--seeds 1 2 3] [--json]
+$PY tools/eval/compare_arms.py /storage/royno7/stage3/runs --volume 0.12 --base chosen-ebpf --other chosen-handler [--title T]   # one arm against another, a difference row per scenario
 $PY -m pytest -q tools/eval/tests                         # fixture arithmetic
 $PY tools/eval/make_fake_run.py <100 % Jaeger export> OUT [--frac 0.12] [--fault-service socialgraph]   # dev only
 $PY tools/eval/burst_phase.py RUN_DIR...                  # burner runs, before the tables: burst_phase.json, the bursts' position in the quota period

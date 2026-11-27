@@ -37,7 +37,7 @@ func feedChain(c *Calibrator, durMs [3]float64, n int, frozen map[string]bool) m
 }
 
 func TestFrozenServiceKeepsItsT(t *testing.T) {
-	c, err := NewCalibrator(chainGraph(), map[string]float64{"r": 0.012}, 0.95, 20, 1, false, "none")
+	c, err := NewCalibrator(chainGraph(), map[string]float64{"r": 0.012}, 0.95, 20, 1, false, "none", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestFrozenServiceKeepsItsT(t *testing.T) {
 }
 
 func TestFrozenBeforeAnyTableFallsBackToThePlainSplit(t *testing.T) {
-	c, _ := NewCalibrator(chainGraph(), map[string]float64{"r": 0.012}, 0.95, 20, 1, true, "none")
+	c, _ := NewCalibrator(chainGraph(), map[string]float64{"r": 0.012}, 0.95, 20, 1, true, "none", 1)
 	t0 := feedChain(c, [3]float64{6, 2, 1}, 60, map[string]bool{"b": true})
 	if math.Abs(t0["a"]-0.012) > 1e-12 {
 		t.Fatalf("root T %v", t0["a"])

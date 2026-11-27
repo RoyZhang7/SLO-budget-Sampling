@@ -138,7 +138,7 @@ def replay(corpus: Corpus, sampler: Sampler, v_star: float, cap: float, seed: in
         st.cost_pre += cost
         if cost_in_period + cost > cap + 1e-9:          # the collector admits at most `cap` span units per period
             st.dropped["cap"] = st.dropped.get("cap", 0) + 1
-            drop_reason[idx] = "cap"
+            drop_reason[idx] = "cap:" + reason       # what the span would have been kept for
         else:
             record(idx, p, reason, per, when, cost)
             drop_reason[idx] = ""

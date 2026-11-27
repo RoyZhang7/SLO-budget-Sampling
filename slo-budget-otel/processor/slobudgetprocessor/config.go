@@ -50,6 +50,11 @@ type Config struct {
 	ServerHold time.Duration `mapstructure:"server_hold"`
 	// StatsLog logs the period stats line.
 	StatsLog bool `mapstructure:"stats_log"`
+	// PeriodDetailLog (off by default) adds at each period's end one "slobudget service" line per service seen (the live
+	// thresholds b in force per table key in ms, N_need, the outliers the N_need rule counted and its coin dropped, frozen)
+	// and one "slobudget pool" line (the host pool at the period's start and what was left of it at its end).  Cheap: a
+	// pass over the table per service once a period; on the span path only a counter.
+	PeriodDetailLog bool `mapstructure:"period_detail_log"`
 	// BudgetSource: "propagated" takes the request's budget from the SDK's slo.budget
 	// attribute (issued at the root, carried in the trace's baggage) and issues it here only
 	// for requests that carry none; "self" always issues it here.

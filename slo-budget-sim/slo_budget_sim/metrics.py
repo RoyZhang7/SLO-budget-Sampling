@@ -174,7 +174,7 @@ REASON_GROUPS = ("budget", "pool", "n_need", "credit", "k_cap", "credit_coin", "
 
 
 def _group(reason: str) -> str:
-    return REASON_GROUP.get(reason, "arm")      # "arm": a baseline's own rule (head coin, rate coin, reservoir)
+    return REASON_GROUP.get(reason.split(":")[0], "arm")      # "arm": a baseline's own rule (head coin, rate coin, reservoir)
 
 
 def _truth_block(corpus: Corpus, A: CorpusArrays, res: RunResult, truth: str, c: dict) -> dict:

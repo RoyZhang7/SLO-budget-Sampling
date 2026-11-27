@@ -28,7 +28,8 @@ the scenario and the same collector cap = cap_factor * V*.
               vs the full-duration trigger (m = 0.1) on chosen-v2, at 25, 12, 5%, every scenario plus
               the drift workload's steady and saturated; every metric under both truths
   exp16       Stage 2d A4: trace-consistent plan coin and decaying N_need counts on the own trigger
-              (exp14-16 are pinned to the Stage 2c freeze release, freeze_release=1, since Stage 3)
+              (exp14-16 are pinned to the Stage 2c freeze release, freeze_release=1, since Stage 3, and to
+              table_smooth=1 since the default became 6 on 2026-11-26)
 
 Every experiment is resumable: rows already in results/<exp>.csv for the same
 (scenario, seed, arm, label, volume, overrides, workload / scenario tag) are
@@ -93,7 +94,10 @@ VOLUMES = (0.25, 0.12, 0.05)
 # BudgetConfig fields added after the result rows of passes 1-5 were written: they enter the
 # config hash only when set away from their default, so those rows stay valid
 HASH_OPTIONAL = {"n_need_healthy": False, "plan_coin": "span", "n_need_decay": 0.0, "own_measure": "handler",      # outlier_margin always enters the hash since its default moved to 0.1 (Stage 2c)
-                 "freeze_release": 1}       # Stage 3: rows before the field existed used the release at the first quiet period
+                 "freeze_release": 1,       # Stage 3: rows before the field existed used the release at the first quiet period
+                 # fields added later enter the hash only away from the behaviour that existed before them (2026-11-26): no
+                 # smoothing (table_smooth 1), the seeded draws (coin_source rng), today's budget rule
+                 "coin_source": "rng", "table_smooth": 1, "outlier_policy": "nneed", "pool_follow_demand": False, "pool_demand_floor": 0.05}
 # Stage 2d: outlier_trigger and own_margin enter the hash only for the own trigger, so that a
 # duration-trigger configuration hashes as it did before the fields existed
 TRIGGER_VARIANTS = [("duration m=0.1", {"outlier_trigger": "duration", "outlier_margin": 0.1})] + [
@@ -367,7 +371,7 @@ def exp14_jobs(seeds: list[int], extra: dict | None = None) -> list[Job]:
     misses beyond the service's healthy over-T rate), at 25, 12 and 5%, on every
     scenario of the fitted workload and of the drift variant, plus steady on the
     heavytail refit."""
-    return [Job("exp14", sc, sd, "chosen-v2", label, {"outlier_trigger": "duration", "freeze_release": 1, **(extra or {}), **ov},
+    return [Job("exp14", sc, sd, "chosen-v2", label, {"outlier_trigger": "duration", "freeze_release": 1, "table_smooth": 1, **(extra or {}), **ov},
                 volume_frac=vf)
             for vf in VOLUMES for sc in EXP14_SCENARIOS for sd in seeds for label, ov in RULE_VARIANTS]
 
@@ -377,14 +381,14 @@ def exp15_jobs(seeds: list[int], extra: dict | None = None) -> list[Job]:
     share of the square-root split; m in 0, 0.1, 0.2, 0.3) vs the full-duration trigger
     (duration > 1.1 T_i, the Stage 2c rule) on chosen-v2, at 25, 12 and 5%, on every
     scenario plus the drift workload's steady and saturated."""
-    return [Job("exp15", sc, sd, "chosen-v2", label, {"freeze_release": 1, **(extra or {}), **ov}, volume_frac=vf)
+    return [Job("exp15", sc, sd, "chosen-v2", label, {"freeze_release": 1, "table_smooth": 1, **(extra or {}), **ov}, volume_frac=vf)
             for vf in VOLUMES for sc in EXP15_SCENARIOS for sd in seeds for label, ov in TRIGGER_VARIANTS]
 
 
 def exp16_jobs(seeds: list[int], extra: dict | None = None) -> list[Job]:
     """Stage 2d A4 on the own trigger: the trace-consistent plan coin and N_need
     counts that decay (d = 0.25, 0.5, 0.75) instead of resetting each period."""
-    return [Job("exp16", sc, sd, "chosen-v2", label, {"freeze_release": 1, **(extra or {}), **ov}, volume_frac=vf)
+    return [Job("exp16", sc, sd, "chosen-v2", label, {"freeze_release": 1, "table_smooth": 1, **(extra or {}), **ov}, volume_frac=vf)
             for vf in VOLUMES for sc in SCENARIOS for sd in seeds for label, ov in A4_VARIANTS]
 
 
@@ -920,7 +924,7 @@ def _ov_key(text: str) -> str:
     # an explicit duration trigger is what every row written before Stage 2d ran, and the
     # Stage 2c freeze release what every row written before Stage 3 ran; the config hash
     # tells the other rows apart
-    return " ".join(t for t in (text or "").split() if t not in ("outlier_trigger=duration", "freeze_release=1"))
+    return " ".join(t for t in (text or "").split() if t not in ("outlier_trigger=duration", "freeze_release=1", "table_smooth=1"))
 
 
 def _job_key(j: Job) -> tuple:

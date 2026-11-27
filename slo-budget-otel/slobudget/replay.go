@@ -85,7 +85,7 @@ func Replay(c *Corpus, cfg Config, vStar, cap float64, seed uint64, oracle *Cali
 		st.CostPre += cost
 		if costInPeriod+cost > cap+1e-9 {
 			st.Dropped["cap"]++
-			res.Decisions[idx] = Decision{false, p, "cap"}
+			res.Decisions[idx] = Decision{false, p, "cap:" + reason} // what the span would have been kept for (replay.py)
 			return
 		}
 		costInPeriod += cost

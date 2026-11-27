@@ -287,6 +287,9 @@ type Calibrator struct {
 	MinClassSamples int
 	Window          int
 	UseClass        bool
+	// Smooth K (table_smooth): the published B of a key is the mean of its last K calibrations' raw values.
+	Smooth int
+	braw   []map[TableKey]float64 // the last K raw b tables, oldest first
 
 	buf   []map[TableKey]*samples // the last `window` closed periods, oldest first
 	cur   map[TableKey]*samples
@@ -295,11 +298,11 @@ type Calibrator struct {
 	L     map[TableKey]float64
 	O     map[TableKey]float64
 	// Freeze holds the services whose previous L, O are reused at the next rebuild.
-	Freeze     map[string]bool
+	Freeze map[string]bool
 	// UseOwn feeds the observed own-time quantiles O into the split (the simulator's
 	// default); false derives own time from the inclusive quantiles (L minus the
 	// callees' L), for stacks where the stamped own time is unreliable.
-	UseOwn     bool
+	UseOwn bool
 	// Within: the samples start at the request's arrival (Span.Wait), not at the handler's start
 	// (own_measure within_service).
 	Within     bool
@@ -312,11 +315,14 @@ type Calibrator struct {
 
 // NewCalibrator mirrors Calibrator.__init__; prior is "none", "equal" or
 // "file" (seeded through SeedPrior).
-func NewCalibrator(g *CallGraph, routesSLO map[string]float64, q float64, minClassSamples, window int, useClass bool, prior string) (*Calibrator, error) {
+func NewCalibrator(g *CallGraph, routesSLO map[string]float64, q float64, minClassSamples, window int, useClass bool, prior string, smooth int) (*Calibrator, error) {
 	if window < 1 {
 		window = 1
 	}
-	c := &Calibrator{Graph: g, RoutesSLO: routesSLO, Q: q, MinClassSamples: minClassSamples, Window: window, UseClass: useClass, UseOwn: true,
+	if smooth < 1 {
+		smooth = 1
+	}
+	c := &Calibrator{Graph: g, RoutesSLO: routesSLO, Q: q, MinClassSamples: minClassSamples, Window: window, UseClass: useClass, UseOwn: true, Smooth: smooth,
 		cur: map[TableKey]*samples{}, Table: map[TableKey]float64{}, B: map[TableKey]float64{}, L: map[TableKey]float64{},
 		O: map[TableKey]float64{}, Freeze: map[string]bool{}, PriorTable: map[[2]string]float64{}, PriorB: map[[2]string]float64{},
 		Calibrated: map[[2]string]bool{}}
@@ -449,6 +455,7 @@ func (c *Calibrator) rebuild(merged map[TableKey]*samples) {
 		keys[[2]string{k.Route, k.Class}] = true
 	}
 	table, btab, Ltab, Otab := map[TableKey]float64{}, map[TableKey]float64{}, map[TableKey]float64{}, map[TableKey]float64{}
+	heldKeys := map[TableKey]bool{} // the keys of frozen services that kept their b: published as held, not smoothed
 	empty := &samples{}
 	for rc := range keys {
 		route, cls := rc[0], rc[1]
@@ -517,6 +524,9 @@ func (c *Calibrator) rebuild(merged map[TableKey]*samples) {
 			Oused = nil
 		}
 		Tsplit, bsplit := SplitBudgets(slo, L, c.Graph, route, Oused, heldT, heldB)
+		for _, svc := range heldB.keys { // the keys of frozen services that kept their b
+			heldKeys[TableKey{route, cls, svc}] = true
+		}
 		for _, svc := range Tsplit.keys {
 			table[TableKey{route, cls, svc}] = Tsplit.vals[svc]
 			btab[TableKey{route, cls, svc}] = bsplit.vals[svc]
@@ -526,7 +536,29 @@ func (c *Calibrator) rebuild(merged map[TableKey]*samples) {
 			Otab[TableKey{route, cls, svc}] = O.vals[svc]
 		}
 	}
-	c.Table, c.B, c.L, c.O = table, btab, Ltab, Otab
+	// the published b: the mean of the last Smooth raw tables (Calibrator.rebuild's _braw in Python), the latest alone when 1
+	c.braw = append(c.braw, btab)
+	if len(c.braw) > c.Smooth {
+		c.braw = c.braw[len(c.braw)-c.Smooth:]
+	}
+	bpub := btab
+	if c.Smooth > 1 {
+		bpub = make(map[TableKey]float64, len(btab))
+		for k := range btab {
+			if heldKeys[k] { // the freeze is kept: a frozen service's b does not move
+				bpub[k] = btab[k]
+				continue
+			}
+			vals := make([]float64, 0, len(c.braw))
+			for _, h := range c.braw {
+				if v, ok := h[k]; ok {
+					vals = append(vals, v)
+				}
+			}
+			bpub[k] = PySum(vals) / float64(len(vals)) // Python's sum(): bit-identical b
+		}
+	}
+	c.Table, c.B, c.L, c.O = table, bpub, Ltab, Otab
 	for k := range table {
 		c.Calibrated[[2]string{k.Route, k.Service}] = true
 	}
@@ -575,7 +607,7 @@ func (c *Calibrator) HasTable() bool { return len(c.Table) > 0 }
 // OracleTable is ttable.oracle_table: the calibration procedure on complete
 // (p = 1) data from a healthy reference corpus.
 func OracleTable(reference *Corpus, q float64, useClass bool) *Calibrator {
-	c, _ := NewCalibrator(reference.Graph, reference.RoutesSLO, q, MinSamples, 1, useClass, "none")
+	c, _ := NewCalibrator(reference.Graph, reference.RoutesSLO, q, MinSamples, 1, useClass, "none", 1)
 	for i := range reference.Spans {
 		c.Observe(&reference.Spans[i], 1.0)
 	}

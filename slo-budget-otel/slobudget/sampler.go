@@ -45,7 +45,7 @@ type Sampler struct {
 	Cfg    Config
 	Cal    *Calibrator // the per-period calibration (nil only when calib_source is oracle)
 	Oracle *Calibrator // the ground-truth table (tests, calib_source oracle)
-	rng    coins // the seeded stream (PyRandom), or the deciding span's own draws (coin_source: span)
+	rng    coins       // the seeded stream (PyRandom), or the deciding span's own draws (coin_source: span)
 	g      func(float64) float64
 
 	calibrated  bool
@@ -62,6 +62,7 @@ type Sampler struct {
 	share       map[string]float64
 	poolFull    map[string]float64
 	pool        map[string]float64
+	poolStart   map[string]float64 // the pool each host started the period with (PoolFull)
 	planP       map[string]float64
 	svcHost     map[string]string
 	frozen      map[string]bool
@@ -71,6 +72,7 @@ type Sampler struct {
 
 	// per-period counters (reset at the period end)
 	nseen        map[string]int // outliers counted by the N_need rule (kept or coin-dropped)
+	coinDropped  map[string]int // outliers the N_need coin dropped (the agent's period_detail_log)
 	ndet         map[string]int // outliers detected (including those refused by budget / pool)
 	spansSvc     *orderedMap    // _spans_svc, ordered: its iteration order seeds N_exp's order
 	spansHost    map[string]int
@@ -102,7 +104,7 @@ func NewSampler(cfg Config, graph *CallGraph, routesSLO map[string]float64, host
 	if s.calibrated {
 		prior = cfg.ColdPrior
 	}
-	cal, err := NewCalibrator(graph, routesSLO, cfg.CalibQ, cfg.MinClassSamples, cfg.CalibWindow, cfg.UseClass, prior)
+	cal, err := NewCalibrator(graph, routesSLO, cfg.CalibQ, cfg.MinClassSamples, cfg.CalibWindow, cfg.UseClass, prior, cfg.TableSmooth)
 	if err != nil {
 		return nil, err
 	}
@@ -136,6 +138,7 @@ func NewSampler(cfg Config, graph *CallGraph, routesSLO map[string]float64, host
 	s.share = map[string]float64{}
 	s.poolFull = map[string]float64{}
 	s.pool = map[string]float64{}
+	s.poolStart = map[string]float64{}
 	n := len(s.Hosts)
 	if n < 1 {
 		n = 1
@@ -178,6 +181,7 @@ func (s *Sampler) ForceKeep(sp *Span, req *RequestState) Decision {
 
 func (s *Sampler) resetCounters() {
 	s.nseen = map[string]int{}
+	s.coinDropped = map[string]int{}
 	s.ndet = map[string]int{}
 	s.spansSvc = newOrderedMap()
 	s.spansHost = map[string]int{}
@@ -194,6 +198,7 @@ func (s *Sampler) setPools() {
 		} else {
 			s.pool[h] = full
 		}
+		s.poolStart[h] = s.pool[h]
 	}
 }
 
@@ -406,6 +411,7 @@ func (s *Sampler) decideSpan(sp *Span, req *RequestState) Decision {
 			p = math.Min(1.0, s.NNeed/float64(n)*s.g(miss))
 		}
 		if p < 1.0 && s.rng.Random() >= p {
+			s.coinDropped[svc]++
 			return Decision{false, p, "outlier_coin"}
 		}
 		d := s.spend(sp, req, p, "outlier")
@@ -622,6 +628,51 @@ func (s *Sampler) PlanP(svc string) float64 {
 		return p
 	}
 	return s.Cfg.InitialPlanP
+}
+
+// PoolFull returns the pool the host started this period with (+Inf when unbounded or unknown).  It is not poolFull,
+// which an update of the central may already have set for the next period (ApplyCentral).
+func (s *Sampler) PoolFull(host string) float64 {
+	if s.Cfg.Unbounded {
+		return math.Inf(1)
+	}
+	if p, ok := s.poolStart[host]; ok {
+		return p
+	}
+	return math.Inf(1)
+}
+
+// ServiceDetail is one service's state at a period's end for the agent's period_detail_log: the own-time shares b of the
+// calibrated table for its keys (seconds; the outlier test's thresholds under outlier_trigger own, empty while a cold prior
+// answers; T is not logged), what the N_need rule counted and what its coin dropped, and whether the service is frozen.
+type ServiceDetail struct {
+	Service     string
+	B           map[TableKey]float64
+	NSeen       int
+	CoinDropped int
+	Frozen      bool
+}
+
+// PeriodDetail returns the ServiceDetail of every service seen in the current period (in the order seen); call it
+// before ResetPeriod.  Cost: a pass over the table per service, nothing on the span path beyond the coinDropped counter.
+func (s *Sampler) PeriodDetail() []ServiceDetail {
+	tab := s.Oracle
+	if s.calibrated {
+		tab = s.Cal
+	}
+	out := make([]ServiceDetail, 0, len(s.spansSvc.keys))
+	for _, svc := range s.spansSvc.keys {
+		d := ServiceDetail{Service: svc, B: map[TableKey]float64{}, NSeen: s.nseen[svc], CoinDropped: s.coinDropped[svc], Frozen: s.frozen[svc]}
+		if tab != nil {
+			for k, b := range tab.B {
+				if k.Service == svc {
+					d.B[k] = b
+				}
+			}
+		}
+		out = append(out, d)
+	}
+	return out
 }
 
 // PoolLeft returns the host pool left in this period (+Inf when unbounded).

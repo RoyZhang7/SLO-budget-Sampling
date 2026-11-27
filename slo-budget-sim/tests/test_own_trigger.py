@@ -91,9 +91,9 @@ def test_defaults_and_hash_compatibility():
     pre_2d = {("chosen-v2", ()): "1c831dfa20", ("chosen-v2", (("outlier_margin", 0.2),)): "2c1b88020a",
               ("threshold", ()): "b32db50535", ("v2-keep-parent", ()): "693867f75f", ("chosen", ()): "513a407c67"}
     for (arm, ov), h in pre_2d.items():
-        assert _config_hash_impl(arm, {"outlier_trigger": "duration", "freeze_release": 1, **dict(ov)}) == h
+        assert _config_hash_impl(arm, {"outlier_trigger": "duration", "freeze_release": 1, "table_smooth": 1, **dict(ov)}) == h
     assert _config_hash_impl("chosen-v2", {"outlier_trigger": "duration"}) != pre_2d[("chosen-v2", ())]   # frozen source: release 3
-    assert _config_hash_impl("threshold", {"outlier_trigger": "duration"}) == pre_2d[("threshold", ())]   # kept source: no effect
+    assert _config_hash_impl("threshold", {"outlier_trigger": "duration", "table_smooth": 1}) == pre_2d[("threshold", ())]   # kept source: no effect
     assert _config_hash_impl("chosen-v2", {}) != pre_2d[("chosen-v2", ())]
     assert _config_hash_impl("chosen-v2", {"own_margin": 0.2}) != _config_hash_impl("chosen-v2", {})
 
@@ -212,7 +212,7 @@ def test_pre_2d_duration_rows_stay_valid_and_baselines_follow_the_default_truth(
     # exp14 (the Stage 2c duration-rule sweep) pins the duration trigger; a row it wrote
     # before the trigger field existed still matches the pinned job
     job = [j for j in exp14_jobs([1]) if j.label == "margin m=0.2"][0]
-    assert job.overrides == {"outlier_trigger": "duration", "freeze_release": 1, "outlier_margin": 0.2}
+    assert job.overrides == {"outlier_trigger": "duration", "freeze_release": 1, "table_smooth": 1, "outlier_margin": 0.2}
     row = {"scenario": job.scenario, "seed": 1, "arm": "chosen-v2", "label": job.label, "volume_frac": job.volume_frac,
            "overrides": "outlier_margin=0.2", "config": "2c1b88020a", "tag": _job_key(job)[-1]}
     assert _row_key(row) == _job_key(job)

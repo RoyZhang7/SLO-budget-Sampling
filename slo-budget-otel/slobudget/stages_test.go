@@ -124,7 +124,7 @@ func TestSplitStagesEqualToTheFlagChangeNothing(t *testing.T) {
 
 func TestDiscardPeriodLeavesOnlyWhatIsClosed(t *testing.T) {
 	c := chainCorpus([3]float64{6, 2, 1}, 40)
-	cal, err := NewCalibrator(c.Graph, c.RoutesSLO, 0.95, 20, 2, true, "none")
+	cal, err := NewCalibrator(c.Graph, c.RoutesSLO, 0.95, 20, 2, true, "none", 1)
 	if err != nil {
 		t.Fatal(err)
 	}

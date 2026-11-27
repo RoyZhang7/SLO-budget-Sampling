@@ -61,7 +61,7 @@ func TestSqrtSplitAndPriorOnTheChain(t *testing.T) {
 			t.Fatalf("prior T[%s] = %v, want %v", svc, prior[svc], want)
 		}
 	}
-	cal, _ := NewCalibrator(c.Graph, c.RoutesSLO, 0.95, 20, 1, true, "equal")
+	cal, _ := NewCalibrator(c.Graph, c.RoutesSLO, 0.95, 20, 1, true, "equal", 1)
 	if v, ok := cal.Lookup("r", "r|any", "c"); !ok || !approx(v, 0.004, 1e-9) || cal.PriorHits != 1 {
 		t.Fatalf("prior lookup: %v %v hits %d", v, ok, cal.PriorHits)
 	}
@@ -81,7 +81,7 @@ func TestSqrtSplitAndPriorOnTheChain(t *testing.T) {
 func TestInclusiveOwnTimeFallbackMatchesOnTheChain(t *testing.T) {
 	// on a sequential chain own = L minus the child's L exactly, so both sources give the same split
 	c := chainCorpus([3]float64{6, 2, 1}, 20)
-	cal, _ := NewCalibrator(c.Graph, c.RoutesSLO, 0.95, 20, 1, true, "none")
+	cal, _ := NewCalibrator(c.Graph, c.RoutesSLO, 0.95, 20, 1, true, "none", 1)
 	cal.UseOwn = false
 	for i := range c.Spans {
 		cal.Observe(&c.Spans[i], 1.0)

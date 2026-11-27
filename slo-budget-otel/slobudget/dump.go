@@ -47,7 +47,7 @@ type EventsDump struct {
 		NBytes    []int     `json:"nbytes"`
 		Transit   []float64 `json:"transit"`
 		Own       []float64 `json:"own"`
-		Wait      []float64 `json:"wait"` // absent: no span has an arrival
+		Wait      []float64 `json:"wait"`           // absent: no span has an arrival
 		Dropped   []int     `json:"dropped_before"` // absent: no in-service filter
 	} `json:"spans"`
 	// an in-service filter's count records, handed to the sampler at the period's end (before on_period_end)
@@ -87,8 +87,20 @@ func LoadEvents(path string) (*EventsDump, *Corpus, error) {
 	}
 	var d EventsDump
 	d.Config = DefaultConfig()
+	d.Config.TableSmooth = 1 // a dump written before table_smooth existed: the simulator published the latest b alone
 	if err := json.Unmarshal(raw, &d); err != nil {
 		return nil, nil, fmt.Errorf("%s: %w", path, err)
+	}
+	// rule options of the simulator that the port does not have: a dump that sets one would replay under another rule
+	var probe struct {
+		Config map[string]any `json:"config"`
+	}
+	if err := json.Unmarshal(raw, &probe); err == nil {
+		for key, def := range map[string]string{"outlier_policy": "nneed", "pool_follow_demand": "false"} {
+			if v, ok := probe.Config[key]; ok && fmt.Sprint(v) != def {
+				return nil, nil, fmt.Errorf("%s: %s=%v is a simulator option the Go port does not have", path, key, v)
+			}
+		}
 	}
 	n := len(d.Spans.SpanID)
 	c := &Corpus{Name: d.Name, RoutesSLO: d.RoutesSLO, Hosts: d.Hosts, HostSkew: d.HostSkew, Period: d.Period, T0: d.T0,
@@ -135,7 +147,7 @@ func OracleFromDump(d *EventsDump, graph *CallGraph) *Calibrator {
 	if d.Oracle == nil {
 		return nil
 	}
-	c, _ := NewCalibrator(graph, d.RoutesSLO, 0.95, MinSamples, 1, true, "none")
+	c, _ := NewCalibrator(graph, d.RoutesSLO, 0.95, MinSamples, 1, true, "none", 1)
 	for route, byCls := range d.Oracle {
 		for cls, bySvc := range byCls {
 			for svc, T := range bySvc {

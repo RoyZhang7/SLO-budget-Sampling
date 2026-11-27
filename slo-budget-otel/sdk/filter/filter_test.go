@@ -99,7 +99,7 @@ func TestPlanCoinIsTheIdsAndTheRateTheHigherOfTwo(t *testing.T) {
 			kept++
 		}
 	}
-	if kept < 6100 || kept > 6500 {
+	if kept < 6400 || kept > 6800 { // 0.3 x 1.10 x 20000 = 6600 (6300 at the old headroom 1.05)
 		t.Fatalf("%d of 20000 kept at the higher rate 0.3 x the headroom %.2f", kept, RateHeadroom)
 	}
 	s.Update(poll(5, 1.0, 0.05), now.Add(10*time.Second)) // the rate fell: the previous period's 0.3 still rules

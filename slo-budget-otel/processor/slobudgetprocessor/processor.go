@@ -11,6 +11,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -111,9 +112,9 @@ type agent struct {
 	// keep_parent ablation (sampler.keep_parent): span ids forced here (locally or by a
 	// peer's force-notice), span ids this agent broadcast, and recently decided span ids
 	// (to tell a late force from one that will be honoured)
-	forcedAt  map[uint64]time.Time
+	forcedAt map[uint64]time.Time
 	// keep_parent_grace: spans dropped here, kept aside for a late force (span id -> the span with its decision's facts)
-	lateBuf map[uint64]*lateSpan
+	lateBuf   map[uint64]*lateSpan
 	sentForce map[uint64]time.Time
 	decided   map[uint64]decidedSpan
 
@@ -144,7 +145,7 @@ type agentCounters struct {
 	// server_hold: spans held, client spans that arrived after their parent was released
 	// (own time overestimated), summed hold time, peak spans and bytes held at once
 	srvHeld, srvLateClients, srvHeldPeak, srvBytesPeak int
-	srvHoldNs                                         int64
+	srvHoldNs                                          int64
 }
 
 func newAgent(set processor.Settings, cfg *Config, next consumer.Traces) (*agent, error) {
@@ -831,6 +832,28 @@ func (a *agent) flushLoop(ctx context.Context) {
 	}
 }
 
+// bString renders a service's thresholds for the detail log: "route|class=ms;...", keys sorted.
+func bString(b map[slobudget.TableKey]float64) string {
+	keys := make([]slobudget.TableKey, 0, len(b))
+	for k := range b {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].Route != keys[j].Route {
+			return keys[i].Route < keys[j].Route
+		}
+		return keys[i].Class < keys[j].Class
+	})
+	var sb strings.Builder
+	for i, k := range keys {
+		if i > 0 {
+			sb.WriteByte(';')
+		}
+		fmt.Fprintf(&sb, "%s|%s=%.3f", k.Route, k.Class, b[k]*1e3)
+	}
+	return sb.String()
+}
+
 // periodLoop closes periods on wall-clock boundaries: report, reset, pull config.
 func (a *agent) periodLoop(ctx context.Context) {
 	defer a.wg.Done()
@@ -853,6 +876,11 @@ func (a *agent) periodLoop(ctx context.Context) {
 		var arrived []zap.Field
 		if a.arr != nil {
 			arrived = a.arr.Take()
+		}
+		var detail []slobudget.ServiceDetail // period_detail_log: read before the reset refills the pools and clears the counters
+		var poolFull, poolLeft, nNeed float64
+		if a.cfg.PeriodDetailLog {
+			detail, poolFull, poolLeft, nNeed = a.s.PeriodDetail(), a.s.PoolFull(a.host), a.s.PoolLeft(a.host), a.s.NNeed
 		}
 		a.s.ResetPeriod()
 		a.lastStat = st
@@ -886,6 +914,14 @@ func (a *agent) periodLoop(ctx context.Context) {
 				a.log.Info("slobudget arrival", append([]zap.Field{zap.Int64("period", st.Period)}, arrived...)...)
 			}
 		}
+		if a.cfg.PeriodDetailLog {
+			for _, d := range detail {
+				a.log.Info("slobudget service", zap.Int64("period", st.Period), zap.String("service", d.Service), zap.String("b_ms", bString(d.B)),
+					zap.Float64("n_need", nNeed), zap.Int("n_seen", d.NSeen), zap.Int("dropped_n_need", d.CoinDropped), zap.Bool("frozen", d.Frozen))
+			}
+			a.log.Info("slobudget pool", zap.Int64("period", st.Period), zap.String("host", a.host), zap.Float64("pool_full", poolFull),
+				zap.Float64("pool_left", poolLeft))
+		}
 		if a.cfg.Central != "" {
 			a.postStats(ctx, st)
 			a.pullConfig(ctx, false)
@@ -902,9 +938,9 @@ func (a *agent) handleSDK(w http.ResponseWriter, r *http.Request) {
 		B       float64                                  `json:"b"`
 		Host    string                                   `json:"host"`
 		Period  float64                                  `json:"period_s"`
-		Per     int64                                    `json:"period"`            // the update's period
-		BTable  map[string]map[string]map[string]float64 `json:"btable,omitempty"`  // route -> class -> service -> b (s): the in-service filter's thresholds
-		PlanP   map[string]float64                       `json:"plan_p,omitempty"`  // service -> ordinary-span rate: its plan coin's rate
+		Per     int64                                    `json:"period"`           // the update's period
+		BTable  map[string]map[string]map[string]float64 `json:"btable,omitempty"` // route -> class -> service -> b (s): the in-service filter's thresholds
+		PlanP   map[string]float64                       `json:"plan_p,omitempty"` // service -> ordinary-span rate: its plan coin's rate
 	}{a.version, a.s.B, a.host, a.cfg.Period.Seconds(), a.last.Period, a.last.BTable, a.last.PlanP}
 	a.stats.sdkPolls++
 	a.mu.Unlock()

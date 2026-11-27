@@ -96,6 +96,7 @@ from .ttable import PRIORS, Calibrator
 
 ROOT_POLICIES = ("pin", "on_demand", "record", "plan")
 OUTLIER_TRIGGERS = ("own", "duration")
+OUTLIER_POLICIES = ("nneed", "first", "nneed_when_ahead")
 OWN_MEASURES = ("handler", "within_service")
 PLAN_COINS = ("span", "trace", "hash")
 
@@ -218,7 +219,8 @@ class BudgetConfig:
     alpha: float = 0.5              # refill damping
     calib_q: float = 0.95           # calibration percentile for T_i
     calib_window: int = 2           # periods of kept spans used for calibration
-    table_smooth: int = 1           # the published b: mean of the last K calibrations (1: the latest alone); the freeze is kept
+    table_smooth: int = 6           # the published b: mean of the last K calibrations (1: the latest alone); the freeze is kept;
+                                    # 6 since 2026-11-26 (the smoothing study; 1 was today's 5-second recalculation)
     min_class_samples: int = 20     # class key falls back to the route key below this
     use_class: bool = True          # key T_i by (service, root, class) rather than (service, root)
     plan: str = "uniform"           # uniform | sqrt   (ordinary-span plan weights)
@@ -255,6 +257,14 @@ class BudgetConfig:
     initial_budget: float = 3.0     # per-request budget before the first refill
     initial_plan_p: float = 0.15    # ordinary-span rate before the first plan
     pool_factor: float = 1.0        # host pool = pool_factor * V* * host share
+    # the budget-rule study (2026-11-26): how outliers meet the budget, and how the host pools are sized
+    outlier_policy: str = "nneed"   # nneed: today's rule | first: every outlier kept at p = 1 while its host's pool (its
+                                    # share of the period's target) has room, neither N_need nor the request budget applies
+                                    # to outliers, the plan fills the rest | nneed_when_ahead: today's N_need coin only while
+                                    # the host's spend is ahead of pace within the period
+    pool_follow_demand: bool = False  # each period the hosts' pools are reassigned in proportion to last period's outlier
+                                      # demand (outliers detected per host), total unchanged, pool_demand_floor share each
+    pool_demand_floor: float = 0.05
     b_min: float = 0.05             # B below 1 means most requests get budget 0 (root only)
     b_max: float = 64.0
     rate_ewma: float = 0.5          # smoothing of expected requests / counts
@@ -298,6 +308,10 @@ class BudgetConfig:
             raise ValueError("n_need_decay must be in [0, 1)")
         if int(self.table_smooth) < 1:
             raise ValueError("table_smooth must be >= 1")
+        if self.outlier_policy not in OUTLIER_POLICIES:
+            raise ValueError(f"unknown outlier_policy {self.outlier_policy}; choose from {OUTLIER_POLICIES}")
+        if not 0.0 <= self.pool_demand_floor < 1.0:
+            raise ValueError("pool_demand_floor must be in [0, 1)")
 
 
 def _growth(rule: str):
@@ -372,12 +386,15 @@ class BudgetSampler(Sampler):
         self._frozen: set[str] = set()
         self._healthy_rate: dict[str, float] = {}
         self._quiet: dict[str, int] = {}             # frozen services: consecutive periods below the trigger
+        self._period_idx = 0                         # the current period's index (pace of the spend)
+        self._t = corpus.t0
         self._reset_counters()
         self._exhausted_reason = ""
 
     def _reset_counters(self) -> None:
         self._nseen: dict[str, int] = {}     # outliers counted by the N_need rule (kept or coin-dropped)
         self._ndet: dict[str, int] = {}      # outliers detected (including those refused by budget / pool)
+        self._ndet_host: dict[str, int] = {}  # the same per host: the outlier demand the pools may follow
         self._spans_svc: dict[str, int] = {}
         self._spans_host: dict[str, int] = {}
         self._requests = 0
@@ -503,8 +520,8 @@ class BudgetSampler(Sampler):
         # reaches the collector either way (record or full span), so the stamp is 1
         return True, (1.0 if self.cfg.root_policy == "record" else p), reason
 
-    def _spend(self, span: Span, req: RequestState, p: float, reason: str) -> tuple[bool, float, str]:
-        bypass = reason == "escalate" and self.cfg.escalate_bypass_budget
+    def _spend(self, span: Span, req: RequestState, p: float, reason: str, skip_budget: bool = False) -> tuple[bool, float, str]:
+        bypass = skip_budget or (reason == "escalate" and self.cfg.escalate_bypass_budget)
         if self._exhausted(span, req, skip_budget=bypass):
             return False, p, self._exhausted_reason
         if not self.cfg.unbounded:
@@ -593,6 +610,16 @@ class BudgetSampler(Sampler):
         outlier, miss = self._outlier_test(span)
         if outlier:
             self._ndet[svc] = self._ndet.get(svc, 0) + 1
+            self._ndet_host[span.host] = self._ndet_host.get(span.host, 0) + 1
+            if cfg.outlier_policy == "first":
+                # outliers first: kept while the host's share of the target has room; no N_need, no request budget
+                if self._pool.get(span.host, math.inf) <= 0:
+                    return False, 0.0, "pool"
+                self._nseen[svc] = self._nseen.get(svc, 0) + 1
+                keep, p, reason = self._spend(span, req, 1.0, "outlier", skip_budget=True)
+                if keep and cfg.keep_parent and span.parent_idx >= 0:
+                    self._forced.add(span.parent_idx)
+                return keep, p, reason
             if self._exhausted(span, req):
                 return self._try_credit(span, req, miss, self._exhausted_reason)
             n = self._nseen.get(svc, 0) + 1
@@ -602,7 +629,8 @@ class BudgetSampler(Sampler):
                 h = self._healthy_rate.get(svc)
                 if h is not None and h > 0.0:
                     n = max(1.0, n - h * self._spans_svc.get(svc, 0))
-            p = 1.0 if n <= self.n_need else min(1.0, self.n_need / n * self._g(miss))
+            coin = cfg.outlier_policy != "nneed_when_ahead" or self._ahead_of_pace(span.host)
+            p = 1.0 if (n <= self.n_need or not coin) else min(1.0, self.n_need / n * self._g(miss))
             if p < 1.0 and self.rng.random() >= p:
                 return False, p, "outlier_coin"
             keep, p, reason = self._spend(span, req, p, "outlier")
@@ -620,6 +648,17 @@ class BudgetSampler(Sampler):
             return False, p, "plan_coin"
         return self._spend(span, req, p, "plan")
 
+    def _ahead_of_pace(self, host: str) -> bool:
+        """Has the host spent more of its pool than the elapsed share of the period (outlier_policy nneed_when_ahead)?"""
+        full = self._pool_full.get(host, math.inf)
+        if not math.isfinite(full) or full <= 0:
+            return False
+        period_len = self.ctx.corpus.period
+        frac = (self._t - (self.ctx.corpus.t0 + self._period_idx * period_len)) / period_len
+        frac = min(1.0, max(0.0, frac))
+        spent = full - self._pool.get(host, full)
+        return spent > frac * full
+
     def on_count_record(self, service: str, host: str, n: int) -> None:
         """An in-service filter's count record at a period's end: n ordinary spans of the service it dropped since its last
         report; they count as seen by the service and its host (the plan rates and the host pools)."""
@@ -629,6 +668,7 @@ class BudgetSampler(Sampler):
 
     def on_end(self, span: Span, req: RequestState, t: float) -> tuple[bool, float, str]:
         self._cur, self._draw = span.span_id, 0
+        self._t = t
         self._spans_host[span.host] = self._spans_host.get(span.host, 0) + 1 + span.dropped_before
         self._svc_host[span.service] = span.host
         if span.parent_idx < 0:
@@ -712,6 +752,16 @@ class BudgetSampler(Sampler):
                 share = self._spans_host.get(h, 0) / total_host
                 self._share[h] = (1 - cfg.rate_ewma) * self._share[h] + cfg.rate_ewma * share
                 self._pool_full[h] = max(1, round(cfg.pool_factor * v_star * self._share[h]))
+        if cfg.pool_follow_demand and not cfg.unbounded:
+            # the pools follow last period's outlier demand per host (total unchanged), each host keeps a floor share
+            demand = {h: self._ndet_host.get(h, 0) for h in self.hosts}
+            tot = sum(demand.values())
+            if tot > 0:
+                nh = max(1, len(self.hosts))
+                fl = min(cfg.pool_demand_floor, 1.0 / nh)
+                for h in self.hosts:
+                    sh = fl + (1.0 - nh * fl) * demand[h] / tot
+                    self._pool_full[h] = max(1, round(cfg.pool_factor * v_star * sh))
         self._set_pools()                                   # credit does not roll over
         self.out_exp = (1 - cfg.rate_ewma) * self.out_exp + cfg.rate_ewma * self._kept_outlier
         for svc, n in self._spans_svc.items():
@@ -734,6 +784,7 @@ class BudgetSampler(Sampler):
             self._nseen = {svc: n for svc, n in carry.items() if n > 1e-9}     # counts decay instead of resetting
         else:
             self._reset_counters()
+        self._period_idx = period + 1
 
     def _repayment(self, debt: dict[str, int]) -> dict[str, float]:
         """Plan-rate factor per host for the next period that removes the
@@ -779,7 +830,7 @@ class BudgetSampler(Sampler):
         total = sum(self.N_exp.values())
         if total <= 0:
             return
-        if cfg.unbounded:
+        if cfg.unbounded or cfg.outlier_policy == "first":
             roots = self.R_exp if cfg.root_policy == "pin" else 0.0
             target = max(cfg.ordinary_floor * v_star, v_star - roots - self.out_exp)
         else:

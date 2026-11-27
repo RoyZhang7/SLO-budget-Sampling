@@ -6,13 +6,14 @@ coin of the span id (plan_coin: hash) and every other draw a function of the spa
     python3 tools/filter_replay.py --run /storage/royno7/stage3/runs/v12-steady-ebpf-s1   a cluster run's 100 % export (node-0; measure13.build)
     python3 tools/filter_replay.py --corpus FILE.pkl ...                                   a corpus pickled by another tool
     ... --dump DIR                                                                         the filtered corpus's events/decisions for the Go differential test
+    ... --headroom H --smooth K                                                            the filter's coin headroom (1.10) and both runs' table_smooth (6)
 
 The agent run (A) is the simulator's chosen-v2 sampler on every span (own trigger on the within-service latency, Span.wait), recording the
 thresholds b and the plan rates in force after each period.  Both agent runs use coin_source = span: every draw (the request budget's
 fraction, the outlier coin beyond N_need, the credit coin) is a function of the span id and the draw's number, so that two runs over
 different span sets make the same decision for the same span; what the filter changes is then only what it drops.  The filter (F) sees every span in the same order with the tables ONE PERIOD
 STALE (what the agent had in the period before: its poll is at most a second behind the agent, which applies the central's update at the
-period's start) and the higher plan rate of its two newest tables times the headroom 1.05; it passes roots, errors, spans over b WITHOUT
+period's start) and the higher plan rate of its two newest tables times the headroom (--headroom, 1.10); it passes roots, errors, spans over b WITHOUT
 the margin, spans the coin selects, and spans without an arrival (--no-arrival SHARE of them, at random); it counts what it drops per
 service and stamps the count on the next span it passes, and what is still uncounted at a period's end goes to the agent as a count
 record at that boundary (--no-count-records: it rides on the next passed span instead, which shows the drift that costs).  The agent run on the passed spans (B) must keep the same spans with the same reasons.  Reported: the spans
@@ -33,10 +34,10 @@ for _p in ("/users/royno7/slo-budget-sim", os.environ.get("SLO_SIM")):      # SL
     if _p:
         sys.path.insert(0, _p)
 from slo_budget_sim.replay import replay  # noqa: E402
-from slo_budget_sim.sampler import BudgetSampler, coin_u, make_budget_arm  # noqa: E402
+from slo_budget_sim.sampler import BudgetConfig, BudgetSampler, coin_u, make_budget_arm  # noqa: E402
 
 
-RATE_HEADROOM = 1.05        # sdk/filter RateHeadroom
+RATE_HEADROOM = 1.10        # sdk/filter RateHeadroom (1.05 until 2026-11-26; --headroom overrides)
 ARM = dict(plan_coin="hash", coin_source="span")
 
 
@@ -216,6 +217,7 @@ def run(corpus, v_star, cap, seed, lag, no_arrival, flush=True, dump=None, name=
 
 
 def main() -> int:
+    global RATE_HEADROOM
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--synthetic", help="a simulator scenario (saturated, cascade, steady, ...)")
     ap.add_argument("--corpus", help="a pickled Corpus (with fault_window = (start, end) when it has one)")
@@ -226,8 +228,11 @@ def main() -> int:
     ap.add_argument("--run", help="a cluster run directory (node-0): the corpus from its 100 %% export, the wait by the stamp")
     ap.add_argument("--no-count-records", action="store_true", help="no count record at the period's end: the counts ride on the next passed span")
     ap.add_argument("--dump", help="write <name>-all / <name>-filtered events and decisions here (the Go differential test)")
+    ap.add_argument("--headroom", type=float, default=RATE_HEADROOM, help="the filter's coin headroom (sdk/filter RateHeadroom)")
+    ap.add_argument("--smooth", type=int, default=BudgetConfig().table_smooth, help="threshold smoothing K of both agent runs (table_smooth)")
     ap.add_argument("--out")
     a = ap.parse_args()
+    RATE_HEADROOM = a.headroom
     if a.synthetic:
         from slo_budget_sim.synthetic import build_scenario
         corpus, _ = build_scenario(a.synthetic, a.seed)
@@ -253,8 +258,10 @@ def main() -> int:
     dur = max(s.start + s.duration for s in corpus.spans) - corpus.t0
     v_star = a.volume * n * corpus.period / dur
     name = a.synthetic or (os.path.basename(a.run.rstrip("/")) if a.run else os.path.basename(a.corpus))
-    res = run(corpus, v_star, 1.25 * v_star, 1000 + a.seed, a.lag, a.no_arrival, flush=not a.no_count_records, dump=a.dump, name=name, own_measure="within_service")
+    res = run(corpus, v_star, 1.25 * v_star, 1000 + a.seed, a.lag, a.no_arrival, flush=not a.no_count_records, dump=a.dump, name=name,
+              own_measure="within_service", table_smooth=a.smooth)
     res["source"] = name
+    res["rate_headroom"], res["table_smooth"] = a.headroom, a.smooth
     print(json.dumps(res, indent=1))
     if a.out:
         json.dump(res, open(a.out, "w"), indent=1)
